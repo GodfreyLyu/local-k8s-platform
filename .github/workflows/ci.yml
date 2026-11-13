@@ -1,0 +1,48 @@
+# Purpose: require offline tests and Terraform validation before merging PRs into main.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Check out the tested revision; PRs use the merge commit with main.
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Test the minimum supported Python version; no pip dependencies are needed.
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.10'
+
+      # Run all offline tests, including fake-tool orchestration and temporary certificates.
+      - name: Run Python tests
+        run: python3 -B -m unittest discover -s tests -v
+
+      # Use the tested Terraform release with native CLI output for the validation script.
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: '1.15.8'
+          terraform_wrapper: false
+
+      # Reject formatting changes across all packaged Terraform stages.
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive assets/infra
+
+      # Validate all 12 profiles and 40 stage instances in a private directory outside the repo.
+      - name: Validate Terraform profiles
+        run: python3 -B scripts/validate.py --report-dir "$RUNNER_TEMP/terraform-validation"
