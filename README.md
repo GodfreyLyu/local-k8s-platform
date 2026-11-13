@@ -132,6 +132,10 @@ To use the project through an agent, point it to [SKILL.md](SKILL.md). Creating 
 
 ## Validation
 
+Pull requests targeting `main` run the `CI` workflow. Its required `Tests` check runs the offline Python suite, Terraform formatting, and the native Terraform validation matrix. Actions are pinned to commit hashes; Terraform uses the tested `1.15.8` release.
+
+The `main` branch requires a pull request, passing `Tests` from GitHub Actions, and an up-to-date branch before merging. These requirements also apply to repository administrators. No approving review is required, so the repository owner can merge their own PR after the checks pass. Branch protection is configured in GitHub repository settings; the workflow alone does not enforce merging rules.
+
 The recorded build passed **58 offline tests**. Native Terraform validation passed **12 configuration profiles and 40 stage instances**, with no errors or warnings. That run used Terraform `1.15.8` and Kubernetes provider `2.38.0`.
 
 These results cover the implementation and static provider schema. This project has not completed live deployment or functional acceptance. The [validation report](references/validation.md) records the checks and their limits.
