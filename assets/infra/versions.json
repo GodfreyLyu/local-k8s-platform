@@ -1,0 +1,44 @@
+{
+  "$comment": "Purpose: Record pins derived from the executable Terraform assets and their read-only reference provenance; this is not runtime certification.",
+  "schema_version": 1,
+  "provider": {
+    "source": "hashicorp/kubernetes",
+    "version": "2.38.0",
+    "lockfile": "stacks/*/.terraform.lock.hcl"
+  },
+  "images": {
+    "postgres": {
+      "reference": "docker.io/library/postgres:17.11@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f",
+      "asset": "stacks/30-postgres/main.tf"
+    },
+    "postgres_exporter": {
+      "reference": "quay.io/prometheuscommunity/postgres-exporter:v0.20.1@sha256:ac5ec343104fae0e2d84a27bb8d69b38430a11910c5382cad85d478d2bab713e",
+      "asset": "stacks/30-postgres/main.tf"
+    },
+    "kafka": {
+      "reference": "quay.io/strimzi/kafka:1.3.0-kafka-4.3.1@sha256:1f189b1f0f32684302d8b018b1d21b411e2469a9c465fbdc18fa3599cb5bbdad",
+      "asset": "stacks/31-kafka/main.tf"
+    },
+    "local_path": {
+      "reference": "docker.io/rancher/local-path-provisioner:v0.0.37@sha256:e757967a5ec338f6a9b371c5a9688bedaa8c3578ea3dd4db329ea0084be0a86f",
+      "asset": "stacks/05-storage/main.tf"
+    },
+    "storage_helper": {
+      "reference": "docker.io/library/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4",
+      "asset": "stacks/05-storage/main.tf"
+    }
+  },
+  "compatibility_requirements": {
+    "strimzi_operator": "1.3.0",
+    "strimzi_crd_api": "kafka.strimzi.io/v1",
+    "kafka": "4.3.1",
+    "prometheus_crd_api": "monitoring.coreos.com/v1"
+  },
+  "provenance": {
+    "reference_project": "platform-infra",
+    "reference_record": "versions.json and stacks/05-storage/main.tf",
+    "reference_review_date": "2026-11-12",
+    "note": "Pins were copied from read-only project references. The new package has not executed these images or certified target-cluster compatibility."
+  },
+  "runtime_verified": false
+}

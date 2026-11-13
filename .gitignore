@@ -1,0 +1,54 @@
+# Purpose: exclude local development settings, test output, runtime data, and generated archives.
+
+# Editor, agent, and operating-system files.
+.idea/
+.vscode/
+.codex/
+*.iml
+.DS_Store
+*.swp
+*~
+
+# Local Python tooling; the skill has no third-party Python runtime dependencies.
+.venv/
+venv/
+env/
+.python-version
+uv.lock
+
+# Interpreter caches, test output, and build artifacts.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.egg-info/
+build/
+dist/
+*.tmp
+
+# Private runtime files. Keep .terraform.lock.hcl for pinned provider checksums.
+.local/
+.state/
+.terraform/
+*.tfstate*
+*.tfplan*
+*.tfvars
+*.tfvars.json
+*.log
+.env
+.env.*
+!.env.example
+kubeconfig
+*.kubeconfig
+*.pem
+*.key
+*.crt
+*.csr
+*.srl

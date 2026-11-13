@@ -1,0 +1,5 @@
+# Purpose: Provide discovery metadata for the local Kubernetes platform skill.
+interface:
+  display_name: "Local Kubernetes Platform"
+  short_description: "Configure and check an existing Minikube platform"
+  default_prompt: "Use $local-k8s-platform to set up PostgreSQL and Kafka on my existing Minikube cluster."

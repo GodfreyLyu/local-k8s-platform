@@ -1,0 +1,10 @@
+# Purpose: Restrict database identities to TLS and reserve peer administration for the Pod.
+local all postgres peer
+local all all reject
+hostnossl all all all reject
+hostssl postgres postgres 127.0.0.1/32 scram-sha-256
+hostssl postgres postgres ::1/128 scram-sha-256
+hostssl ${database} ${username} all scram-sha-256
+hostssl ${database} postgres_exporter 127.0.0.1/32 scram-sha-256
+hostssl ${database} postgres_exporter ::1/128 scram-sha-256
+host all all all reject
