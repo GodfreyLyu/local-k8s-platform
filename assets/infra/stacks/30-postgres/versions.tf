@@ -9,7 +9,38 @@ terraform {
 
 variable "environment" {
   description = "Environment normalized and validated by the Python entry point."
-  type        = any
+  type = object({
+    cluster = object({
+      context    = string
+      kubeconfig = string
+    })
+    application = object({
+      database  = string
+      namespace = string
+      username  = string
+    })
+    derived = object({
+      namespace            = string
+      validation_namespace = string
+      postgres_name        = string
+      labels               = map(string)
+    })
+    monitoring = object({
+      enabled    = bool
+      namespace  = string
+      pod_labels = map(string)
+    })
+    postgres = object({
+      storage = string
+      resources = object({
+        requests = map(string)
+        limits   = map(string)
+      })
+    })
+    storage = object({
+      class = string
+    })
+  })
 }
 
 locals {

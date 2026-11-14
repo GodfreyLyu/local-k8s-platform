@@ -8,6 +8,8 @@ The helpers need Python 3.10 or later on macOS or Linux. They use only the Pytho
 
 ## Command effects
 
+Every `platform.py` action loads the configuration and locks the workspace. It runs `configure` before the selected action. This refreshes stage copies, variable files, `environment.json`, and interface records. A preview can therefore update local files without changing Kubernetes.
+
 | Command | Local effects | Cluster effects |
 |---|---|---|
 | `configure` | Fill in defaults and copy selected stage files into the workspace. | None; offline. |
@@ -22,7 +24,7 @@ The helpers need Python 3.10 or later on macOS or Linux. They use only the Pytho
 | `credentials --component kafka --execute` | Record handoff results. | Read selected Strimzi client fields and write application client Secrets. |
 | `verify` | Save baseline results and pending acceptance items. | Read-only checks for enabled components. |
 
-The CLI has no destroy, import, cluster creation, or automatic cleanup action. Configuration and preview commands do not authorize later writes. Building this project does not install the skill globally.
+The CLI has no destroy, import, cluster creation, or cleanup command. Configuration and preview commands do not authorize later writes. Building this project does not install the skill globally.
 
 To build a portable archive, choose an output path outside the maintained source directories:
 
@@ -34,13 +36,27 @@ The archive contains the maintained skill files, tests, and a checksum manifest.
 
 ## Workspace and identity
 
-Use a private directory, for example `/private/path/foo-dev`. Runtime directories use mode `0700`; files that may contain state, plans, or credentials use `0600`. Keep the workspace out of source control and distribution archives.
+Use a private directory, for example `/private/path/foo-dev`. New helper-created directories request mode `0700`. JSON files and new lock files request `0600`. The directory check requires the current user's UID and no group or other permissions. It does not require exact owner permission bits or change existing permissions.
+
+Stage copies and saved plan files are explicitly set to `0600`. Child commands receive a `077` umask. This affects new files, not existing ones. Keep the workspace out of source control and distribution archives. See [Artifact I/O and subprocesses](io.md) for path checks and storage limits.
+
+The workspace lock is advisory and non-blocking. A competing operation using the same lock is rejected immediately. The lock is released when the CLI action exits; `.operation.lock` remains on disk. It does not coordinate separate workspaces or unrelated tools.
 
 Each stage has its own Terraform working directory and state path. The CLI sets that path during initialization. Terraform input variables cannot set a backend path. Do not share state between environments or let separate states own the same Kubernetes resources.
 
 Use one workspace for the cluster's managed environment. Concurrent first deployments from different workspaces are unsupported. Ownership labels cannot prevent a race before resources exist. Use the same workspace and new plans for later changes.
 
 Every Kubernetes request uses the configured kubeconfig and context. Commands leave the global current context alone. Inspection records the live cluster identity, including the `kube-system` namespace UID. Reusing a context name after recreating a cluster does not preserve that identity.
+
+## Local files and command failures
+
+JSON writes use a temporary file in the target directory. The helper flushes and syncs that file before atomic replacement. It does not sync the parent directory or promise persistence after power loss. Other file writes and stage copies do not use this JSON replacement path.
+
+Failed JSON writes attempt to remove their temporary file. Cleanup can fail and leave a `.write-*` file. The original error retains the cleanup error as its cause. CLI JSON errors show only the primary message. Inspect the affected private directory before deciding how to recover. The helpers do not perform stale-file cleanup at startup.
+
+Commands have per-call timeouts. The shared runner uses 60 seconds by default. Runtime Terraform init, plan, and apply use 600 seconds. The runner captures output in memory and does not redact it. Keep raw command logs private. A timeout does not prove that an external operation had no effect.
+
+Before invoking Terraform apply, the runtime consumes the reviewed plan. A runner timeout or startup error records the result as `uncertain`. Inspect actual state and create a new plan before another attempt. See the [subprocess reference](io.md#subprocess-execution) for exact environment and error handling.
 
 ## Preparation and inventory
 

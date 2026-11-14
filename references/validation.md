@@ -2,13 +2,13 @@
 
 # Validation
 
-This report records checks completed on 2026-11-13. It covers the skill implementation and static Terraform validation. Live deployment and functional acceptance have not been completed.
+This report includes the original build checks from 2026-11-13. Typed Terraform inputs were revalidated on 2026-11-14. The results cover the implementation and static Terraform validation. Live deployment and functional acceptance remain pending.
 
 ## Results
 
 | Check | Result |
 |---|---|
-| Offline Python tests | 58 passed. Coverage includes configuration, workspace files, plan integrity, ownership, credentials, startup, and validation orchestration. |
+| Offline Python tests | 72 passed on Python 3.10. Coverage includes configuration, workspace files, JSON I/O failure handling, plan integrity, ownership, credentials, startup, and validation orchestration. |
 | Local certificate preparation | OpenSSL generated and verified temporary certificates. A second run reused the credentials. Test material was removed afterward. |
 | Independent agent trial | A PostgreSQL-only request produced the expected stages and application settings. It made no calls to kubectl, Terraform, Minikube, or OpenSSL. |
 | Python lint and formatting | Ruff checks passed. Ruff is optional for development; the runtime needs no third-party Python packages. |
@@ -16,6 +16,8 @@ This report records checks completed on 2026-11-13. It covers the skill implemen
 | Terraform formatting | All five stage roots passed recursive format checking. |
 | Native provider check | Schema loading passed with Terraform `1.15.8` and Kubernetes provider `2.38.0`. |
 | Native configuration matrix | All 12 profiles and 40 stage instances passed, with zero errors and zero warnings. |
+| Typed input contracts | All five exact stage variable declarations accepted the normalized environment in provider-free, resource-free console fixtures. Ten negative cases rejected missing `cluster.kubeconfig` or an invalid `cluster.context` type. |
+| Terraform IDE inspections | All 12 Terraform files passed IDE inspection with no errors or warnings after adding explicit stage input types. |
 | Live acceptance | Pending. These checks did not deploy resources or test application connections. |
 
 ## Native Terraform run
@@ -23,6 +25,8 @@ This report records checks completed on 2026-11-13. It covers the skill implemen
 The report returned `status=pass`, `provider_probe=pass`, and `cases_passed=cases_planned=40`.
 
 The audit checked every command result. All 40 initializations and all 40 validations exited 0. Each validation returned `valid=true`, no errors, no warnings, and an empty diagnostic list.
+
+These static checks cover attribute references and configuration consistency. The additional console fixtures evaluate actual input conversion against each stage's explicit `object` type. They contain no providers, resources, or remote backend.
 
 All 24 stage source files and lockfiles matched the copies used by the native run. Generated variables also matched the current configuration logic. Coverage included every Terraform root:
 
@@ -37,6 +41,12 @@ All 24 stage source files and lockfiles matched the copies used by the native ru
 [Native validation evidence](native-validation.json) lists the profile coverage and source hashes. It also stores the original report digest and digests for all 80 command diagnostics. Private workspaces and raw TRACE logs are excluded from the package.
 
 These results establish static Terraform and provider-schema consistency. They do not prove live CRD compatibility, service connectivity, permissions, network isolation, alert delivery, or recovery.
+
+## I/O documentation review
+
+The documentation review used `io_utils.py` and its actual callers as the reference. All 14 JSON storage tests and six boundary tests passed on Python 3.10. Seven temporary probe groups also passed. They covered literal arguments, stdin, child permissions, nonzero exits, timeouts, environment filtering, and path-check limits.
+
+These checks do not establish crash recovery or complete protection against concurrent path changes. See [Artifact I/O and subprocesses](io.md) for the implemented limits.
 
 ## Run the checks
 
@@ -78,7 +88,7 @@ A minimal configuration with only `required_providers` and the lockfile failed i
 
 The same provider loaded successfully in the user's native terminal. The complete matrix then passed without changes to the pinned provider or Terraform assets.
 
-When this permission error occurs, the runner returns `blocked` with `local_socket_denied`. It stops before validating the stage matrix. Other provider failures keep their own diagnostic category.
+If the provider probe hits this permission error, the runner returns `blocked` with `local_socket_denied`. It stops before the stage matrix. A later stage failure is recorded against that case, and the runner continues with other cases. Other provider failures keep their own diagnostic category.
 
 ## Packaging
 

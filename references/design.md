@@ -11,17 +11,20 @@ This skill configures a local development platform on an existing Minikube clust
 | `SKILL.md` | Interpret requests, choose operations, and explain evidence. | Configuration and results for review. |
 | Configuration entry point | Check input, fill defaults, and derive names and stages. | Validated environment configuration. |
 | Command entry point | Create the workspace and run the selected action. | Structured result. |
+| I/O helpers | Check directories, replace JSON files, lock the workspace, and invoke commands. | Local artifacts and captured command results. |
 | Terraform assets | Manage selected resources with separate state for each stage. | Saved plans and resources. |
 | Credential helper | Prepare credentials and write fixed Secrets outside Terraform. | Protected credentials and application-local Secret references. |
 | Runtime checks | Check cluster identity, ownership, prerequisites, and readiness. | Inventory, plan review, and acceptance status. |
 
-The Agent runs the packaged command through its shell tools. This skill needs no custom server, MCP connection, background daemon, or scheduler.
+The agent invokes the packaged CLI through its execution tool. Python starts child commands without a shell wrapper. This skill needs no custom server, MCP connection, background daemon, or scheduler.
 
 ## Source and workspace separation
 
 `assets/infra` contains the Terraform source for this skill. It was adapted from reference infrastructure and runs without sibling projects. The package includes only the supported local stages. It keeps published validation summaries, but excludes private logs, production-reference stacks, state, credentials, and saved plans.
 
-`configure` copies selected stages into the environment workspace and writes their variables. Terraform initialization and backend setup run there too. This keeps `.terraform`, state, and plans outside the packaged assets. File hashes record each plan's source and configuration.
+Every `platform.py` action loads the configuration and acquires the workspace lock. It then calls `configure` before the selected action. This copies selected stages and writes their variables, `environment.json`, and interface records. Preview and read-only cluster actions can therefore update local files.
+
+Terraform initialization and backend setup run in the workspace. This keeps `.terraform`, state, and plans outside the packaged assets. File hashes record each plan's source and configuration.
 
 Keep the workspace outside the installed skill directory. If it contains stage files absent from the current engine, configuration stops. It refuses to run with leftover Terraform code and leaves those files untouched. Removing engine files or managed stages requires a separate migration review.
 
@@ -35,6 +38,8 @@ Support for multiple environments needs clear ownership of shared cluster resour
 
 `scripts/config.py` defines the configuration rules. It checks allowed fields, required values, names, quantities, and component combinations, then fills defaults. Internal functions use those results directly. There is no separate JSON Schema to maintain.
 
+Each Terraform stage declares an explicit `object` type containing only the environment fields it consumes. These types document the Python-to-Terraform interface and support static field checks. Defaults, naming rules, and component-combination validation remain in Python.
+
 Later checks cover things that can change outside the input file:
 
 - Files or plans may change after preparation.
@@ -46,6 +51,12 @@ Later checks cover things that can change outside the input file:
 These checks protect external state. They do not repeat the original input checks.
 
 The selected components determine stages, prerequisites, resource estimates, credentials, monitors, and readiness checks. A PostgreSQL-only configuration has no Kafka or CNPG dependency.
+
+## I/O and subprocess boundaries
+
+The shared helpers check local permissions and replace individual JSON files atomically. They do not make workspace preparation a transaction. Their subprocess runner uses argument lists, per-call timeouts, and a child umask. It does not provide a command sandbox or cap captured output.
+
+The standalone Terraform validator uses a separate subprocess wrapper. Its environment filtering and diagnostic files differ from the runtime runner. See [Artifact I/O and subprocesses](io.md) for both implementations.
 
 ## Ownership and integration
 

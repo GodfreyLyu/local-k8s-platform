@@ -2,7 +2,9 @@
 
 # Environment configuration
 
-`scripts/platform.py` reads and checks the JSON configuration. `configure` fills defaults and creates the selected Terraform work directories. It does not contact Kubernetes. Start from [environment.example.json](../assets/environment.example.json). Its `$comment` field explains the file's purpose in valid JSON.
+`scripts/config.py` reads the JSON configuration, checks it, and fills defaults. `scripts/platform.py` then prepares the workspace and dispatches the action. The `configure` action does not contact Kubernetes. Start from [environment.example.json](../assets/environment.example.json). Its `$comment` explains the file's purpose.
+
+The configuration path is expanded and resolved before reading. Relative kubeconfig paths use the resolved configuration file's directory. A configuration symlink can therefore be accepted. Direct artifact reads have a separate [no-follow rule](io.md#json-reads-and-hashes).
 
 ## Input contract
 

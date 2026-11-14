@@ -34,7 +34,7 @@ Only one managed platform environment is supported per cluster. Keep one workspa
 - Set up HTTPS ingress, CNPG, object storage, WAL archiving, or point-in-time recovery.
 - Automatically renew certificates, rotate credentials, run backups, or test restores.
 - Run a full functional test suite for TLS, ACLs, network isolation, alerts, and recovery.
-- Import existing resources, destroy environments, or clean up data automatically.
+- Import existing resources, destroy environments, or automatically delete application data or retained volumes.
 
 The current checks report basic Kubernetes readiness. They cannot establish that an application can connect or that a backup can be restored. See [verification and acceptance](references/operations.md#verification-and-acceptance) for the remaining checks.
 
@@ -56,6 +56,8 @@ flowchart TD
 `scripts/config.py` checks user input and fills in defaults. Other modules use that resolved configuration. Later checks cover files and live resources, which may change during a run.
 
 `scripts/runtime.py` handles inspection, plan review, apply, and verification. `scripts/credentials.py` handles local certificates and fixed Secret writes.
+
+`scripts/io_utils.py` provides private JSON storage, workspace locking, and subprocess calls. Child commands use argument lists without a shell wrapper. They have per-call timeouts and a `077` umask. These controls do not add a command sandbox. See the [I/O and subprocess reference](references/io.md) for the exact behavior and limits.
 
 Terraform owns the selected Kubernetes resources. Each stage has a separate state file. Credential data stays outside Terraform.
 
@@ -108,7 +110,7 @@ Generate the local workspace:
 python3 -B scripts/platform.py --config ../demo-environment.json --workspace "$HOME/local-k8s-workspaces/demo" configure
 ```
 
-This command runs offline. It writes stage files and a connection template for the application. Use a new, empty workspace outside the repository. The tool requires private permissions: `0700` for directories and `0600` for files.
+This command runs offline. It copies stage files and writes application interface records. For the first run, choose an empty workspace outside the repository. New directories request mode `0700`; JSON files request `0600`. The directory helper requires the current user's UID and no group or other permissions. It does not repair existing permissions.
 
 ### Inspect and plan
 
@@ -132,11 +134,11 @@ To use the project through an agent, point it to [SKILL.md](SKILL.md). Creating 
 
 ## Validation
 
-Pull requests targeting `main` run the `CI` workflow. Its required `Tests` check runs the offline Python suite, Terraform formatting, and the native Terraform validation matrix. Actions are pinned to commit hashes; Terraform uses the tested `1.15.8` release.
+Pull requests targeting `main` run the `CI` workflow. Its `Tests` job runs the offline Python suite, Terraform formatting, and the native Terraform validation matrix. Actions are pinned to commit hashes; Terraform uses the tested `1.15.8` release.
 
-The `main` branch requires a pull request, passing `Tests` from GitHub Actions, and an up-to-date branch before merging. These requirements also apply to repository administrators. No approving review is required, so the repository owner can merge their own PR after the checks pass. Branch protection is configured in GitHub repository settings; the workflow alone does not enforce merging rules.
+Required checks and review rules are GitHub repository settings. They are not defined by this workflow. The workflow alone does not block merges.
 
-The recorded build passed **58 offline tests**. Native Terraform validation passed **12 configuration profiles and 40 stage instances**, with no errors or warnings. That run used Terraform `1.15.8` and Kubernetes provider `2.38.0`.
+The recorded build passed **72 offline tests**. Native Terraform validation passed **12 configuration profiles and 40 stage instances**, with no errors or warnings. That run used Terraform `1.15.8` and Kubernetes provider `2.38.0`.
 
 These results cover the implementation and static provider schema. This project has not completed live deployment or functional acceptance. The [validation report](references/validation.md) records the checks and their limits.
 
@@ -163,6 +165,7 @@ The validator needs a Terraform release whose `validate` command supports `-var-
 | `assets/infra/stacks/` | Terraform roots and PostgreSQL startup files. |
 | [Configuration reference](references/configuration.md) | Input fields, defaults, supported combinations, and application access. |
 | [Operations guide](references/operations.md) | Command effects, deployment order, credentials, and verification. |
+| [I/O and subprocess reference](references/io.md) | Private file handling, locks, command environments, and timeouts. |
 | [Design notes](references/design.md) | Architecture, ownership, and scope decisions. |
 | [Validation report](references/validation.md) | Observed results and evidence. |
 | `tests/` | Offline tests and fake external tools. |
