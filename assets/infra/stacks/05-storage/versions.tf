@@ -9,7 +9,23 @@ terraform {
 
 variable "environment" {
   description = "Environment normalized and validated by the Python entry point."
-  type        = any
+  type = object({
+    environment_id = string
+    cluster = object({
+      context    = string
+      kubeconfig = string
+    })
+    budget = object({
+      min_disk_free_mib = number
+    })
+    derived = object({
+      labels = map(string)
+    })
+    storage = object({
+      class = string
+      nodes = list(string)
+    })
+  })
 }
 
 locals {
