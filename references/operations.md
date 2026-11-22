@@ -4,7 +4,7 @@
 
 Run commands from the skill's root. Supply a configuration and a private workspace outside the repository. Use one workspace for the managed environment in a cluster. Keep packaged scripts and assets unchanged.
 
-The helpers need Python 3.10 or later on macOS or Linux. They use only the Python standard library. Cluster operations also need Terraform `>=1.10,<2`, kubectl, and an existing Minikube kubeconfig. Pinned providers and images must be available. PostgreSQL credential preparation uses OpenSSL.
+The helpers need Python 3.10 or later on macOS or Linux. They use only the Python standard library. Cluster operations also need Terraform `>=1.10,<2`, kubectl, and an existing Minikube kubeconfig. Pinned providers and images must be available. Use the [prerequisite workflow](prerequisites.md) to prepare missing Operators, minimal monitoring, or local OpenSSL.
 
 ## Command effects
 
@@ -13,6 +13,9 @@ Every `platform.py` action loads the configuration and locks the workspace. It r
 | Command | Local effects | Cluster effects |
 |---|---|---|
 | `configure` | Fill in defaults and copy selected stage files into the workspace. | None; offline. |
+| `prerequisites` | Save a review and plan ID for selected dependencies. | Read inventory and create permissions. No writes. |
+| `prerequisites --plan-id ID` | Preview a saved dependency plan. | None. |
+| `prerequisites --plan-id ID --execute` | Install reviewed local packages and record partial results. | Create missing reviewed namespaces, CRDs, RBAC, and workloads. |
 | `inspect` | Save structured inventory and blockers. | Read-only API requests. |
 | `plan --stage NAME` | Initialize/check one stage; save plan and review manifest. | Read current objects; no apply. |
 | `apply --stage NAME --plan-id ID` | Check a saved plan and show execution preview. | No mutation without `--execute`. |
@@ -60,16 +63,23 @@ Before invoking Terraform apply, the runtime consumes the reviewed plan. A runne
 
 ## Preparation and inventory
 
-1. Run offline `configure`. Review components, resource requests, names, and stages.
-2. Run `inspect`. Check ownership, node readiness, DNS, storage, operators, and required CRDs.
-3. Resolve blockers with current evidence. A configured budget does not prove that RAM or disk space is available. Missing statistics, permissions, and ownership information block planning.
-4. Do not automatically resize VMs, stop workloads, adopt objects, install duplicate operators, or clear data to pass a check.
+1. Run offline `configure`. Review components, small resource requests, names, and stages. Use `storage.mode=csi` when the existing Minikube CSI driver is ready.
+2. Run `prerequisites` when dependency preparation is needed. Review and execute its concrete plan within the authorized scope. Compatible installations are reused.
+3. Run `inspect`. Check ownership, node readiness, DNS, storage, operators, and required CRDs. Review per-Pod allocations and remaining node capacity. Monitoring also needs a ready Prometheus instance with matching selectors and Pod labels.
+4. Resolve blockers with current evidence. A configured budget does not prove that RAM or disk space is available. Missing statistics, permissions, and ownership information block planning.
+5. Do not automatically resize VMs, stop workloads, adopt objects, install duplicate operators, or clear data to pass a check.
 
-Check free disk space on eligible nodes and verify storage binding and retention. Local volumes belong to their nodes. PVC size is neither a host disk quota nor a backup.
+Capacity checks use measured free memory and allocatable memory minus assigned Pod requests. They include init peaks, restartable init sidecars, and Pod overhead. The placement estimate reserves 128Mi per used node and 256Mi of aggregate memory headroom. Each volume is assigned once within the selected storage nodes. The algorithm tries at most 10000 assignments and reports a blocker if it finds none.
+
+An unused node with less disk space does not need to fit every volume. Read the report's `allocations` and remaining-capacity fields. These are estimates, not scheduling reservations. CPU, image pulls, admission, concurrent work, and runtime behavior need separate evidence.
+
+Check free disk space on selected storage nodes and verify binding and retention. Local volumes belong to their nodes. PVC size is neither a host disk quota nor a backup.
 
 ## Plan and execute by stage
 
-Generate a plan for the next stage whose prerequisites are ready. Bootstrap creates dedicated namespaces and identities. Add storage creation when selected. PostgreSQL needs its namespace, storage class, and source Secrets. Kafka needs existing Strimzi CRDs and a namespace watched by the operator. Monitoring needs existing CRDs, matching selectors, and ready data services.
+Generate a plan for the next stage whose prerequisites are ready. Each plan and apply checks that stage's new Pods and volumes. Bootstrap creates dedicated namespaces and identities. `05-storage-csi` creates a class using the existing CSI driver; `05-storage` installs a separate Local Path controller. PostgreSQL needs its namespace, storage class, and source Secrets. Kafka needs ready Strimzi CRDs and an Operator in its configured namespace. The monitoring stage needs a ready monitoring installation, matching selectors, and ready data services.
+
+Unchanged applied stages are excluded from new capacity demand. A resource increase retains full replacement-Pod headroom. Data-stage state blocks automatic volume shrinking or storage-node/class changes. Plan review also rejects shrinking Kafka volumes, reducing existing Topic partitions, or shortening existing message retention.
 
 Deploy in stages. After applying a prerequisite, check its result and create a fresh plan for the next stage.
 

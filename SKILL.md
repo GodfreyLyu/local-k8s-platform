@@ -1,19 +1,21 @@
 ---
 name: local-k8s-platform
-description: Configure PostgreSQL and Kafka on an existing Minikube cluster. Use for local platform configuration, plans, and readiness checks. Cluster creation and application releases are outside its scope.
+description: Prepare missing prerequisites and configure PostgreSQL and Kafka on an existing Minikube cluster. Use for local platform configuration, reviewed installation plans, and readiness checks. Cluster creation and application releases are outside its scope.
 ---
 <!-- Purpose: Route local platform requests through validated configuration and packaged execution tools. -->
 
 # Local Kubernetes Platform
 
-Configure one platform environment per existing Minikube cluster. This release requires Calico. It uses existing Strimzi and Prometheus installations when those components are enabled. All required Terraform and Python files are included.
+Configure one platform environment per existing Minikube cluster. This release requires Calico. Reuse compatible Strimzi and Prometheus installations. Prepare missing Operators, a minimal Prometheus instance, and local OpenSSL through reviewed prerequisite plans. Required manifests, Terraform files, and Python scripts are included.
 
 Use English for maintained documentation and code comments. Respond in the user's preferred language.
 
 ## Select the work
 
 - For configuration, defaults, or component choices, read [configuration.md](references/configuration.md).
+- For small-model local training and existing Minikube CSI storage, read [local-training.md](references/local-training.md).
 - Before inspecting a cluster, deploying resources, or writing credentials, read the relevant procedure in [operations.md](references/operations.md).
+- For missing Operators, monitoring setup, or local OpenSSL, read [prerequisites.md](references/prerequisites.md).
 - For implementation changes or scope decisions, read [design.md](references/design.md).
 - For offline Terraform checks or provider startup errors, read [validation.md](references/validation.md) and use `scripts/validate.py`.
 
@@ -34,6 +36,18 @@ python3 -B scripts/platform.py --config environment.json --workspace /private/pa
 
 `configure` is offline. Review selected stages, resource estimates, names, and planned interfaces before contacting Kubernetes.
 
+## Prepare prerequisites
+
+```sh
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev prerequisites
+```
+
+This prepares a plan for enabled components. It reuses compatible installations and lists missing resources and local package commands. It does not install anything. Use `--component openssl` for local preparation without contacting Kubernetes. If no changes are needed, continue to `inspect`.
+
+Present the target, reused resources, namespace, versions, requested memory, and exact changes. Include cluster-scoped CRDs and RBAC. Obtain any missing authorization for that plan. Then execute it with `prerequisites --plan-id REVIEWED_PLAN_ID --execute`. This authorization is separate from later Terraform changes and Secret writes.
+
+Do not replace, upgrade, or adopt existing Operators. Stop on conflicts or stale plans. Preserve partial installations and prepare a fresh plan before resuming. An installed Operator or a Ready Prometheus Pod does not establish scrape health or alert delivery.
+
 ## Inspect and plan
 
 ```sh
@@ -42,7 +56,9 @@ python3 -B scripts/platform.py --config environment.json --workspace /private/pa
 
 Check current capacity, StorageClass behavior, ownership, namespaces, and required CRDs. Stop when the evidence is missing. Do not set an ownership flag or treat resource requests as measured free capacity.
 
-Plan a stage only after its prerequisites exist. Begin with `00-bootstrap`. Include `05-storage` when configured. Prepare PostgreSQL credentials before planning that stage. Add monitoring after the selected data services are ready.
+Plan a stage only after its prerequisites are ready. Begin with `00-bootstrap`. Use `05-storage-csi` for an existing CSI driver, or `05-storage` for a new Local Path controller. Prepare PostgreSQL credentials before planning that stage. Add monitors and rules after the selected data services are ready.
+
+Use the small defaults for new local environments: PostgreSQL and Kafka each request a 1Gi PVC. Read the capacity report by Pod and storage node. Reuse current Operators and CSI where compatible. Keep model files, training data, and checkpoint budgets separate. Existing volumes, Topic partitions, and retention settings need their own migration review before any reduction.
 
 ```sh
 python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev plan --stage 00-bootstrap

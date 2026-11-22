@@ -39,6 +39,7 @@ variable "environment" {
     })
     storage = object({
       class = string
+      nodes = list(string)
     })
   })
 }

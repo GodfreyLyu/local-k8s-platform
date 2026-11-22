@@ -8,6 +8,8 @@ import re
 import time
 from pathlib import Path
 
+from capacity import assess
+from config import memory_mib
 from io_utils import private_dir, read_json, run, sha256, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,13 +64,20 @@ def _kube(config: dict) -> list[str]:
 # Inputs: configuration and GET arguments. Outputs: decoded JSON or None for an absent named object.
 # Purpose: Read cluster objects without printing their contents. Dependencies: kubectl, io_utils.run.
 def _get(
-    config: dict, resource: str, name: str | None = None, namespace: str | None = None
+    config: dict,
+    resource: str,
+    name: str | None = None,
+    namespace: str | None = None,
+    *,
+    all_namespaces: bool = False,
 ) -> dict | None:
     command = _kube(config) + ["get", resource]
     if name is not None:
         command += [name, "--ignore-not-found=true"]
     if namespace is not None:
         command += ["--namespace", namespace]
+    if all_namespaces:
+        command += ["--all-namespaces"]
     result = run(command + ["-o", "json"], timeout=20)
     if result.returncode:
         raise RuntimeError(f"Cannot read {resource}; check API access and permissions.")
@@ -129,26 +138,119 @@ def _bind(config: dict, workspace: Path, identity: dict) -> bool:
     return True
 
 
-# Inputs: normalized configuration, workspace. Outputs: remaining total memory, storage and largest stage request in MiB.
-# Purpose: Avoid counting previously applied workloads as new capacity requests. Dependencies: applied-stage records.
-def _remaining_demand(config: dict, workspace: Path) -> tuple[int, int, int]:
-    memory = config["derived"]["memory_requests_by_stage"]
-    storage = config["derived"]["storage_mib_by_stage"]
-    remaining_memory = 0
-    remaining_storage = 0
-    largest_request = 0
-    for stage, requested in memory.items():
-        path = workspace / "reports" / f"applied-{stage}.json"
+# Inputs: resolved configuration, workspace and optional stage. Outputs: remaining Pod forecasts.
+# Purpose: omit unchanged applied workloads and reserve replacement headroom for increases. Dependencies: applied-stage records.
+def _remaining_workloads(config: dict, workspace: Path, stage: str | None = None) -> list[dict]:
+    result = []
+    for name in config["derived"]["stages"]:
+        if stage is not None and name != stage:
+            continue
+        items = [item for item in config["derived"]["workloads"] if item["stage"] == name]
+        requested = sum(item["memory_mib"] for item in items)
+        storage = sum(item["storage_mib"] for item in items)
+        path = workspace / "reports" / f"applied-{name}.json"
         previous = read_json(path) if path.exists() else {}
         prior_memory = (
             previous.get("memory_requests_mib", 0) if previous.get("status") == "applied" else 0
         )
         prior_storage = previous.get("storage_mib", 0) if previous.get("status") == "applied" else 0
-        additional_memory = max(0, requested - prior_memory)
-        remaining_memory += additional_memory
-        largest_request = max(largest_request, additional_memory)
-        remaining_storage += max(0, storage.get(stage, 0) - prior_storage)
-    return remaining_memory, remaining_storage, largest_request
+        if requested <= prior_memory and storage <= prior_storage:
+            continue
+        result.extend(
+            {**item, "storage_mib": max(0, item["storage_mib"] - prior_storage)} for item in items
+        )
+    return result
+
+
+# Inputs: resolved config, Nodes and whether the class must already exist. Outputs: structured storage checks.
+# Purpose: validate the existing CSI driver and selected topology without installing a provisioner. Dependencies: read-only Kubernetes APIs.
+def _storage_checks(config: dict, nodes: list[dict], require_class: bool) -> list[tuple]:
+    storage = config["storage"]
+    selected = set(storage["nodes"]) or {item["metadata"]["name"] for item in nodes}
+    checks = [
+        (
+            "storage_nodes",
+            selected.issubset({item["metadata"]["name"] for item in nodes}),
+            {"eligible": sorted(selected)},
+        )
+    ]
+    if storage["mode"] == "csi":
+        driver = _get(config, "csidrivers.storage.k8s.io", "hostpath.csi.k8s.io")
+        registrations = _get(config, "csinodes.storage.k8s.io")["items"]
+        registered = {
+            item["metadata"]["name"]
+            for item in registrations
+            if any(
+                entry["name"] == "hostpath.csi.k8s.io"
+                and "topology.hostpath.csi/node" in entry.get("topologyKeys", [])
+                for entry in item["spec"].get("drivers", [])
+            )
+        }
+        labeled = {
+            item["metadata"]["name"]
+            for item in nodes
+            if item["metadata"].get("labels", {}).get("topology.hostpath.csi/node")
+            == item["metadata"]["name"]
+            and item["metadata"].get("labels", {}).get("kubernetes.io/hostname")
+            == item["metadata"]["name"]
+        }
+        daemonset = _get(config, "daemonsets.apps", "csi-hostpathplugin", "kube-system") or {}
+        status = daemonset.get("status", {})
+        desired = status.get("desiredNumberScheduled", 0)
+        checks.append(
+            (
+                "csi_driver",
+                bool(driver)
+                and selected.issubset(registered & labeled)
+                and desired > 0
+                and status.get("numberReady", 0) == desired,
+                {
+                    "driver": "hostpath.csi.k8s.io",
+                    "selected_nodes": sorted(selected),
+                    "ready": status.get("numberReady", 0),
+                    "desired": desired,
+                },
+            )
+        )
+    if require_class:
+        item = _get(config, "storageclasses.storage.k8s.io", storage["class"])
+        valid = (
+            bool(item)
+            and item.get("volumeBindingMode") == "WaitForFirstConsumer"
+            and item.get("reclaimPolicy") == "Retain"
+        )
+        if storage["mode"] != "reuse":
+            valid = (
+                valid
+                and item["metadata"].get("labels", {}).get(ENVIRONMENT_LABEL)
+                == config["environment_id"]
+            )
+        if storage["mode"] == "csi" and item:
+            allowed = [
+                expression
+                for term in item.get("allowedTopologies", [])
+                for expression in term.get("matchLabelExpressions", [])
+            ]
+            valid = (
+                valid
+                and item.get("provisioner") == "hostpath.csi.k8s.io"
+                and len(allowed) == 1
+                and allowed[0].get("key") == "topology.hostpath.csi/node"
+                and set(allowed[0].get("values", [])) == selected
+            )
+        checks.append(
+            (
+                "storage_class",
+                bool(valid),
+                {
+                    "name": storage["class"],
+                    "present": bool(item),
+                    "binding": item.get("volumeBindingMode") if item else None,
+                    "reclaim": item.get("reclaimPolicy") if item else None,
+                },
+            )
+        )
+    return checks
 
 
 # Inputs: normalized configuration. Outputs: required in-cluster Kubernetes API /32 peers.
@@ -177,13 +279,21 @@ def _api_peers(config: dict) -> set[str]:
     return {f"{address}/32" for address in addresses}
 
 
-# Inputs: normalized configuration and private workspace. Outputs: persisted read-only inventory and prerequisite checks.
+# Inputs: resolved configuration, workspace, dependency scope, optional stage or prerequisite forecasts. Outputs: read-only inventory.
 # Purpose: Measure the actual target before generating or executing plans. Dependencies: kubectl GET, kubelet summary access.
-def inspect(config: dict, workspace: Path) -> dict:
+def inspect(
+    config: dict,
+    workspace: Path,
+    *,
+    check_dependencies: bool = True,
+    stage: str | None = None,
+    workloads: list[dict] | None = None,
+) -> dict:
     report = {
         "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "checks": [],
         "status": "blocked",
+        "scope": stage or ("platform" if workloads is None else "prerequisite-foundation"),
     }
     try:
         report["identity"] = _identity(config)
@@ -230,31 +340,18 @@ def inspect(config: dict, workspace: Path) -> dict:
             bool(nodes) and all(_condition(item) for item in nodes),
             {"nodes": [item["metadata"]["name"] for item in nodes]},
         )
-        eligible = (
-            set(config["storage"]["nodes"])
-            if config["storage"]["mode"] == "create"
-            else {item["metadata"]["name"] for item in nodes}
+        forecasts = (
+            _remaining_workloads(config, workspace, stage) if workloads is None else workloads
         )
-        _check(
-            report,
-            "storage_nodes",
-            eligible.issubset({item["metadata"]["name"] for item in nodes}),
-            {"eligible": sorted(eligible)},
-        )
-        memory_needed, storage_needed, largest_request = _remaining_demand(config, workspace)
         measurements = []
         for node in nodes:
             name = node["metadata"]["name"]
-            if name not in eligible:
-                continue
             response = run(
                 _kube(config) + ["get", "--raw", f"/api/v1/nodes/{name}/proxy/stats/summary"],
                 timeout=20,
             )
             if response.returncode:
-                raise RuntimeError(
-                    "Measured node capacity is unavailable; allocatable capacity cannot replace it."
-                )
+                raise RuntimeError("Measured node capacity is unavailable; planning is blocked.")
             summary = json.loads(response.stdout)["node"]
             measurements.append(
                 {
@@ -263,97 +360,61 @@ def inspect(config: dict, workspace: Path) -> dict:
                     "disk_available_mib": int(summary["fs"]["availableBytes"]) // 1048576,
                 }
             )
-        report["capacity"] = {
-            "nodes": measurements,
-            "new_memory_requests_mib": memory_needed,
-            "new_storage_mib": storage_needed,
-        }
-        _check(
-            report,
-            "measured_memory",
-            bool(measurements)
-            and sum(item["memory_available_mib"] for item in measurements) >= memory_needed + 256,
-            "Measured aggregate memory needs new requests plus 256MiB headroom.",
+        pods = _get(config, "pods", all_namespaces=True)["items"]
+        report["capacity"] = assess(
+            nodes,
+            pods,
+            measurements,
+            forecasts,
+            config["storage"]["nodes"],
+            config["budget"]["min_disk_free_mib"],
         )
-        _check(
-            report,
-            "single_node_memory",
-            bool(measurements)
-            and max(item["memory_available_mib"] for item in measurements) >= largest_request + 128,
-            "At least one eligible node must fit the largest new stage request plus 128MiB headroom.",
-        )
-        _check(
-            report,
-            "measured_disk",
-            bool(measurements)
-            and all(
-                item["disk_available_mib"] >= storage_needed + config["budget"]["min_disk_free_mib"]
-                for item in measurements
-            ),
-            "Every eligible local-storage node must fit all new volumes plus disk headroom.",
-        )
-        if config["storage"]["mode"] == "reuse":
-            storage_class = _get(
-                config, "storageclasses.storage.k8s.io", config["storage"]["class"]
-            )
+        for name, passed in report["capacity"]["checks"].items():
             _check(
                 report,
-                "storage_class",
-                bool(storage_class)
-                and storage_class.get("volumeBindingMode") == "WaitForFirstConsumer"
-                and storage_class.get("reclaimPolicy") == "Retain",
-                "An explicit WFFC/Retain StorageClass is required.",
+                name,
+                passed,
+                {
+                    "memory_requests_mib": report["capacity"]["new_memory_requests_mib"],
+                    "storage_mib": report["capacity"]["new_storage_mib"],
+                    "disk_reserve_mib": config["budget"]["min_disk_free_mib"],
+                    "placement": "Pod memory includes assigned requests and measured availability; each volume uses one eligible node.",
+                },
             )
-        required_crds = []
-        if config["kafka"]["enabled"]:
-            required_crds += [
-                "kafkas.kafka.strimzi.io",
-                "kafkanodepools.kafka.strimzi.io",
-                "kafkatopics.kafka.strimzi.io",
-                "kafkausers.kafka.strimzi.io",
-            ]
-            _check(
-                report,
-                "kafka_namespace",
-                any(
-                    item["metadata"]["name"] == config["kafka"]["namespace"] for item in namespaces
-                ),
-                "The existing Strimzi namespace must be present.",
-            )
-            operators = _get(config, "deployments.apps", namespace=config["kafka"]["namespace"])[
-                "items"
-            ]
-            strimzi = [
-                item
-                for item in operators
-                if any(
-                    "strimzi/operator" in container.get("image", "")
-                    for container in item.get("spec", {})
-                    .get("template", {})
-                    .get("spec", {})
-                    .get("containers", [])
-                )
-            ]
-            matching = [
-                item
-                for item in strimzi
-                if any(
-                    container.get("image", "").split("@")[0] == "quay.io/strimzi/operator:1.3.0"
-                    for container in item["spec"]["template"]["spec"]["containers"]
-                )
-                and item.get("status", {}).get("availableReplicas", 0)
-                >= item.get("spec", {}).get("replicas", 1)
-                and item.get("status", {}).get("updatedReplicas", 0)
-                >= item.get("spec", {}).get("replicas", 1)
-                and item.get("status", {}).get("observedGeneration", 0)
-                >= item.get("metadata", {}).get("generation", 1)
-            ]
-            _check(
-                report,
-                "strimzi_profile",
-                len(strimzi) == len(matching) == 1,
-                "One available Strimzi 1.3.0 Operator is required by the Kafka 4.3.1 profile; no Operator is installed or upgraded.",
-            )
+        if workloads is None and (
+            stage is None or stage in {"05-storage-csi", "30-postgres", "31-kafka"}
+        ):
+            require_class = config["storage"]["mode"] == "reuse" or stage in {
+                "30-postgres",
+                "31-kafka",
+            }
+            for name, passed, detail in _storage_checks(config, nodes, require_class):
+                _check(report, name, passed, detail)
+        if check_dependencies:
+            from prerequisites import installed
+
+            for component, enabled in (
+                ("strimzi", config["kafka"]["enabled"]),
+                ("monitoring", config["monitoring"]["enabled"]),
+            ):
+                if enabled and (
+                    stage is None
+                    or stage == "40-monitoring"
+                    or component == "strimzi"
+                    and stage == "31-kafka"
+                ):
+                    installed(config, component)
+                    _check(
+                        report,
+                        f"{component}_installation",
+                        True,
+                        "Compatible installation is ready.",
+                    )
+        if (
+            check_dependencies
+            and config["kafka"]["enabled"]
+            and (stage is None or stage in {"31-kafka", "40-monitoring"})
+        ):
             required_peers = _api_peers(config)
             _check(
                 report,
@@ -363,32 +424,6 @@ def inspect(config: dict, workspace: Path) -> dict:
                     "required_cidrs": sorted(required_peers),
                     "configured_cidrs": config["network"]["api_server_cidrs"],
                 },
-            )
-        if config["monitoring"]["enabled"]:
-            required_crds += [
-                "podmonitors.monitoring.coreos.com",
-                "prometheusrules.monitoring.coreos.com",
-            ]
-            _check(
-                report,
-                "monitoring_namespace",
-                any(
-                    item["metadata"]["name"] == config["monitoring"]["namespace"]
-                    for item in namespaces
-                ),
-                "The reused monitoring namespace must be present.",
-            )
-        for name in required_crds:
-            crd = _get(config, "customresourcedefinitions.apiextensions.k8s.io", name)
-            served = bool(crd) and any(
-                version.get("name") == "v1" and version.get("served") is True
-                for version in crd.get("spec", {}).get("versions", [])
-            )
-            _check(
-                report,
-                f"crd/{name}",
-                bool(crd) and _condition(crd, "Established") and served,
-                "Required existing CRD must be Established and serve the v1 API used by the assets.",
             )
         selector = ",".join(
             f"{key}={value}" for key, value in sorted(config["network"]["dns_labels"].items())
@@ -441,11 +476,11 @@ def inspect(config: dict, workspace: Path) -> dict:
 # Inputs: normalized configuration, selected stage. Outputs: required earlier stages.
 # Purpose: Keep optional-component ordering explicit without a generic workflow framework. Dependencies: enabled stage list.
 def _dependencies(config: dict, stage: str) -> list[str]:
-    if stage in ("00-bootstrap", "05-storage"):
+    if stage in ("00-bootstrap", "05-storage", "05-storage-csi"):
         return []
     required = ["00-bootstrap"]
-    if stage in ("30-postgres", "31-kafka") and config["storage"]["mode"] == "create":
-        required.append("05-storage")
+    if stage in ("30-postgres", "31-kafka") and config["derived"]["storage_stage"]:
+        required.append(config["derived"]["storage_stage"])
     if stage == "40-monitoring":
         required += [
             name for name in ("30-postgres", "31-kafka") if name in config["derived"]["stages"]
@@ -470,9 +505,13 @@ def _stage_ready(config: dict, stage: str) -> tuple[bool, str]:
             == config["environment_id"]
             for item in objects
         ), "Owned application, data and validation namespaces must exist."
-    if stage == "05-storage":
+    if stage in {"05-storage", "05-storage-csi"}:
         item = _get(config, "storageclasses.storage.k8s.io", config["storage"]["class"])
-        return bool(item) and item.get("volumeBindingMode") == "WaitForFirstConsumer" and item.get(
+        return bool(item) and item.get("metadata", {}).get("labels", {}).get(
+            ENVIRONMENT_LABEL
+        ) == config["environment_id"] and item.get(
+            "volumeBindingMode"
+        ) == "WaitForFirstConsumer" and item.get(
             "reclaimPolicy"
         ) == "Retain", "Owned WFFC/Retain StorageClass must be ready."
     if stage == "30-postgres":
@@ -584,6 +623,46 @@ def _resource_identity(resource_type: str, values: dict) -> dict:
     }
 
 
+# Inputs: Terraform resource type and a before/after change. Outputs: none or a migration blocker.
+# Purpose: preserve existing volumes, partitions and retained messages when defaults become smaller. Dependencies: provider plan shapes.
+def _protect_data(resource_type: str, change: dict) -> None:
+    before, after = change.get("before"), change.get("after")
+    if not before or not after:
+        return
+    if resource_type == "kubernetes_persistent_volume_claim_v1":
+        old = before["spec"][0]["resources"][0]["requests"]["storage"]
+        new = after["spec"][0]["resources"][0]["requests"]["storage"]
+        if memory_mib(new) < memory_mib(old):
+            raise RuntimeError("PVC shrinking requires a separate data migration.")
+    if resource_type == "kubernetes_manifest":
+        old, new = before["manifest"], after["manifest"]
+        if old["kind"] == "KafkaNodePool":
+            previous = {item["id"]: item["size"] for item in old["spec"]["storage"]["volumes"]}
+            current = {item["id"]: item["size"] for item in new["spec"]["storage"]["volumes"]}
+            if any(
+                key not in current or memory_mib(current[key]) < memory_mib(size)
+                for key, size in previous.items()
+            ):
+                raise RuntimeError(
+                    "Kafka volume removal or shrinking requires a separate data migration."
+                )
+        if old["kind"] == "KafkaTopic":
+            if new["spec"]["partitions"] < old["spec"]["partitions"]:
+                raise RuntimeError("Existing Kafka partitions cannot be reduced by this workflow.")
+            for key in ("retention.ms", "retention.bytes"):
+                previous = old["spec"].get("config", {}).get(key)
+                current = new["spec"].get("config", {}).get(key)
+                if (
+                    previous is not None
+                    and current is not None
+                    and int(current) >= 0
+                    and (int(previous) < 0 or int(current) < int(previous))
+                ):
+                    raise RuntimeError(
+                        "Reducing existing Kafka retention requires a separate data migration."
+                    )
+
+
 # Inputs: normalized configuration and decoded Terraform plan. Outputs: safe resource-action summary.
 # Purpose: Reject deletion, import, unsupported resources and collisions with resources outside this state. Dependencies: kubectl GET.
 def _review_changes(config: dict, document: dict) -> list[dict]:
@@ -595,6 +674,7 @@ def _review_changes(config: dict, document: dict) -> list[dict]:
         actions = change["actions"]
         if "delete" in actions or change.get("importing"):
             raise RuntimeError("Destructive or importing plans are not supported by this skill.")
+        _protect_data(item["type"], change)
         identity = _resource_identity(
             item["type"], change.get("after") or change.get("before") or {}
         )
@@ -663,7 +743,7 @@ def _fresh_plan_directory(workspace: Path, stage: str) -> Path:
 def plan(config: dict, workspace: Path, stage: str, plugin_dir: Path | None = None) -> dict:
     directory = _fresh_plan_directory(workspace, stage)
     try:
-        inventory = inspect(config, workspace)
+        inventory = inspect(config, workspace, stage=stage)
         if inventory["status"] != "pass":
             raise RuntimeError(
                 "Preflight is blocked; inspect the inventory report before planning."
@@ -786,7 +866,7 @@ def apply(config: dict, workspace: Path, stage: str, plan_id: str, execute: bool
             "changes": review["changes"],
             "requires_execute": True,
         }
-    inventory = inspect(config, workspace)
+    inventory = inspect(config, workspace, stage=stage)
     if inventory["status"] != "pass" or inventory["identity"] != review["identity"]:
         raise RuntimeError("Target identity or prerequisites changed; execution is blocked.")
     _prerequisites(config, workspace, stage)

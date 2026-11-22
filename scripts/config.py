@@ -19,21 +19,26 @@ DEFAULTS = {
     "application": {"namespace": "", "service_account": "", "database": "", "username": ""},
     "postgres": {
         "enabled": True,
-        "storage": "4Gi",
+        "storage": "1Gi",
         "resources": {
-            "requests": {"cpu": "250m", "memory": "384Mi"},
-            "limits": {"cpu": "1000m", "memory": "768Mi"},
+            "requests": {"cpu": "250m", "memory": "256Mi"},
+            "limits": {"cpu": "1000m", "memory": "512Mi"},
         },
     },
     "kafka": {
         "enabled": True,
         "namespace": "kafka",
-        "storage": "4Gi",
+        "storage": "1Gi",
+        "heap_mib": 256,
+        "partitions": 1,
+        "retention_hours": 6,
+        "retention_mib": 64,
+        "segment_mib": 16,
         "topics": [],
         "consumer_group": "",
         "resources": {
-            "requests": {"cpu": "300m", "memory": "768Mi"},
-            "limits": {"cpu": "1500m", "memory": "1280Mi"},
+            "requests": {"cpu": "300m", "memory": "512Mi"},
+            "limits": {"cpu": "1500m", "memory": "768Mi"},
         },
     },
     "monitoring": {
@@ -48,7 +53,7 @@ DEFAULTS = {
         "dns_labels": {"k8s-app": "kube-dns"},
         "api_server_cidrs": [],
     },
-    "budget": {"max_memory_requests_mib": 2048, "min_disk_free_mib": 2048},
+    "budget": {"max_memory_requests_mib": 2048, "min_disk_free_mib": 512},
 }
 DNS = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
 SQL = r"[a-z][a-z0-9_]{0,30}"
@@ -184,10 +189,10 @@ def load_config(path):
     }:
         raise ValueError("Application and infrastructure namespaces must be distinct")
     storage = config["storage"]
-    if storage["mode"] not in {"reuse", "create"}:
-        raise ValueError("storage.mode must be reuse or create")
+    if storage["mode"] not in {"reuse", "create", "csi"}:
+        raise ValueError("storage.mode must be reuse, create or csi")
     storage["class"] = storage["class"] or (
-        f"{env}-local-retain" if storage["mode"] == "create" else ""
+        f"{env}-local-retain" if storage["mode"] != "reuse" else ""
     )
     identifier(storage["class"], DNS, "storage.class")
     managed_namespaces = {app["namespace"], f"{env}-data", f"{env}-validation"}
@@ -198,8 +203,8 @@ def load_config(path):
     for component in ("kafka", "monitoring"):
         if config[component]["enabled"] and config[component]["namespace"] in managed_namespaces:
             raise ValueError("Reused infrastructure namespaces cannot also be managed namespaces")
-    if storage["mode"] == "create" and not storage["nodes"]:
-        raise ValueError("Creating Local Path requires explicitly selected node names")
+    if storage["mode"] != "reuse" and not storage["nodes"]:
+        raise ValueError("Creating storage requires explicitly selected node names")
     for node in storage["nodes"]:
         if not isinstance(node, str):
             raise ValueError("storage.nodes must contain node names")
@@ -229,29 +234,58 @@ def load_config(path):
             raise ValueError("network.api_server_cidrs contains an invalid CIDR") from None
         if parsed.version != 4 or parsed.prefixlen != 32:
             raise ValueError("API server egress requires explicit IPv4 /32 addresses")
-    requested = 64 if storage["mode"] == "create" else 0
-    total_storage = 0
+    quantities = {}
     for name in ("postgres", "kafka"):
         component = config[name]
         size = memory_mib(component["storage"])
+        quantities[name] = {"storage_mib": size}
         for unit, parser in (("cpu", cpu_millis), ("memory", memory_mib)):
             request = parser(component["resources"]["requests"][unit])
             limit = parser(component["resources"]["limits"][unit])
+            quantities[name][unit] = {"request": request, "limit": limit}
             if request > limit:
                 raise ValueError(f"{name} {unit} request exceeds its limit")
         if component["enabled"]:
             minimum_request, minimum_limit = (256, 512) if name == "postgres" else (512, 768)
             if (
-                memory_mib(component["resources"]["requests"]["memory"]) < minimum_request
-                or memory_mib(component["resources"]["limits"]["memory"]) < minimum_limit
+                quantities[name]["memory"]["request"] < minimum_request
+                or quantities[name]["memory"]["limit"] < minimum_limit
             ):
                 raise ValueError(f"{name} memory is below the supported startup minimum")
-            requested += memory_mib(component["resources"]["requests"]["memory"])
-            total_storage += size
-    if config["postgres"]["enabled"] and config["monitoring"]["enabled"]:
-        requested += 64
+    for key in ("heap_mib", "partitions", "retention_hours", "retention_mib", "segment_mib"):
+        if kafka[key] <= 0:
+            raise ValueError(f"kafka.{key} must be a positive integer")
+    if kafka["enabled"] and kafka["heap_mib"] >= quantities["kafka"]["memory"]["request"]:
+        raise ValueError("Kafka heap must leave space within its memory request for native memory")
+    if kafka["segment_mib"] > kafka["retention_mib"]:
+        raise ValueError("Kafka segment size cannot exceed its retention target")
+    workloads = []
+    if storage["mode"] == "create":
+        workloads.append(
+            {"stage": "05-storage", "name": f"{env}-local-path", "memory_mib": 64, "storage_mib": 0}
+        )
+    for name, stage in (("postgres", "30-postgres"), ("kafka", "31-kafka")):
+        if config[name]["enabled"]:
+            workloads.append(
+                {
+                    "stage": stage,
+                    "name": f"{env}-{name}",
+                    "memory_mib": quantities[name]["memory"]["request"]
+                    + (64 if name == "postgres" and config["monitoring"]["enabled"] else 0),
+                    "storage_mib": quantities[name]["storage_mib"],
+                }
+            )
     if kafka["enabled"]:
-        requested += 256
+        workloads.append(
+            {
+                "stage": "31-kafka",
+                "name": f"{env}-kafka-entity-operator",
+                "memory_mib": 256,
+                "storage_mib": 0,
+            }
+        )
+    requested = sum(item["memory_mib"] for item in workloads)
+    total_storage = sum(item["storage_mib"] for item in workloads)
     if any(value <= 0 for value in config["budget"].values()):
         raise ValueError("Resource budgets must be positive integers")
     if requested > config["budget"]["max_memory_requests_mib"]:
@@ -259,6 +293,8 @@ def load_config(path):
     stages = ["00-bootstrap"]
     if storage["mode"] == "create":
         stages.append("05-storage")
+    elif storage["mode"] == "csi":
+        stages.append("05-storage-csi")
     stages += [
         stage
         for component, stage in (
@@ -268,21 +304,6 @@ def load_config(path):
         )
         if config[component]["enabled"]
     ]
-    memory_by_stage = {
-        "00-bootstrap": 0,
-        "05-storage": 64,
-        "30-postgres": memory_mib(config["postgres"]["resources"]["requests"]["memory"])
-        + (64 if config["monitoring"]["enabled"] else 0),
-        "31-kafka": memory_mib(kafka["resources"]["requests"]["memory"]) + 256,
-        "40-monitoring": 0,
-    }
-    storage_by_stage = {
-        "00-bootstrap": 0,
-        "05-storage": 0,
-        "30-postgres": memory_mib(config["postgres"]["storage"]),
-        "31-kafka": memory_mib(kafka["storage"]),
-        "40-monitoring": 0,
-    }
     config["derived"] = {
         "namespace": f"{env}-data",
         "validation_namespace": f"{env}-validation",
@@ -293,9 +314,17 @@ def load_config(path):
             "local-k8s-platform/environment": env,
         },
         "stages": stages,
+        "storage_stage": next((stage for stage in stages if stage.startswith("05-storage")), ""),
+        "workloads": workloads,
         "requests_memory_mib": requested,
         "total_storage_mib": total_storage,
-        "memory_requests_by_stage": {stage: memory_by_stage[stage] for stage in stages},
-        "storage_mib_by_stage": {stage: storage_by_stage[stage] for stage in stages},
+        "memory_requests_by_stage": {
+            stage: sum(item["memory_mib"] for item in workloads if item["stage"] == stage)
+            for stage in stages
+        },
+        "storage_mib_by_stage": {
+            stage: sum(item["storage_mib"] for item in workloads if item["stage"] == stage)
+            for stage in stages
+        },
     }
     return config
