@@ -13,6 +13,7 @@ from config import memory_mib
 from io_utils import private_dir, read_json, run, sha256, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
+IMAGES = read_json(ROOT / "assets" / "infra" / "versions.json")["images"]
 ENVIRONMENT_LABEL = "local-k8s-platform/environment"
 RESOURCE_TYPES = {
     "kubernetes_namespace_v1": "namespaces",
@@ -88,7 +89,8 @@ def _get(
 # Purpose: Detect cluster replacement or retargeting under the same context name. Dependencies: kubectl, kubeconfig file.
 def _identity(config: dict) -> dict:
     namespace = _get(config, "namespaces", "kube-system")
-    if not namespace or not namespace.get("metadata", {}).get("uid"):
+    uid = (namespace or {}).get("metadata", {}).get("uid")
+    if not isinstance(uid, str) or not uid:
         raise RuntimeError("Cannot establish the kube-system UID for the target cluster.")
     result = run(
         _kube(config)
@@ -105,7 +107,7 @@ def _identity(config: dict) -> dict:
         "kubeconfig": config["cluster"]["kubeconfig"],
         "kubeconfig_sha256": sha256(Path(config["cluster"]["kubeconfig"])),
         "server": server,
-        "kube_system_uid": namespace["metadata"]["uid"],
+        "kube_system_uid": uid,
     }
 
 
@@ -126,14 +128,54 @@ def _check(report: dict, name: str, passed: bool, detail: object) -> None:
     )
 
 
-# Inputs: normalized configuration, workspace, target identity. Outputs: whether the workspace binding matches.
-# Purpose: Persist the first target and reject accidental reuse for another cluster. Dependencies: private JSON workspace.
-def _bind(config: dict, workspace: Path, identity: dict) -> bool:
+# Inputs: configuration and workspace. Outputs: a complete creation report for this target, or None.
+# Purpose: require identity observed during creation before running later stages. Dependencies: private JSON report.
+def _creation_report(config: dict, workspace: Path) -> dict | None:
+    try:
+        report = read_json(workspace / "reports" / "cluster.json")
+    except FileNotFoundError:
+        return None
+    cluster = config["cluster"]
+    identity = report.get("identity") if isinstance(report, dict) else None
+    if (
+        not isinstance(identity, dict)
+        or report.get("status") != "created"
+        or report.get("profile") != cluster["name"]
+        or identity.get("context") != cluster["context"]
+        or identity.get("kubeconfig") != cluster["kubeconfig"]
+        or not isinstance(identity.get("server"), str)
+        or not identity["server"].startswith("https://")
+        or not isinstance(identity.get("kube_system_uid"), str)
+        or not identity["kube_system_uid"]
+    ):
+        return None
+    return report
+
+
+# Inputs: configuration, workspace, target identity, and whether this is initial creation.
+# Outputs: whether the target matches the workspace. Dependencies: private report and binding files.
+def _bind(
+    config: dict, workspace: Path, identity: dict, *, initial_creation: bool = False
+) -> bool:
     path = workspace / "cluster-binding.json"
     durable = {key: value for key, value in identity.items() if key != "kubeconfig_sha256"}
     binding = {"environment_id": config["environment_id"], "identity": durable}
-    if path.exists():
+    creation = None
+    if config["cluster"]["mode"] == "create" and not initial_creation:
+        creation = _creation_report(config, workspace)
+        if creation is None:
+            return False
+        recorded = {
+            key: value for key, value in creation["identity"].items() if key != "kubeconfig_sha256"
+        }
+        if recorded != durable:
+            return False
+    try:
         return read_json(path) == binding
+    except FileNotFoundError:
+        # Only legacy reports can restore a missing binding from the matching creation identity.
+        if creation and creation.get("binding_established"):
+            return False
     write_json(path, binding)
     return True
 
@@ -279,6 +321,40 @@ def _api_peers(config: dict) -> set[str]:
     return {f"{address}/32" for address in addresses}
 
 
+# Inputs: resolved configuration. Outputs: pinned image keys this configuration may deploy.
+# Purpose: scope architecture checks to enabled components. Dependencies: versions.json image keys.
+def _required_images(config: dict) -> list[str]:
+    images = []
+    if config["storage"]["mode"] == "create":
+        images += ["local_path", "storage_helper"]
+    if config["postgres"]["enabled"]:
+        images += ["postgres"] + (["postgres_exporter"] if config["monitoring"]["enabled"] else [])
+    if config["kafka"]["enabled"]:
+        # Strimzi is listed even when reused; a reused Operator still runs the pinned Kafka image.
+        images += ["kafka", "strimzi_operator"]
+    if config["monitoring"]["enabled"]:
+        images += ["prometheus_operator", "prometheus_config_reloader", "prometheus"]
+    return images
+
+
+# Inputs: resolved configuration and node objects. Outputs: check result and safe detail.
+# Purpose: block plans whose pinned images cannot run on the nodes. Dependencies: recorded image platforms.
+def _image_platforms(config: dict, nodes: list[dict]) -> tuple[bool, dict]:
+    platforms = sorted(
+        {
+            f"{node['status']['nodeInfo']['operatingSystem']}/{node['status']['nodeInfo']['architecture']}"
+            for node in nodes
+        }
+    )
+    # Any node may host a Pod, so every pinned image must support every node platform.
+    unsupported = {
+        name: [item for item in platforms if item not in IMAGES[name]["platforms"]]
+        for name in _required_images(config)
+    }
+    unsupported = {name: missing for name, missing in unsupported.items() if missing}
+    return not unsupported, {"node_platforms": platforms, "unsupported_images": unsupported}
+
+
 # Inputs: resolved configuration, workspace, dependency scope, optional stage or prerequisite forecasts. Outputs: read-only inventory.
 # Purpose: Measure the actual target before generating or executing plans. Dependencies: kubectl GET, kubelet summary access.
 def inspect(
@@ -297,12 +373,16 @@ def inspect(
     }
     try:
         report["identity"] = _identity(config)
+        bound = _bind(config, workspace, report["identity"])
         _check(
             report,
             "workspace_target",
-            _bind(config, workspace, report["identity"]),
-            "Workspace is bound to one environment and cluster identity.",
+            bound,
+            "The target must match the workspace binding.",
         )
+        if not bound:
+            write_json(workspace / "reports" / "inventory.json", report)
+            return report
         version = run(_kube(config) + ["get", "--raw", "/version"], timeout=20)
         git_version = (
             json.loads(version.stdout).get("gitVersion", "") if version.returncode == 0 else ""
@@ -340,6 +420,7 @@ def inspect(
             bool(nodes) and all(_condition(item) for item in nodes),
             {"nodes": [item["metadata"]["name"] for item in nodes]},
         )
+        _check(report, "image_platforms", *_image_platforms(config, nodes))
         forecasts = (
             _remaining_workloads(config, workspace, stage) if workloads is None else workloads
         )
@@ -940,12 +1021,17 @@ def verify(config: dict, workspace: Path) -> dict:
     }
     try:
         identity = _identity(config)
+        bound = _bind(config, workspace, identity)
         _check(
             report,
             "workspace_target",
-            _bind(config, workspace, identity),
-            "Verification must target the bound cluster.",
+            bound,
+            "Verification must match the workspace binding.",
         )
+        if not bound:
+            report.update(baseline_result="blocked", status="blocked")
+            write_json(workspace / "reports" / "verification.json", report)
+            return report
         for stage in config["derived"]["stages"]:
             ready, detail = _stage_ready(config, stage)
             _check(report, stage, ready, detail)

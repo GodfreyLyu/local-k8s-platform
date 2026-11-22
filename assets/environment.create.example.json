@@ -1,0 +1,49 @@
+{
+  "$comment": "Purpose: demonstrate creating a new, explicitly named Minikube cluster; replace the name and driver, review the cluster plan, then add the suggested API CIDRs before Kafka planning.",
+  "schema_version": 1,
+  "environment_id": "example-dev",
+  "cluster": {
+    "type": "minikube",
+    "mode": "create",
+    "name": "example-dev",
+    "kubeconfig": "~/.kube/config",
+    "create": {
+      "driver": "krunkit",
+      "nodes": 3,
+      "cpus": 2,
+      "memory_mib": 4096,
+      "disk_mib": 20000,
+      "kubernetes_version": "v1.37.0",
+      "container_runtime": "containerd"
+    }
+  },
+  "application": {
+    "database": "example_app",
+    "username": "example_app"
+  },
+  "postgres": {
+    "enabled": true,
+    "storage": "1Gi"
+  },
+  "kafka": {
+    "enabled": true,
+    "namespace": "kafka",
+    "topics": ["example.jobs.v1", "example.jobs.dlq.v1"],
+    "consumer_group": "example-worker",
+    "storage": "1Gi"
+  },
+  "monitoring": {
+    "enabled": true,
+    "namespace": "monitoring",
+    "release": "monitoring"
+  },
+  "storage": {
+    "mode": "csi",
+    "class": "example-dev-local-retain",
+    "nodes": ["example-dev-m02", "example-dev-m03"]
+  },
+  "budget": {
+    "max_memory_requests_mib": 2048,
+    "min_disk_free_mib": 512
+  }
+}

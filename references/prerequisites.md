@@ -86,7 +86,7 @@ the Pod namespace field. Reuse requires one Strimzi 1.3.0 Operator in that names
 a matching watch scope, and established `v1` CRDs. Discovery includes Deployments
 in all namespaces, so an Operator elsewhere cannot trigger a duplicate install.
 
-New Prometheus Operator installations use version `v0.95.1`. They watch
+New Prometheus Operator installations use version `v0.95.2`. Its upstream v0.95.1 images were published for linux/amd64 only and could not start on arm64 nodes. They watch
 `monitoring.namespace` and do not manage kubelet Services. New Prometheus instances
 use version `v3.16.0`. Their Pod labels match `monitoring.pod_labels`. Their monitor
 and rule selectors match `monitoring.release` in the monitoring namespace.
@@ -148,6 +148,8 @@ The credential helper resolves OpenSSL once per preparation or bundle validation
 It passes that path to all certificate commands.
 
 ## Failure and recovery
+
+Readiness waits allow 600 seconds per resource, because first image pulls on a local VM can take minutes. A timeout reports the pending resource. Check its Pod events for slow or failed image pulls before preparing a new plan.
 
 Results are written after each creation. See
 `reports/prerequisites-<component>.json` and the consumed plan record under

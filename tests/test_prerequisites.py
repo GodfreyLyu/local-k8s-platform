@@ -164,6 +164,7 @@ class PrerequisiteTests(unittest.TestCase):
                 "status": {
                     "conditions": [{"type": "Ready", "status": "True"}],
                     "allocatable": {"memory": "16Gi"},
+                    "nodeInfo": {"operatingSystem": "linux", "architecture": "arm64"},
                 },
             },
             "nodes",
@@ -387,6 +388,32 @@ class PrerequisiteTests(unittest.TestCase):
         document["metadata"]["name"] = "second-operator"
         self.add(document)
         self.assertEqual(self.request()[0], 2)
+
+    # Inputs: an installed operator plus the entity operator Strimzi creates for a Kafka cluster.
+    # Outputs: one detected operator. Purpose: Kafka operands share the operator image but are not
+    # cluster operators (found live after 31-kafka). Dependencies: Strimzi labels and owner references.
+    def test_strimzi_operands_are_not_counted_as_operators(self):
+        self.seed(external=True)
+        document = next(
+            item
+            for item in module._documents(self.config, "strimzi")
+            if item["kind"] == "Deployment"
+        )
+        operand = json.loads(json.dumps(document))
+        operand["metadata"]["name"] = "atlas-kafka-entity-operator"
+        operand["metadata"]["labels"] = {
+            "strimzi.io/cluster": "atlas-kafka",
+            "strimzi.io/kind": "Kafka",
+        }
+        operand["metadata"]["ownerReferences"] = [
+            {"apiVersion": "kafka.strimzi.io/v1", "kind": "Kafka", "name": "atlas-kafka"}
+        ]
+        deployments = [document, operand]
+        self.assertEqual(module._operators(deployments, "strimzi"), [document])
+        del operand["metadata"]["labels"]
+        self.assertEqual(module._operators(deployments, "strimzi"), [document])
+        operand["metadata"]["ownerReferences"] = []
+        self.assertEqual(len(module._operators(deployments, "strimzi")), 2)
 
     # Inputs: an isolated foreign CRD. Outputs: collision without adoption.
     # Purpose: preserve resources from incomplete external installations. Dependencies: named GET and ownership checks.

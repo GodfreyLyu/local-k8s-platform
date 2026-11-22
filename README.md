@@ -2,7 +2,7 @@
 
 # Local Kubernetes Platform
 
-An agent skill for setting up PostgreSQL and Kafka on an existing Minikube cluster.
+An agent skill for creating or reusing a local Minikube cluster and setting up PostgreSQL and Kafka on it.
 
 A local data platform needs storage, credentials, network rules, and monitoring to work together. This project brings those pieces into one configuration and a staged Terraform workflow. The agent helps choose settings and explain results. Python and Terraform handle the actual operations.
 
@@ -10,12 +10,13 @@ The aim is to reuse the same workflow across development projects. Each environm
 
 Defaults target small local workloads. PostgreSQL requests 256Mi of memory and Kafka requests 512Mi. Each uses a 1Gi PVC. The example reuses an existing Minikube CSI driver. Training jobs, model weights, datasets, and checkpoints have separate resource budgets. See the [small local training guide](references/local-training.md).
 
-The current build has passed static validation. Live deployment and functional acceptance are still pending.
+The current build has passed static validation and a live deployment on a three-node Minikube profile, where readiness checks and Prometheus scraping passed. Functional acceptance (TLS, permissions, ACLs, NetworkPolicy traffic, backup and restore, and alert delivery) is still pending. See [Validation](references/validation.md).
 
 ## What it does
 
 | Area | Current support |
 |---|---|
+| Cluster | Reuse an existing Minikube cluster, or create a new, explicitly named profile through a reviewed create-only plan. |
 | Configuration | Choose PostgreSQL, Kafka, or both. Set names, resource requests, storage, and application access. |
 | Environment checks | Read cluster identity, ownership, node capacity, DNS, storage, and required operators. |
 | Prerequisites | Reuse compatible installations or prepare reviewed plans for missing Operators, minimal Prometheus, and local OpenSSL. |
@@ -31,7 +32,7 @@ Only one managed platform environment is supported per cluster. Keep one workspa
 
 ## What it does not do
 
-- Create or recreate Kubernetes clusters, replace the CNI, or replace and upgrade operators.
+- Start, recreate, resize, or delete existing clusters, replace the CNI, or replace and upgrade operators.
 - Build application images, deploy applications, run schema migrations, or manage message formats.
 - Provide PostgreSQL replication, Kafka replication, automatic failover, or production high availability.
 - Set up HTTPS ingress, CNPG, object storage, WAL archiving, or point-in-time recovery.
@@ -58,7 +59,7 @@ flowchart TD
 
 `scripts/config.py` checks user input and fills in defaults. Other modules use that resolved configuration. Later checks cover files and live resources, which may change during a run.
 
-`scripts/runtime.py` handles inspection, plan review, apply, and verification. `scripts/prerequisites.py` prepares reviewed dependency installs. `scripts/credentials.py` handles local certificates and fixed Secret writes.
+`scripts/cluster.py` plans and creates a new Minikube profile. `scripts/runtime.py` handles inspection, plan review, apply, and verification. `scripts/prerequisites.py` prepares reviewed dependency installs. `scripts/credentials.py` handles local certificates and fixed Secret writes.
 
 `scripts/capacity.py` estimates placement for individual Pods and volumes. It checks measured free memory, assigned Pod requests, disk headroom, and selected storage nodes. The estimate reports remaining capacity. Actual Kubernetes scheduling and runtime behavior still need verification.
 
@@ -90,7 +91,7 @@ Offline configuration needs **Python 3.10 or later on macOS or Linux**. The Pyth
 Cluster operations also need:
 
 - Terraform `>=1.10,<2`, kubectl, and access to the pinned providers and images.
-- An existing Minikube cluster with Calico. The current preflight accepts Kubernetes `1.35` through `1.37`.
+- An existing Minikube cluster with Calico, or minikube and a working driver to create one. The current preflight accepts Kubernetes `1.35` through `1.37`.
 - An explicit kubeconfig and context. Access must include cluster inventory and node capacity statistics.
 
 The skill can prepare these additional dependencies through a reviewed plan:
@@ -99,7 +100,7 @@ The skill can prepare these additional dependencies through a reviewed plan:
 - Prometheus Operator and a minimal Prometheus instance when monitoring is enabled.
 - Local OpenSSL for PostgreSQL credential preparation, through an existing supported package manager.
 
-Compatible existing installations are reused. New monitoring installations use Prometheus Operator `v0.95.1` and Prometheus `v3.16.0`. The [prerequisite guide](references/prerequisites.md) covers scope, permissions, local package managers, and recovery.
+Compatible existing installations are reused. New monitoring installations use Prometheus Operator `v0.95.2` and Prometheus `v3.16.0`. The [prerequisite guide](references/prerequisites.md) covers scope, permissions, local package managers, and recovery.
 
 Versions and image digests are listed in [the version record](assets/infra/versions.json). The Kafka profile uses Kafka `4.3.1`; PostgreSQL uses `17.11`.
 
@@ -114,6 +115,15 @@ cp assets/environment.example.json ../demo-environment.json
 Edit the copy before using it. The example enables PostgreSQL, Kafka, and monitoring. For PostgreSQL alone, set both `kafka.enabled` and `monitoring.enabled` to `false`.
 
 Choose a stable `environment_id` and the actual cluster context. The example uses `storage.mode=csi` with workers `minikube-m02` and `minikube-m03`. Review those names and the existing driver. For `storage.mode=reuse`, supply a reviewed WFFC/Retain class. For `storage.mode=create`, select nodes for a new Local Path controller. When Kafka is enabled, supply the checked API Service and endpoint `/32` addresses. The [configuration reference](references/configuration.md) explains these fields and their defaults.
+
+To create a new cluster instead, start from `assets/environment.create.example.json`. Set `cluster.mode=create`, an explicit `cluster.name`, and `cluster.create.driver`. After `configure`, review and execute the cluster plan before any other cluster step:
+
+```sh
+python3 -B scripts/platform.py --config ../demo-environment.json --workspace "$HOME/local-k8s-workspaces/demo" cluster
+python3 -B scripts/platform.py --config ../demo-environment.json --workspace "$HOME/local-k8s-workspaces/demo" cluster --plan-id REVIEWED_PLAN_ID --execute
+```
+
+Conflicting profiles, planned machine names, or kubeconfig entries block creation. Later operations use the identity recorded when the cluster was created. See [Create a Minikube cluster](references/operations.md#create-a-minikube-cluster).
 
 Generate the local workspace:
 
@@ -163,7 +173,7 @@ Pull requests targeting `main` run the `CI` workflow. Its `Tests` job runs the o
 
 Required checks and review rules are GitHub repository settings. They are not defined by this workflow. The workflow alone does not block merges.
 
-The current build passed **109 offline tests** on Python `3.13`. Prerequisite tests use fake Kubernetes and package tools. Prometheus and the rendered Kafka manifests passed offline CRD-schema checks. Native Terraform validation passed **18 configuration profiles and 63 stage instances**, with no errors or warnings. That run used Terraform `1.15.8` and Kubernetes provider `2.38.0`.
+The current build passed **121 offline tests** on Python `3.13`. Prerequisite tests use fake Kubernetes and package tools. Prometheus and the rendered Kafka manifests passed offline CRD-schema checks. Native Terraform validation passed **18 configuration profiles and 63 stage instances**, with no errors or warnings. That run used Terraform `1.15.8` and Kubernetes provider `2.38.0`.
 
 These results cover the implementation and static provider schema. This project has not completed live deployment or functional acceptance. The [validation report](references/validation.md) records the checks and their limits.
 

@@ -4,7 +4,7 @@
 
 Run commands from the skill's root. Supply a configuration and a private workspace outside the repository. Use one workspace for the managed environment in a cluster. Keep packaged scripts and assets unchanged.
 
-The helpers need Python 3.10 or later on macOS or Linux. They use only the Python standard library. Cluster operations also need Terraform `>=1.10,<2`, kubectl, and an existing Minikube kubeconfig. Pinned providers and images must be available. Use the [prerequisite workflow](prerequisites.md) to prepare missing Operators, minimal monitoring, or local OpenSSL.
+The helpers need Python 3.10 or later on macOS or Linux. They use only the Python standard library. Cluster operations also need Terraform `>=1.10,<2`, kubectl, and a Minikube kubeconfig context. A new cluster also needs minikube and a working driver. Pinned providers and images must be available. Use the [prerequisite workflow](prerequisites.md) to prepare missing Operators, minimal monitoring, or local OpenSSL.
 
 ## Command effects
 
@@ -13,6 +13,9 @@ Every `platform.py` action loads the configuration and locks the workspace. It r
 | Command | Local effects | Cluster effects |
 |---|---|---|
 | `configure` | Fill in defaults and copy selected stage files into the workspace. | None; offline. |
+| `cluster` | Check profile, machine, and kubeconfig names. Save a review and plan ID. | None. |
+| `cluster --plan-id ID` | Preview a saved cluster plan. | None. |
+| `cluster --plan-id ID --execute` | Save the verified cluster binding, creation result, and suggested API addresses. | Run the reviewed `minikube start` once for the new profile. |
 | `prerequisites` | Save a review and plan ID for selected dependencies. | Read inventory and create permissions. No writes. |
 | `prerequisites --plan-id ID` | Preview a saved dependency plan. | None. |
 | `prerequisites --plan-id ID --execute` | Install reviewed local packages and record partial results. | Create missing reviewed namespaces, CRDs, RBAC, and workloads. |
@@ -27,7 +30,7 @@ Every `platform.py` action loads the configuration and locks the workspace. It r
 | `credentials --component kafka --execute` | Record handoff results. | Read selected Strimzi client fields and write application client Secrets. |
 | `verify` | Save baseline results and pending acceptance items. | Read-only checks for enabled components. |
 
-The CLI has no destroy, import, cluster creation, or cleanup command. Configuration and preview commands do not authorize later writes. Building this project does not install the skill globally.
+The CLI has no destroy, import, cluster deletion, restart, or cleanup command. `cluster` only creates a profile that does not exist yet. Configuration and preview commands do not authorize later writes. Building this project does not install the skill globally.
 
 To build a portable archive, choose an output path outside the maintained source directories:
 
@@ -36,6 +39,21 @@ python3 -B scripts/package.py --output /private/path/local-k8s-platform.tar.gz
 ```
 
 The archive contains the maintained skill files, tests, and a checksum manifest. Identical source produces identical archive bytes. Private workspaces and runtime files are excluded. Packaging does not install or deploy anything.
+
+## Create a Minikube cluster
+
+Use this only with `cluster.mode=create`. The configuration names the new profile in `cluster.name`; the kubeconfig context gets the same name. Reuse mode rejects the `cluster` action.
+
+1. Run `cluster`. It records the Minikube executable and version, the host platform, and collisions with the planned profile, machines, and kubeconfig entries.
+2. Review the exact `minikube start` command: profile, driver, node count, CPUs, memory, disk, Kubernetes version, container runtime, `--cni=calico`, and CSI addons when `storage.mode=csi`. `KUBECONFIG` is set to the configured file. `--keep-context=true` leaves the current context unchanged.
+3. After authorization of that plan, run `cluster --plan-id ID --execute`. Execution checks again that nothing changed since review, consumes the plan, and starts the cluster once, with a 30-minute timeout.
+4. Copy the reviewed `suggested_api_server_cidrs` from `reports/cluster.json` into `network.api_server_cidrs` when Kafka is enabled. Then continue with `prerequisites` and `inspect`.
+
+After a successful start, the CLI records the API endpoint and the `kube-system` namespace UID in `cluster-binding.json` before marking `reports/cluster.json` as `created`. Later cluster operations require the target to match the creation identity and the workspace binding. A legacy creation report with a complete identity can establish a missing binding after the live identity matches it. Offline actions still work.
+
+An existing profile with this name blocks, whether it is running, stopped, or invalid. A machine record for any planned node or a matching context, cluster, or user entry in the selected kubeconfig also blocks. To use an existing profile, start it outside this workflow and switch to `cluster.mode=reuse`. Execution rechecks these conditions before starting Minikube.
+
+A failed start records `failed`. A timeout or an identity verification or binding failure records `uncertain`. These outcomes preserve the profile and block later stages. Inspect the profile with `minikube status -p NAME` and `minikube logs -p NAME` before deciding on recovery. A consumed plan cannot run again.
 
 ## Workspace and identity
 
@@ -72,6 +90,8 @@ Before invoking Terraform apply, the runtime consumes the reviewed plan. A runne
 Capacity checks use measured free memory and allocatable memory minus assigned Pod requests. They include init peaks, restartable init sidecars, and Pod overhead. The placement estimate reserves 128Mi per used node and 256Mi of aggregate memory headroom. Each volume is assigned once within the selected storage nodes. The algorithm tries at most 10000 assignments and reports a blocker if it finds none.
 
 An unused node with less disk space does not need to fit every volume. Read the report's `allocations` and remaining-capacity fields. These are estimates, not scheduling reservations. CPU, image pulls, admission, concurrent work, and runtime behavior need separate evidence.
+
+`image_platforms` compares every node's `linux/<arch>` with the platforms recorded for each pinned image the configuration may deploy. A missing platform blocks planning, because a Pod on that node could never pull its image.
 
 Check free disk space on selected storage nodes and verify binding and retention. Local volumes belong to their nodes. PVC size is neither a host disk quota nor a backup.
 

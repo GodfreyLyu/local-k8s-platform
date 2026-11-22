@@ -168,7 +168,10 @@ resource "kubernetes_deployment_v1" "controller" {
             requests = { cpu = "50m", memory = "64Mi" }
             limits   = { cpu = "200m", memory = "128Mi" }
           }
+          # Set run_as_non_root here too: provider v2 sends an omitted container field as false,
+          # which overrides the Pod value and fails the restricted Pod Security profile.
           security_context {
+            run_as_non_root            = true
             allow_privilege_escalation = false
             read_only_root_filesystem  = true
             capabilities { drop = ["ALL"] }

@@ -14,6 +14,6 @@ Use the packaged scripts to run operations. Keep credentials out of Terraform in
 
 The build task allows file creation, local validation, and isolated tests. It does not authorize cluster changes. Get authorization for the current plan before live deployment. Include Secret writes and any tests that change cluster state in that scope.
 
-Do not create or recreate clusters, replace operators or CNI, or import resources as a side effect. Do not destroy environments or clean up unknown data.
+Create a cluster only as a new, explicitly named Minikube profile through a reviewed `cluster` plan with its own authorization. Do not recreate, restart, or delete clusters, replace operators or CNI, or import resources as a side effect. Do not destroy environments or clean up unknown data.
 
 Check changed behavior with focused offline tests. Use fake tools to test command orchestration. Keep test files in private temporary directories. Runtime acceptance needs evidence from the selected environment.

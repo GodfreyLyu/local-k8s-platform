@@ -2,13 +2,13 @@
 
 # Validation
 
-This report includes build checks from 2026-11-14 for the small local profile, prerequisite automation, and existing-CSI storage. The results cover implementation, static validation, and a selected-cluster read-only preflight. Deployment and functional acceptance remain pending.
+This report includes build checks from 2026-11-14 for the small local profile, prerequisite automation, and existing-CSI storage, and live runs from 2026-11-22 on the `skill-test` Minikube profile. The results cover implementation, static validation, a selected-cluster read-only preflight, cluster creation, prerequisites, and deployment of every stage with passing readiness checks. Functional acceptance remains pending.
 
 ## Results
 
 | Check | Result |
 |---|---|
-| Offline Python tests | 109 passed on Python 3.13. Coverage includes capacity placement, CSI checks, data migration guards, stage scopes, prerequisites, configuration, private I/O, credentials, startup, and validation orchestration. |
+| Offline Python tests | 134 passed on Python 3.13 on 2026-11-23, after the live-run fixes (previously 128, then 109). Coverage includes capacity placement, CSI checks, data migration guards, stage scopes, prerequisites, configuration, private I/O, credentials, startup, validation orchestration, cluster creation, image platforms, and container Pod Security settings. |
 | Prerequisite orchestration | 24 tests passed with private fake kubectl, Homebrew, and OpenSSL tools. Cases include missing future storage, permissions before CRD discovery, reuse, conflicts, budgets, plan integrity, and partial recovery. Linux package commands were checked without installation. |
 | Capacity placement | Eight isolated tests covered the three-node capacity pattern, effective Pod requests, shared disk accounting, taints, and joint allocation. A low-disk control node did not block worker volumes. |
 | Vendored CRD schemas | All 10 Strimzi schemas and all 10 Prometheus Operator schemas matched their official downloaded bundles. Source and packaged checksums matched. |
@@ -25,7 +25,15 @@ This report includes build checks from 2026-11-14 for the small local profile, p
 | Native configuration matrix | All 18 profiles and 63 stage instances passed, with zero errors and zero warnings. |
 | Typed input contracts | All six exact stage variable declarations accepted normalized input in provider-free, resource-free console fixtures. Twelve negative cases rejected a missing kubeconfig or an invalid context type. |
 | Selected-cluster preflight | The private small profile passed read-only inspection. The estimate placed PostgreSQL and its 1Gi volume on one worker, Kafka and its 1Gi volume on the other, and the Entity Operator on the control node. No resources were created. |
-| Live acceptance | Pending. These checks did not deploy resources or test application connections. |
+| Cluster creation (2026-11-22) | 11 isolated tests passed with private fake minikube and kubectl tools. They covered create-mode input checks, the exact reviewed `minikube start` arguments, blocking existing valid/stopped/invalid profiles and contexts, plan invalidation, consumed plans, failed starts without deletion, the pre-creation gate, and legacy workspace bindings. A read-only plan against the local minikube v1.39.0 produced the expected command and blocked the existing `minikube` profile. No cluster was created. |
+| Live cluster creation (2026-11-22) | Reviewed `cluster --execute` created the three-node krunkit profile `skill-test` (Kubernetes v1.37.0, arm64). All nodes became Ready, Calico reached 3/3, and `hostpath.csi.k8s.io` registered. Read-only `inspect` passed every cluster check and blocked only on the missing Strimzi Operator. |
+| Live prerequisites, first attempt (2026-11-22) | All 49 reviewed resources were created. Strimzi became Ready after a 191-second image pull, which exceeded the 180-second wait. Prometheus Operator v0.95.1 never started: its pinned image existed only for linux/amd64. Fixes: v0.95.2 pins, recorded image platforms with an `image_platforms` preflight check, and a 600-second readiness wait. |
+| Image platforms | All nine pinned digests were read from their registry indexes. Each now supports linux/amd64 and linux/arm64. Upstream v0.95.2 CRD schemas and ClusterRole rules equal the vendored resources. |
+| Live prerequisites repair (2026-11-22) | A fresh plan reported false drift on the Strimzi Deployment because the API server stores `1000m` as `1`; resource quantities are now compared numerically. The 15 label-verified v0.95.1 operator objects were deleted with separate authorization. During CRD deletion the 3072 MiB control-plane node ran out of memory (VM root filesystem in RAM, about 1.2 GiB) and kube-apiserver restarted. `cluster.create.memory_mib` now has a 4096 MiB minimum, and the profile is being recreated at that size. |
+| Live rebuild (2026-11-22) | After the user deleted the 3072 MiB profile, a reviewed plan recreated `skill-test` at 4096 MiB per node (control plane 1402 MiB available before prerequisites). The reviewed prerequisites plan created all 49 resources: Strimzi 1.3.0 and Prometheus Operator v0.95.2 became Ready, and Prometheus v3.16.0 reconciled. A fresh plan afterwards reported zero changes. Minikube set the kubeconfig current context to the new profile despite `--keep-context=true`; the previous current context was most likely empty. |
+| Live data stages (2026-11-22) | `00-bootstrap`, `05-storage-csi`, and PostgreSQL credentials applied as reviewed. The first `30-postgres` apply was rejected by the restricted Pod Security profile: kubernetes provider v2.38.0 sends an omitted container `run_as_non_root` as `false`, overriding the Pod value. Terraform waited until the 600-second limit, and the stage was recorded as `uncertain`. Container security contexts now set `run_as_non_root = true` (guarded by `tests/test_pod_security.py`). With authorization, the untracked StatefulSet (no Pod, no data) and the stale state lock were removed; a fresh plan created only the StatefulSet, and PostgreSQL 17.11 became Ready on `skill-test-m03` with a bound 1Gi volume. |
+| Live Kafka and monitoring (2026-11-22) | `31-kafka` applied; Strimzi reconciled Kafka, both topics, and both users to Ready in 340 seconds, and the Kafka client handoff published two application Secrets. The `40-monitoring` preflight then counted the Strimzi entity operator (same image) as a second cluster Operator; operator detection now skips Deployments labeled `strimzi.io/cluster` or owned by a `kafka.strimzi.io` resource. After the fix, `40-monitoring` applied and `verify` passed every readiness check. Prometheus reported both PodMonitor targets up (`pg_up` = 1, Kafka series present) and evaluated all three rules as inactive. |
+| Live acceptance | Readiness and scraping pass on `skill-test`. Functional acceptance (TLS, permissions, ACLs, backup and restore, alert delivery, NetworkPolicy traffic) is pending. |
 
 ## Prerequisite checks
 
@@ -39,7 +47,7 @@ resources toward the memory budget. Create-only execution preserved successful
 resources after an injected failure. A consumed plan could not run again. A fresh
 plan resumed the unchanged owned resources.
 
-The official Strimzi `1.3.0` and Prometheus Operator `v0.95.1` bundles were checked
+The official Strimzi `1.3.0` and Prometheus Operator `v0.95.2` bundles were checked
 before conversion to packaged JSON. Image digests were read from the official
 release or registry. The local Prometheus profile uses `v3.16.0`. These source
 checks establish provenance and schema consistency. They do not prove that the
