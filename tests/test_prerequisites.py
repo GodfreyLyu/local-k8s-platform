@@ -694,20 +694,28 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertFalse(self.log.exists())
 
     # Inputs: existing Linux package managers. Outputs: fixed install arguments and non-interactive elevation.
-    # Purpose: validate supported package commands without installing anything. Dependencies: mocked discovery and UID.
+    # Purpose: validate package commands and symlink resolution. Dependencies: private fake tools, mocked discovery and UID.
     def test_linux_package_commands_are_fixed_and_noninteractive(self):
-        for manager in ("apt-get", "dnf"):
+        fake_tool = "# Purpose: stand in for a Linux package tool during command planning.\n"
+        sudo_target = self.executable("sudo-wrapper", fake_tool)
+        sudo_link = self.tools / "sudo"
+        sudo_link.symlink_to(sudo_target.name)
+        for manager, flags in (
+            ("apt-get", ["--yes", "--no-install-recommends"]),
+            ("dnf", ["--assumeyes"]),
+        ):
             with self.subTest(manager=manager):
-                paths = {manager: "/usr/bin/" + manager, "sudo": "/usr/bin/sudo"}
+                executable = self.executable(manager, fake_tool)
+                paths = {manager: str(executable), "sudo": str(sudo_link)}
                 with (
                     patch.object(module.sys, "platform", "linux"),
                     patch.object(module.shutil, "which", side_effect=paths.get),
                     patch.object(module.os, "geteuid", return_value=1000),
                 ):
                     command = module._openssl_install()
-                self.assertEqual(command[:2], ["/usr/bin/sudo", "-n"])
-                self.assertEqual(command[-1], "openssl")
-                self.assertIn("install", command)
+                self.assertEqual(
+                    command, [str(sudo_target), "-n", str(executable), "install", *flags, "openssl"]
+                )
 
     # Inputs: malformed CLI requests and a disabled component. Outputs: entry-point rejection.
     # Purpose: reject invalid execution requests before subprocesses. Dependencies: argparse and normalized component selection.
