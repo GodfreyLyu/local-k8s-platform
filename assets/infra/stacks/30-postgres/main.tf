@@ -168,7 +168,10 @@ resource "kubernetes_stateful_set_v1" "postgres" {
             requests = local.e.postgres.resources.requests
             limits   = local.e.postgres.resources.limits
           }
+          # Set run_as_non_root here too: provider v2 sends an omitted container field as false,
+          # which overrides the Pod value and fails the restricted Pod Security profile.
           security_context {
+            run_as_non_root            = true
             allow_privilege_escalation = false
             read_only_root_filesystem  = true
             capabilities { drop = ["ALL"] }

@@ -1,30 +1,31 @@
 ---
 name: local-k8s-platform
-description: Prepare missing prerequisites and configure PostgreSQL and Kafka on an existing Minikube cluster. Use for local platform configuration, reviewed installation plans, and readiness checks. Cluster creation and application releases are outside its scope.
+description: Create a new, explicitly named Minikube cluster or reuse an existing one, prepare missing prerequisites, and configure PostgreSQL and Kafka on it. Use for local Kubernetes platform setup, reviewed installation plans, and readiness checks. Application releases are outside its scope.
 ---
 <!-- Purpose: Route local platform requests through validated configuration and packaged execution tools. -->
 
 # Local Kubernetes Platform
 
-Configure one platform environment per existing Minikube cluster. This release requires Calico. Reuse compatible Strimzi and Prometheus installations. Prepare missing Operators, a minimal Prometheus instance, and local OpenSSL through reviewed prerequisite plans. Required manifests, Terraform files, and Python scripts are included.
+Configure one platform environment per Minikube cluster. Reuse an existing cluster, or create a new profile with an explicit name through a reviewed plan. This release requires Calico. Reuse compatible Strimzi and Prometheus installations. Prepare missing Operators, a minimal Prometheus instance, and local OpenSSL through reviewed prerequisite plans. Required manifests, Terraform files, and Python scripts are included.
 
 Use English for maintained documentation and code comments. Respond in the user's preferred language.
 
 ## Select the work
 
 - For configuration, defaults, or component choices, read [configuration.md](references/configuration.md).
+- To create a new Minikube cluster, read [Create a Minikube cluster](references/operations.md#create-a-minikube-cluster).
 - For small-model local training and existing Minikube CSI storage, read [local-training.md](references/local-training.md).
 - Before inspecting a cluster, deploying resources, or writing credentials, read the relevant procedure in [operations.md](references/operations.md).
 - For missing Operators, monitoring setup, or local OpenSSL, read [prerequisites.md](references/prerequisites.md).
 - For implementation changes or scope decisions, read [design.md](references/design.md).
 - For offline Terraform checks or provider startup errors, read [validation.md](references/validation.md) and use `scripts/validate.py`.
 
-Support a single PostgreSQL StatefulSet and a single Strimzi KRaft node. Local storage and monitoring integration are optional. Cluster creation, operator replacement, HTTPS ingress, CNPG, PITR, and application releases are outside this version's scope. Explain unsupported requests rather than trying to enable them through configuration.
+Support a single PostgreSQL StatefulSet and a single Strimzi KRaft node. Local storage and monitoring integration are optional. Cluster creation is create-only: it never starts, recreates, or deletes an existing profile. Operator replacement, HTTPS ingress, CNPG, PITR, and application releases are outside this version's scope. Explain unsupported requests rather than trying to enable them through configuration.
 
 ## Form an explicit configuration
 
-1. Identify the context, environment ID, data services, storage, application namespace, and resource budget. Use the request and available evidence.
-2. Copy `assets/environment.example.json` outside the packaged assets. Keep passwords and private keys out of the copy.
+1. Identify the cluster mode, context or new cluster name, environment ID, data services, storage, application namespace, and resource budget. Use the request and available evidence. Never invent a cluster name; ask for one when a new cluster is wanted.
+2. Copy `assets/environment.example.json` (existing cluster) or `assets/environment.create.example.json` (new cluster) outside the packaged assets. Keep passwords and private keys out of the copy.
 3. Use `scripts/platform.py`. It checks inputs and fills in defaults. Pass that resolved configuration to later steps. Do not add a second set of input checks or unrelated shell commands.
 4. Use one private workspace for the environment and cluster. Keep packaged assets unchanged. Apply later configuration changes through the same workspace.
 
@@ -35,6 +36,18 @@ python3 -B scripts/platform.py --config environment.json --workspace /private/pa
 ```
 
 `configure` is offline. Review selected stages, resource estimates, names, and planned interfaces before contacting Kubernetes.
+
+## Create the cluster (new clusters only)
+
+With `cluster.mode=create`, the explicit `cluster.name` becomes the Minikube profile and the kubeconfig context. Later cluster actions require the identity recorded during creation.
+
+```sh
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev cluster
+```
+
+The plan reads the Minikube version, profile list, machine records, and kubeconfig entry names. Present the profile name, kubeconfig, driver, nodes, CPUs, memory, disk, Kubernetes version, CNI, addons, and the exact command. A conflicting profile, machine record, or kubeconfig entry blocks creation. Obtain authorization for that exact plan, then run `cluster --plan-id REVIEWED_PLAN_ID --execute`. This authorization is separate from prerequisites, Terraform changes, and Secret writes.
+
+The result suggests `network.api_server_cidrs` for the new cluster. Review them and add them to the configuration before Kafka prerequisites or planning. A failed or interrupted start or an unverified identity keeps the profile for inspection. Report the outcome and stop.
 
 ## Prepare prerequisites
 
@@ -86,4 +99,4 @@ python3 -B scripts/platform.py --config environment.json --workspace /private/pa
 
 `verify` runs read-only readiness checks. This release has no automated functional acceptance runner. Ready Pods and bound PVCs do not prove TLS, permissions, ACLs, network isolation, alerts, or recovery. Leave those results pending until authorized tests provide evidence.
 
-Return the resolved configuration, executed stages, plan IDs, and endpoints. Include required application labels, application-local Secret references, and remaining acceptance work. Keep credential values out of responses, logs, Terraform inputs, and state. Mark unexecuted checks as pending. Report full usability only after the relevant acceptance checks pass.
+Return the resolved configuration, created cluster profile if any, executed stages, plan IDs, and endpoints. Include required application labels, application-local Secret references, and remaining acceptance work. Keep credential values out of responses, logs, Terraform inputs, and state. Mark unexecuted checks as pending. Report full usability only after the relevant acceptance checks pass.

@@ -8,7 +8,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from config import load_config, memory_mib
+from config import DEFAULTS, load_config, memory_mib
 from io_utils import private_dir, read_json, workspace_lock, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,8 +20,12 @@ def configure(config, workspace):
     saved = workspace / "environment.json"
     if saved.exists():
         previous = read_json(saved)
-        binding = (previous["environment_id"], previous["cluster"])
-        if binding != (config["environment_id"], config["cluster"]):
+        # Workspaces saved before cluster creation support lack the new fields; read them as defaults.
+        cluster = {
+            **{key: DEFAULTS["cluster"][key] for key in ("name", "create")},
+            **previous["cluster"],
+        }
+        if (previous["environment_id"], cluster) != (config["environment_id"], config["cluster"]):
             raise ValueError(
                 "This workspace is already bound to another environment or cluster configuration"
             )
@@ -132,6 +136,9 @@ def arguments(argv=None):
     actions = parser.add_subparsers(dest="action", required=True)
     for name in ("configure", "inspect", "verify"):
         actions.add_parser(name)
+    cluster = actions.add_parser("cluster")
+    cluster.add_argument("--plan-id")
+    cluster.add_argument("--execute", action="store_true")
     plan = actions.add_parser("plan")
     plan.add_argument("--stage", required=True)
     plan.add_argument("--plugin-dir", type=Path)
@@ -153,12 +160,22 @@ def arguments(argv=None):
     args = parser.parse_args(argv)
     if args.action == "credentials" and args.component == "kafka" and args.prepare:
         parser.error("Kafka source credentials are prepared by Strimzi, not this tool")
-    if args.action == "prerequisites":
+    if args.action in {"prerequisites", "cluster"}:
         if args.execute and not args.plan_id:
-            parser.error("prerequisites --execute requires --plan-id")
+            parser.error(f"{args.action} --execute requires --plan-id")
         if args.plan_id and not re.fullmatch(r"[0-9a-f]{64}", args.plan_id):
-            parser.error("prerequisites --plan-id must be a SHA-256 identifier")
+            parser.error(f"{args.action} --plan-id must be a SHA-256 identifier")
     return args
+
+
+# Inputs: parsed CLI arguments. Outputs: whether the action reads or changes Kubernetes.
+# Purpose: identify actions that need an existing cluster. Dependencies: the argparse contract.
+def contacts_cluster(args):
+    if args.action in {"inspect", "verify", "plan", "apply"}:
+        return True
+    if args.action == "credentials":
+        return args.execute
+    return args.action == "prerequisites" and args.component != "openssl"
 
 
 # Inputs: optional CLI argv. Outputs: process exit status. Purpose: dispatch one locked operation.
@@ -182,10 +199,26 @@ def main(argv=None):
             ]
             if not config[component]["enabled"]:
                 raise ValueError("The requested prerequisite component is disabled")
+        if args.action == "cluster" and config["cluster"]["mode"] != "create":
+            raise ValueError(
+                "The cluster action requires cluster.mode=create and an explicit cluster.name"
+            )
         with workspace_lock(workspace):
             configured = configure(config, workspace)
+            if contacts_cluster(args) and config["cluster"]["mode"] == "create":
+                from cluster import created
+
+                # The creation report is live workspace state, so it is checked per operation.
+                if not created(config, workspace):
+                    raise ValueError(
+                        "The Minikube cluster is not created yet or its creation identity is unavailable; check the cluster report"
+                    )
             if args.action == "configure":
                 report = configured
+            elif args.action == "cluster":
+                from cluster import cluster
+
+                report = cluster(config, workspace, args.plan_id, args.execute)
             elif args.action == "credentials":
                 from credentials import credentials
 

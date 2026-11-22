@@ -12,9 +12,14 @@ The configuration path is expanded and resolved before reading. Relative kubecon
 |---|---|
 | `schema_version` | Configuration format version; this release uses `1`. |
 | `environment_id` | Lowercase DNS-label name, up to 24 characters. It may start with a digit. Managed resource names use it as a prefix. |
-| `cluster.type` / `cluster.mode` | `minikube` / `reuse`; the cluster already exists. |
-| `cluster.context` | Kubeconfig context used by every Kubernetes request and Terraform provider. |
-| `cluster.kubeconfig` | Kubeconfig path. Relative paths resolve from the configuration file's directory. |
+| `cluster.type` / `cluster.mode` | `minikube` / `reuse` for an existing cluster, or `create` for a new profile made by the reviewed `cluster` action. |
+| `cluster.name` | New Minikube profile name; required with `create` and rejected with `reuse`. Lowercase DNS label, up to 40 characters. |
+| `cluster.context` | Kubeconfig context used by every Kubernetes request and Terraform provider. With `create`, omit it or set it to `cluster.name`. |
+| `cluster.kubeconfig` | Kubeconfig path. Relative paths resolve from the configuration file's directory. A new cluster writes its context here. |
+| `cluster.create.driver` | Required with `create`: `docker`, `podman`, `krunkit`, `vfkit`, `qemu2`, or `kvm2`. |
+| `cluster.create.nodes` / `cpus` / `memory_mib` / `disk_mib` | Node count (1–5, default 3) and per-node CPUs (default 2), memory (default and minimum 4096 MiB; VM drivers keep the node root filesystem in RAM), and disk (default 20000 MiB). |
+| `cluster.create.kubernetes_version` | `v1.35.x` through `v1.37.x`; default `v1.37.0`, matching the preflight profile. |
+| `cluster.create.container_runtime` | `containerd` (default), `cri-o`, or `docker`. |
 | `application.namespace` | Dedicated application namespace. Defaults to an environment-based name. System namespaces are rejected. |
 | `application.service_account` | Application identity without general Kubernetes administration permissions. |
 | `application.database` / `application.username` | PostgreSQL database and application login. The entry point checks these names before SQL or shell code uses them. |
@@ -58,6 +63,12 @@ The memory budget defaults to `2048` MiB. Disk headroom defaults to `512` MiB pe
 
 The `csi` mode creates only a non-default StorageClass. It requires the existing `hostpath.csi.k8s.io` driver and its node topology registrations. The class uses `WaitForFirstConsumer`, `Retain`, and the selected `topology.hostpath.csi/node` values. PostgreSQL and Kafka use matching hostname affinity. CSI installation and replacement are outside this mode.
 
+### New cluster rules
+
+With `cluster.mode=create`, node names follow Minikube's convention: `NAME`, `NAME-m02`, `NAME-m03`, and so on. `storage.nodes` must be among them, which catches typos before any tool runs. `storage.mode=csi` adds the `csi-hostpath-driver` and `volumesnapshots` addons. The CNI is always Calico. See [assets/environment.create.example.json](../assets/environment.create.example.json).
+
+`network.api_server_cidrs` cannot be known before the cluster exists. The `cluster` result suggests them. Review and add them before enabling Kafka prerequisites or planning.
+
 Keep passwords, private keys, connection strings with credentials, and shell commands out of this file. Packaged assets pin component versions. The configuration does not accept arbitrary version overrides.
 
 ## Supported combinations
@@ -66,7 +77,7 @@ Enable PostgreSQL, Kafka, or both. Monitoring covers the services you enable. A 
 
 | Selection | Prerequisites and behavior |
 |---|---|
-| Cluster/network | Existing Minikube with Calico. The DNS selector must match Ready DNS Pods. |
+| Cluster/network | Existing Minikube with Calico, or a new profile created with `--cni=calico`. The DNS selector must match Ready DNS Pods. |
 | PostgreSQL | StatefulSet, TLS, dedicated PVC, application login, and separate monitoring login. No CNPG dependency. |
 | Kafka | Reuse or prepare Strimzi 1.3.0 in the configured namespace. One broker/controller, RF1 and minISR1. |
 | Monitoring | Reuse a compatible installation or prepare an Operator and minimal Prometheus. Match monitor selectors and Pod labels. |
@@ -74,7 +85,7 @@ Enable PostgreSQL, Kafka, or both. Monitoring covers the services you enable. A 
 | Created storage | Separate Local Path provisioner on selected nodes, with its own non-default class. Existing classes and volumes remain unchanged. |
 | Existing CSI | A new class using the current Minikube CSI Hostpath driver. No extra storage controller is installed. |
 
-This version does not support HTTPS ingress, cluster creation, CNPG, replication, failover, object storage, WAL/PITR, operator upgrades, or application releases. Adding a field to the JSON cannot enable them.
+This version does not start, recreate, resize, or delete clusters. It does not support HTTPS ingress, CNPG, replication, failover, object storage, WAL/PITR, operator upgrades, or application releases. Adding a field to the JSON cannot enable them.
 
 ## Derived resources and stages
 

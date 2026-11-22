@@ -2,7 +2,7 @@
 
 # Architecture and design decisions
 
-This skill configures a local development platform on an existing Minikube cluster. The Agent interprets requests and explains results. Terraform and Python handle the repeatable steps. Build checks do not prove that services are deployed or working.
+This skill configures a local development platform on an existing or newly created Minikube cluster. The Agent interprets requests and explains results. Terraform and Python handle the repeatable steps. Build checks do not prove that services are deployed or working.
 
 ## Responsibilities
 
@@ -14,6 +14,7 @@ This skill configures a local development platform on an existing Minikube clust
 | I/O helpers | Check directories, replace JSON files, lock the workspace, and invoke commands. | Local artifacts and captured command results. |
 | Terraform assets | Manage selected resources with separate state for each stage. | Saved plans and resources. |
 | Credential helper | Prepare credentials and write fixed Secrets outside Terraform. | Protected credentials and application-local Secret references. |
+| Cluster helper | Plan and run one create-only `minikube start` for an explicitly named profile. | Review record, creation report, and suggested API addresses. |
 | Prerequisite helper | Reuse compatible dependencies and create missing reviewed resources or local packages. | Saved manifests, plan IDs, ownership evidence, and partial-result reports. |
 | Runtime checks | Check cluster identity, ownership, prerequisites, and readiness. | Inventory, plan review, and acceptance status. |
 | Capacity helper | Estimate joint Pod memory and volume placement from current evidence. | Suggested allocations and remaining node capacity. |
@@ -79,6 +80,12 @@ Storage retention and deletion protection reduce accidental deletion through Ter
 
 The platform creates database accounts and Kafka access rules. Applications own schemas, migrations, release settings, and business behavior. Copying client credentials into the application namespace is a separate step from creating a Service.
 
+## Cluster creation
+
+`cluster.mode=create` adds one create-only operation. The user names the profile explicitly. The review binds the configuration, sources, Minikube path and version, host platform, and absence of conflicting profile, machine, and kubeconfig entries. A stopped or invalid profile also blocks creation.
+
+The command fixes Calico, CSI addons for CSI storage, the Kubernetes version range, and `--keep-context=true`. A successful start must establish a workspace binding with the cluster's API endpoint and `kube-system` UID. Later inspections and writes compare the observed identity with the binding and creation report. Restart, resize, and deletion stay operator decisions.
+
 ## Plans and execution
 
 Apply uses a saved stage plan and its review record. That record covers configuration, source files, provider lockfiles, prior state, cluster identity, and plan bytes. Changed inputs or a failed attempt make the plan ineligible. An old successful plan must not appear current.
@@ -99,4 +106,4 @@ The native validation run passed 63 stage instances across 18 profiles, includin
 
 ## Extension points
 
-New capabilities need an explicit change to the configuration version or supported combinations. Update their stages, prerequisites, credentials, and verification at the same time. Possible extensions include cluster creation, other local distributions, multiple environments per cluster, credential rotation, HTTPS ingress, and recovery tools. Converting existing single-instance services to replicated deployments requires a separate migration plan.
+New capabilities need an explicit change to the configuration version or supported combinations. Update their stages, prerequisites, credentials, and verification at the same time. Possible extensions include other local distributions, multiple environments per cluster, credential rotation, HTTPS ingress, and recovery tools. Converting existing single-instance services to replicated deployments requires a separate migration plan.

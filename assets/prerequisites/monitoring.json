@@ -1,9 +1,9 @@
 {
   "$comment": "Purpose: vendor official monitoring resources for create-only prerequisite plans. Full upstream CRD schemas are preserved; see NOTICE.md.",
-  "version": "v0.95.1",
+  "version": "v0.95.2",
   "source": {
-    "url": "https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.95.1/bundle.yaml",
-    "sha256": "6f0faaf14999d63451ecbf0d689350ecce3eeda44576d25918878c5119d618fa"
+    "url": "https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.95.2/bundle.yaml",
+    "sha256": "4bc269572c7b0a6849a6933eef2843bf2a0eaa6e55eb5d7b185efe1d2dc44335"
   },
   "items": [
     {
@@ -12,7 +12,7 @@
       "metadata": {
         "annotations": {
           "controller-gen.kubebuilder.io/version": "v0.23.0",
-          "operator.prometheus.io/version": "0.95.1"
+          "operator.prometheus.io/version": "0.95.2"
         },
         "name": "alertmanagerconfigs.monitoring.coreos.com"
       },
@@ -11329,7 +11329,7 @@
       "metadata": {
         "annotations": {
           "controller-gen.kubebuilder.io/version": "v0.23.0",
-          "operator.prometheus.io/version": "0.95.1"
+          "operator.prometheus.io/version": "0.95.2"
         },
         "name": "alertmanagers.monitoring.coreos.com"
       },
@@ -19966,7 +19966,7 @@
       "metadata": {
         "annotations": {
           "controller-gen.kubebuilder.io/version": "v0.23.0",
-          "operator.prometheus.io/version": "0.95.1"
+          "operator.prometheus.io/version": "0.95.2"
         },
         "name": "podmonitors.monitoring.coreos.com"
       },
@@ -21191,7 +21191,7 @@
       "metadata": {
         "annotations": {
           "controller-gen.kubebuilder.io/version": "v0.23.0",
-          "operator.prometheus.io/version": "0.95.1"
+          "operator.prometheus.io/version": "0.95.2"
         },
         "name": "probes.monitoring.coreos.com"
       },
@@ -22476,7 +22476,7 @@
       "metadata": {
         "annotations": {
           "controller-gen.kubebuilder.io/version": "v0.23.0",
-          "operator.prometheus.io/version": "0.95.1"
+          "operator.prometheus.io/version": "0.95.2"
         },
         "name": "prometheusagents.monitoring.coreos.com"
       },
@@ -32203,7 +32203,7 @@
       "metadata": {
         "annotations": {
           "controller-gen.kubebuilder.io/version": "v0.23.0",
-          "operator.prometheus.io/version": "0.95.1"
+          "operator.prometheus.io/version": "0.95.2"
         },
         "name": "prometheuses.monitoring.coreos.com"
       },
@@ -43925,7 +43925,7 @@
       "metadata": {
         "annotations": {
           "controller-gen.kubebuilder.io/version": "v0.23.0",
-          "operator.prometheus.io/version": "0.95.1"
+          "operator.prometheus.io/version": "0.95.2"
         },
         "name": "prometheusrules.monitoring.coreos.com"
       },
@@ -44202,7 +44202,7 @@
       "metadata": {
         "annotations": {
           "controller-gen.kubebuilder.io/version": "v0.23.0",
-          "operator.prometheus.io/version": "0.95.1"
+          "operator.prometheus.io/version": "0.95.2"
         },
         "name": "scrapeconfigs.monitoring.coreos.com"
       },
@@ -56258,7 +56258,7 @@
       "metadata": {
         "annotations": {
           "controller-gen.kubebuilder.io/version": "v0.23.0",
-          "operator.prometheus.io/version": "0.95.1"
+          "operator.prometheus.io/version": "0.95.2"
         },
         "name": "servicemonitors.monitoring.coreos.com"
       },
@@ -57508,7 +57508,7 @@
       "metadata": {
         "annotations": {
           "controller-gen.kubebuilder.io/version": "v0.23.0",
-          "operator.prometheus.io/version": "0.95.1"
+          "operator.prometheus.io/version": "0.95.2"
         },
         "name": "thanosrulers.monitoring.coreos.com"
       },
@@ -65831,7 +65831,7 @@
         "labels": {
           "app.kubernetes.io/component": "controller",
           "app.kubernetes.io/name": "prometheus-operator",
-          "app.kubernetes.io/version": "0.95.1"
+          "app.kubernetes.io/version": "0.95.2"
         },
         "name": "prometheus-operator"
       },
@@ -65855,7 +65855,7 @@
         "labels": {
           "app.kubernetes.io/component": "controller",
           "app.kubernetes.io/name": "prometheus-operator",
-          "app.kubernetes.io/version": "0.95.1"
+          "app.kubernetes.io/version": "0.95.2"
         },
         "name": "prometheus-operator"
       },
@@ -66081,7 +66081,7 @@
         "labels": {
           "app.kubernetes.io/component": "controller",
           "app.kubernetes.io/name": "prometheus-operator",
-          "app.kubernetes.io/version": "0.95.1"
+          "app.kubernetes.io/version": "0.95.2"
         },
         "name": "prometheus-operator",
         "namespace": "__NAMESPACE__"
@@ -66102,7 +66102,7 @@
             "labels": {
               "app.kubernetes.io/component": "controller",
               "app.kubernetes.io/name": "prometheus-operator",
-              "app.kubernetes.io/version": "0.95.1"
+              "app.kubernetes.io/version": "0.95.2"
             }
           },
           "spec": {
@@ -66111,7 +66111,7 @@
               {
                 "args": [
                   "--namespaces=__NAMESPACE__",
-                  "--prometheus-config-reloader=quay.io/prometheus-operator/prometheus-config-reloader:v0.95.1@sha256:39bdbade0c64f7c38bb6d18d6f602b14ad489bc189b709dc9266b49e6647aac1",
+                  "--prometheus-config-reloader=quay.io/prometheus-operator/prometheus-config-reloader:v0.95.2@sha256:cc74ddedad4ab1c49446971f6d51302ad4303d8660a2018af925c7f62c114304",
                   "--disable-unmanaged-prometheus-configuration=true",
                   "--config-reloader-memory-request=16Mi",
                   "--config-reloader-memory-limit=64Mi",
@@ -66124,7 +66124,7 @@
                     "value": "30"
                   }
                 ],
-                "image": "quay.io/prometheus-operator/prometheus-operator:v0.95.1@sha256:9c2490af910d58ec2abd77642d340e30bd5e2de5c80fd19ab4b49e28dc7bbb83",
+                "image": "quay.io/prometheus-operator/prometheus-operator:v0.95.2@sha256:7986c2afa118c9dea07d01c5e1a29555824582e92f6ee8607591d1a7178acf29",
                 "name": "prometheus-operator",
                 "ports": [
                   {
@@ -66176,7 +66176,7 @@
         "labels": {
           "app.kubernetes.io/component": "controller",
           "app.kubernetes.io/name": "prometheus-operator",
-          "app.kubernetes.io/version": "0.95.1"
+          "app.kubernetes.io/version": "0.95.2"
         },
         "name": "prometheus-operator",
         "namespace": "__NAMESPACE__"
@@ -66189,7 +66189,7 @@
         "labels": {
           "app.kubernetes.io/component": "controller",
           "app.kubernetes.io/name": "prometheus-operator",
-          "app.kubernetes.io/version": "0.95.1"
+          "app.kubernetes.io/version": "0.95.2"
         },
         "name": "prometheus-operator",
         "namespace": "__NAMESPACE__"

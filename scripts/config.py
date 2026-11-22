@@ -13,8 +13,18 @@ DEFAULTS = {
     "cluster": {
         "type": "minikube",
         "mode": "reuse",
+        "name": "",
         "context": "minikube",
         "kubeconfig": "~/.kube/config",
+        "create": {
+            "driver": "",
+            "nodes": 3,
+            "cpus": 2,
+            "memory_mib": 4096,
+            "disk_mib": 20000,
+            "kubernetes_version": "v1.37.0",
+            "container_runtime": "containerd",
+        },
     },
     "application": {"namespace": "", "service_account": "", "database": "", "username": ""},
     "postgres": {
@@ -55,6 +65,8 @@ DEFAULTS = {
     },
     "budget": {"max_memory_requests_mib": 2048, "min_disk_free_mib": 512},
 }
+DRIVERS = {"docker", "podman", "krunkit", "vfkit", "qemu2", "kvm2"}
+RUNTIMES = {"containerd", "cri-o", "docker"}
 DNS = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
 SQL = r"[a-z][a-z0-9_]{0,30}"
 LABEL_MAPS = {"network.dns_labels", "monitoring.pod_labels"}
@@ -132,6 +144,48 @@ def selector(value, name):
             raise ValueError(f"{name} contains an invalid label value")
 
 
+# Inputs: merged cluster mapping and the raw user cluster mapping. Outputs: planned node names or None.
+# Purpose: validate the cluster mode once and normalize the new profile's context. Dependencies: DEFAULTS.
+def cluster_creation(cluster, raw_cluster):
+    if cluster["mode"] == "reuse":
+        if cluster["name"] or cluster["create"] != DEFAULTS["cluster"]["create"]:
+            raise ValueError(
+                "cluster.name and cluster.create apply only when cluster.mode is create"
+            )
+        return None
+    name = cluster["name"]
+    if not name:
+        raise ValueError("cluster.mode=create requires an explicit cluster.name")
+    identifier(name, DNS, "cluster.name", 40)
+    # The reuse default context is "minikube"; only an explicitly supplied context can conflict.
+    if raw_cluster.get("context", name) != name:
+        raise ValueError(
+            "A new Minikube profile creates a context with the same name as cluster.name"
+        )
+    cluster["context"] = name
+    create = cluster["create"]
+    if create["driver"] not in DRIVERS:
+        raise ValueError(f"cluster.create.driver must be one of {', '.join(sorted(DRIVERS))}")
+    if create["container_runtime"] not in RUNTIMES:
+        raise ValueError(
+            f"cluster.create.container_runtime must be one of {', '.join(sorted(RUNTIMES))}"
+        )
+    if not re.fullmatch(r"v1\.(35|36|37)\.[0-9]+", create["kubernetes_version"]):
+        raise ValueError("cluster.create.kubernetes_version must be v1.35.x through v1.37.x")
+    # VM drivers keep the node root filesystem in RAM (about 1.2 GiB), and a 3072 MiB control plane
+    # ran out of memory under ordinary API load during live acceptance; 4096 MiB is the tested floor.
+    for key, minimum, maximum in (
+        ("nodes", 1, 5),
+        ("cpus", 2, 64),
+        ("memory_mib", 4096, 262144),
+        ("disk_mib", 10000, 1048576),
+    ):
+        if not minimum <= create[key] <= maximum:
+            raise ValueError(f"cluster.create.{key} must be between {minimum} and {maximum}")
+    # Minikube names the first node after the profile and later nodes <profile>-mNN.
+    return [name] + [f"{name}-m{index:02d}" for index in range(2, create["nodes"] + 1)]
+
+
 # Inputs: user JSON path. Outputs: fully normalized, validated configuration.
 # Purpose: establish the single trusted configuration boundary. Dependencies: DEFAULTS and helpers.
 def load_config(path):
@@ -144,11 +198,12 @@ def load_config(path):
     if (
         config["schema_version"] != 1
         or config["cluster"]["type"] != "minikube"
-        or config["cluster"]["mode"] != "reuse"
+        or config["cluster"]["mode"] not in {"reuse", "create"}
     ):
-        raise ValueError("Version 1 supports only an existing Minikube cluster")
+        raise ValueError("Version 1 supports an existing or a new Minikube cluster only")
     env = config["environment_id"]
     identifier(env, DNS, "environment_id", 24)
+    creation = cluster_creation(config["cluster"], raw.get("cluster", {}))
     for key in ("context", "kubeconfig"):
         text = config["cluster"][key]
         if not text.strip() or any(ord(char) < 32 for char in text):
@@ -211,6 +266,8 @@ def load_config(path):
         identifier(node, DNS, "storage.nodes")
     if len(set(storage["nodes"])) != len(storage["nodes"]):
         raise ValueError("storage.nodes cannot contain duplicates")
+    if creation is not None and not set(storage["nodes"]) <= set(creation):
+        raise ValueError(f"storage.nodes must be nodes of the new cluster: {', '.join(creation)}")
     kafka = config["kafka"]
     kafka["topics"] = kafka["topics"] or [f"{env}.jobs.v1", f"{env}.jobs.dlq.v1"]
     kafka["consumer_group"] = kafka["consumer_group"] or f"{env}-worker"
@@ -314,6 +371,15 @@ def load_config(path):
             "local-k8s-platform/environment": env,
         },
         "stages": stages,
+        "cluster": None
+        if creation is None
+        else {
+            "nodes": creation,
+            "cni": "calico",
+            "addons": ["csi-hostpath-driver", "volumesnapshots"]
+            if storage["mode"] == "csi"
+            else [],
+        },
         "storage_stage": next((stage for stage in stages if stage.startswith("05-storage")), ""),
         "workloads": workloads,
         "requests_memory_mib": requested,

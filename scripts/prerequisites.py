@@ -3,10 +3,12 @@
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import socket
 import sys
 from copy import deepcopy
+from fractions import Fraction
 from pathlib import Path
 
 import runtime
@@ -28,6 +30,7 @@ RESOURCES = {
     "Service": "services",
     "Prometheus": "prometheuses.monitoring.coreos.com",
 }
+READY_TIMEOUT_SECONDS = 600
 ORDER = {kind: index for index, kind in enumerate(RESOURCES)}
 CRDS = {
     "strimzi": [
@@ -75,7 +78,7 @@ def _matches(live, desired):
 # Purpose: compare Deployment env values after API serialization. Dependencies: Kubernetes EnvVar defaults.
 def _matches_document(live, desired):
     if desired["kind"] == "Deployment":
-        live = deepcopy(live)
+        live, desired = deepcopy(live), deepcopy(desired)
         pod_spec = live.get("spec", {}).get("template", {}).get("spec", {})
         for container in pod_spec.get("containers", []) + pod_spec.get("initContainers", []):
             for entry in container.get("env", []):
@@ -84,7 +87,36 @@ def _matches_document(live, desired):
                     entry.setdefault("value", "")
                 else:
                     entry.pop("value", None)
+        # The API server stores canonical quantities, for example 1000m as 1.
+        for document in (live, desired):
+            spec = document.get("spec", {}).get("template", {}).get("spec", {})
+            for container in spec.get("containers", []) + spec.get("initContainers", []):
+                for group in container.get("resources", {}).values():
+                    if isinstance(group, dict):
+                        for key, value in group.items():
+                            group[key] = _quantity(value)
     return _matches(live, desired)
+
+
+# Inputs: Kubernetes quantity string. Outputs: exact numeric value, or the input if unparseable.
+# Purpose: compare equivalent quantities after API canonicalization. Dependencies: Kubernetes suffixes.
+def _quantity(value):
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(m|k|M|G|T|Ki|Mi|Gi|Ti)?", str(value))
+    if not match:
+        return value
+    scale = {
+        None: 1,
+        "m": Fraction(1, 1000),
+        "k": 10**3,
+        "M": 10**6,
+        "G": 10**9,
+        "T": 10**12,
+        "Ki": 2**10,
+        "Mi": 2**20,
+        "Gi": 2**30,
+        "Ti": 2**40,
+    }[match[2]]
+    return Fraction(match[1]) * scale
 
 
 # Inputs: live object and resolved configuration. Outputs: whether this environment owns it.
@@ -141,6 +173,16 @@ def _flag(container, name, default=None):
     return default
 
 
+# Inputs: one Deployment object. Outputs: whether a Strimzi custom resource manages it.
+# Purpose: keep Kafka operands out of operator detection. Dependencies: Strimzi labels and owner references.
+def _strimzi_operand(item):
+    metadata = item.get("metadata", {})
+    return "strimzi.io/cluster" in (metadata.get("labels") or {}) or any(
+        owner.get("apiVersion", "").startswith("kafka.strimzi.io/")
+        for owner in metadata.get("ownerReferences") or []
+    )
+
+
 # Inputs: all Deployment objects and selected component. Outputs: matching operator Deployments.
 # Purpose: detect installations outside the configured namespace before creating a duplicate. Dependencies: image/name conventions.
 def _operators(deployments, component):
@@ -148,7 +190,10 @@ def _operators(deployments, component):
     return [
         item
         for item in deployments
-        if any(
+        # Strimzi runs its per-cluster operands (entity, topic and user operators) from the same
+        # image; they belong to a Kafka resource and are not cluster operators.
+        if not _strimzi_operand(item)
+        and any(
             image in container.get("image", "") or image == container.get("name")
             for container in item.get("spec", {})
             .get("template", {})
@@ -637,6 +682,10 @@ def _snapshot(config, workspace, component):
             if enabled
         ]
     )
+    cluster_components = [name for name in selected if name != "openssl"]
+    if cluster_components and config["cluster"]["mode"] == "create":
+        if not runtime._bind(config, workspace, runtime._identity(config)):
+            raise RuntimeError("The prerequisite target must match the workspace binding.")
     if "openssl" in selected:
         snapshot["host"] = {
             "hostname": socket.gethostname(),
@@ -650,7 +699,6 @@ def _snapshot(config, workspace, component):
             snapshot["reused"].append("openssl")
         else:
             snapshot["changes"].append({"action": "install-openssl", "command": _openssl_install()})
-    cluster_components = [name for name in selected if name != "openssl"]
     deployments = (
         runtime._get(config, "deployments.apps", all_namespaces=True)["items"]
         if cluster_components
@@ -716,6 +764,8 @@ def _sources():
 # Inputs: resolved config and reviewed wait references. Outputs: none.
 # Purpose: wait for APIs before workloads and for current controller rollouts. Dependencies: bounded read-only kubectl operations.
 def _wait(config, references):
+    # First image pulls on a local VM can take minutes; 220MB took 191s on krunkit.
+    limit = f"--timeout={READY_TIMEOUT_SECONDS}s"
     for reference in references:
         resource, name = reference["resource"], reference["name"]
         if resource == "statefulsets.apps":
@@ -725,19 +775,22 @@ def _wait(config, references):
                 f"{resource}/{name}",
                 "--namespace",
                 reference["namespace"],
-                "--timeout=180s",
+                limit,
             ]
-            if run(runtime._kube(config) + creation, timeout=200).returncode:
+            if run(runtime._kube(config) + creation, timeout=READY_TIMEOUT_SECONDS + 30).returncode:
                 raise RuntimeError(f"Prometheus has not created {name}; inspect Operator events.")
         arguments = (
-            ["wait", "--for=condition=Established", f"{resource}/{name}", "--timeout=180s"]
+            ["wait", "--for=condition=Established", f"{resource}/{name}", limit]
             if resource == RESOURCES["CustomResourceDefinition"]
-            else ["rollout", "status", f"{resource}/{name}", "--timeout=180s"]
+            else ["rollout", "status", f"{resource}/{name}", limit]
         )
         if reference["namespace"]:
             arguments += ["--namespace", reference["namespace"]]
-        if run(runtime._kube(config) + arguments, timeout=200).returncode:
-            raise RuntimeError(f"Prerequisite readiness is pending: {resource}/{name}.")
+        if run(runtime._kube(config) + arguments, timeout=READY_TIMEOUT_SECONDS + 30).returncode:
+            raise RuntimeError(
+                f"Prerequisite readiness is pending after {READY_TIMEOUT_SECONDS}s: {resource}/{name}. "
+                "Check its Pod events; an image may still be pulling or unavailable for the node platform."
+            )
 
 
 # Inputs: resolved config, workspace and saved review. Outputs: installation result with completed references.

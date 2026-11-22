@@ -1,5 +1,5 @@
 # Purpose: Provide discovery metadata for the local Kubernetes platform skill.
 interface:
   display_name: "Local Kubernetes Platform"
-  short_description: "Prepare and configure an existing Minikube platform"
-  default_prompt: "Use $local-k8s-platform to prepare a small PostgreSQL and Kafka platform for local training on my existing Minikube cluster, reusing compatible Operators and CSI storage."
+  short_description: "Create or reuse a Minikube cluster and configure its data platform"
+  default_prompt: "Use $local-k8s-platform to prepare a small PostgreSQL and Kafka platform for local training on Minikube. Reuse my existing cluster, or create a new cluster with the name I give you, and review every plan before execution."

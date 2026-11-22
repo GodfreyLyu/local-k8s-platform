@@ -275,6 +275,7 @@ class RuntimeTests(unittest.TestCase):
             "status": {
                 "conditions": [{"type": "Ready", "status": "True"}],
                 "allocatable": {"memory": "999Gi"},
+                "nodeInfo": {"operatingSystem": "linux", "architecture": "arm64"},
             },
         }
 
@@ -446,6 +447,7 @@ class RuntimeTests(unittest.TestCase):
             "status": {
                 "conditions": [{"type": "Ready", "status": "True"}],
                 "allocatable": {"memory": "8Gi"},
+                "nodeInfo": {"operatingSystem": "linux", "architecture": "arm64"},
             },
         }
 

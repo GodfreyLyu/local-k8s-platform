@@ -9,39 +9,105 @@
   "images": {
     "postgres": {
       "reference": "docker.io/library/postgres:17.11@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f",
-      "asset": "stacks/30-postgres/main.tf"
+      "asset": "stacks/30-postgres/main.tf",
+      "platforms": [
+        "linux/386",
+        "linux/amd64",
+        "linux/arm",
+        "linux/arm64",
+        "linux/ppc64le",
+        "linux/riscv64",
+        "linux/s390x"
+      ]
     },
     "postgres_exporter": {
       "reference": "quay.io/prometheuscommunity/postgres-exporter:v0.20.1@sha256:ac5ec343104fae0e2d84a27bb8d69b38430a11910c5382cad85d478d2bab713e",
-      "asset": "stacks/30-postgres/main.tf"
+      "asset": "stacks/30-postgres/main.tf",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm",
+        "linux/arm64",
+        "linux/ppc64le"
+      ]
     },
     "kafka": {
       "reference": "quay.io/strimzi/kafka:1.3.0-kafka-4.3.1@sha256:1f189b1f0f32684302d8b018b1d21b411e2469a9c465fbdc18fa3599cb5bbdad",
-      "asset": "stacks/31-kafka/main.tf"
+      "asset": "stacks/31-kafka/main.tf",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64",
+        "linux/ppc64le",
+        "linux/s390x"
+      ]
     },
     "local_path": {
       "reference": "docker.io/rancher/local-path-provisioner:v0.0.37@sha256:e757967a5ec338f6a9b371c5a9688bedaa8c3578ea3dd4db329ea0084be0a86f",
-      "asset": "stacks/05-storage/main.tf"
+      "asset": "stacks/05-storage/main.tf",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm",
+        "linux/arm64",
+        "linux/ppc64le",
+        "linux/riscv64",
+        "linux/s390x"
+      ]
     },
     "storage_helper": {
       "reference": "docker.io/library/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4",
-      "asset": "stacks/05-storage/main.tf"
+      "asset": "stacks/05-storage/main.tf",
+      "platforms": [
+        "linux/386",
+        "linux/amd64",
+        "linux/arm",
+        "linux/arm64",
+        "linux/ppc64le",
+        "linux/riscv64",
+        "linux/s390x"
+      ]
     },
     "strimzi_operator": {
       "reference": "quay.io/strimzi/operator:1.3.0@sha256:4deb564fa329afa4046c550a6f8f1a6d00be3b9297e556969acabe6647b6676f",
-      "asset": "../prerequisites/strimzi.json"
+      "asset": "../prerequisites/strimzi.json",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64",
+        "linux/ppc64le",
+        "linux/s390x"
+      ]
     },
     "prometheus_operator": {
-      "reference": "quay.io/prometheus-operator/prometheus-operator:v0.95.1@sha256:9c2490af910d58ec2abd77642d340e30bd5e2de5c80fd19ab4b49e28dc7bbb83",
-      "asset": "../prerequisites/monitoring.json"
+      "reference": "quay.io/prometheus-operator/prometheus-operator:v0.95.2@sha256:7986c2afa118c9dea07d01c5e1a29555824582e92f6ee8607591d1a7178acf29",
+      "asset": "../prerequisites/monitoring.json",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm",
+        "linux/arm64",
+        "linux/ppc64le",
+        "linux/s390x"
+      ]
     },
     "prometheus_config_reloader": {
-      "reference": "quay.io/prometheus-operator/prometheus-config-reloader:v0.95.1@sha256:39bdbade0c64f7c38bb6d18d6f602b14ad489bc189b709dc9266b49e6647aac1",
-      "asset": "../prerequisites/monitoring.json"
+      "reference": "quay.io/prometheus-operator/prometheus-config-reloader:v0.95.2@sha256:cc74ddedad4ab1c49446971f6d51302ad4303d8660a2018af925c7f62c114304",
+      "asset": "../prerequisites/monitoring.json",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm",
+        "linux/arm64",
+        "linux/ppc64le",
+        "linux/s390x"
+      ]
     },
     "prometheus": {
       "reference": "quay.io/prometheus/prometheus:v3.16.0@sha256:9332054523223e2ddc18d8101799d54a4a8d823b030c53216f063a6c117773cd",
-      "asset": "../prerequisites/prometheus.json"
+      "asset": "../prerequisites/prometheus.json",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm",
+        "linux/arm64",
+        "linux/ppc64le",
+        "linux/riscv64",
+        "linux/s390x"
+      ]
     }
   },
   "compatibility_requirements": {
@@ -54,7 +120,8 @@
     "reference_project": "platform-infra",
     "reference_record": "versions.json and stacks/05-storage/main.tf",
     "reference_review_date": "2026-11-12",
-    "note": "Terraform image pins came from read-only project references. Prerequisite bundle sources and image digests were checked against official releases and registries. Runtime compatibility is not certified."
+    "note": "Terraform image pins came from read-only project references. Prerequisite bundle sources and image digests were checked against official releases and registries. Runtime compatibility is not certified.",
+    "platforms_note": "Image platforms were read from each pinned digest's registry index on 2026-11-22. Prometheus Operator v0.95.1 published linux/amd64 only, so v0.95.2 replaced it."
   },
   "runtime_verified": false,
   "prerequisites": {
@@ -68,12 +135,12 @@
       }
     },
     "monitoring": {
-      "version": "v0.95.1",
+      "version": "v0.95.2",
       "asset": "../prerequisites/monitoring.json",
-      "sha256": "63686a94ab27a1066c5b49f34e546ed2d8346a791203acf88d3ab941c59178a7",
+      "sha256": "e22b76e18d863ae656056982da16d4a1c463f2e8b38b7d654f505c0b6ae76b61",
       "source": {
-        "url": "https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.95.1/bundle.yaml",
-        "sha256": "6f0faaf14999d63451ecbf0d689350ecce3eeda44576d25918878c5119d618fa"
+        "url": "https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.95.2/bundle.yaml",
+        "sha256": "4bc269572c7b0a6849a6933eef2843bf2a0eaa6e55eb5d7b185efe1d2dc44335"
       }
     },
     "prometheus": {
