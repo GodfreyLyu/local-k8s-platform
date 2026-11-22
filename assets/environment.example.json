@@ -14,14 +14,14 @@
   },
   "postgres": {
     "enabled": true,
-    "storage": "4Gi"
+    "storage": "1Gi"
   },
   "kafka": {
     "enabled": true,
     "namespace": "kafka",
     "topics": ["example.jobs.v1", "example.jobs.dlq.v1"],
     "consumer_group": "example-worker",
-    "storage": "4Gi"
+    "storage": "1Gi"
   },
   "monitoring": {
     "enabled": true,
@@ -29,11 +29,12 @@
     "release": "monitoring"
   },
   "storage": {
-    "mode": "reuse",
-    "class": "platform-local-retain"
+    "mode": "csi",
+    "class": "example-dev-local-retain",
+    "nodes": ["minikube-m02", "minikube-m03"]
   },
   "budget": {
     "max_memory_requests_mib": 2048,
-    "min_disk_free_mib": 2048
+    "min_disk_free_mib": 512
   }
 }

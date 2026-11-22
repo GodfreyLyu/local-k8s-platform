@@ -81,6 +81,9 @@ Other variables remain inherited. This includes `PATH` and `TF_CLI_CONFIG_FILE`.
 | Runtime Terraform init, plan, and apply through `_terraform` | 600 seconds. |
 | Saved-plan decoding with `terraform show` | 60 seconds. |
 | Credential kubectl and OpenSSL calls | 60 seconds. |
+| Prerequisite resource creation, tool checks, and permission checks | 60 seconds. |
+| Prerequisite readiness commands | 200 seconds per call, with a 180-second kubectl wait. |
+| OpenSSL package installation | 600 seconds. |
 | Standalone `validate.py` Terraform wrapper | 120 seconds. |
 
 Runtime kubectl calls also set `--request-timeout=10s`. Credential kubectl calls set `--request-timeout=15s`. These are separate API request limits.
@@ -88,6 +91,17 @@ Runtime kubectl calls also set `--request-timeout=10s`. Credential kubectl calls
 In `run`, a timeout raises `RuntimeError` with a fixed message. Partial output is suppressed. An `OSError` from starting or running the command also becomes a fixed `RuntimeError`. These errors suppress the original exception context. A nonzero exit alone does not raise either error.
 
 The helper does not log or redact captured output. Runtime `_terraform` writes raw stdout and stderr to private JSON logs after `run` returns. If `run` raises, that command log is not written by `_terraform`.
+
+Prerequisite creation sends fixed manifests through stdin. Reports contain resource
+references and outcomes. Package-manager and kubectl output is suppressed on
+failure. macOS package commands use `/usr/bin/env` to disable Homebrew automatic
+update and cleanup. Linux elevation uses `sudo -n`, which does not prompt for a
+password. No shell wrapper is added.
+
+Prerequisite permission checks call the non-persistent authorization review API
+through `kubectl create --raw`. They specify resource and API group directly, so
+the check does not depend on CRD discovery. This request evaluates access without
+creating a platform resource.
 
 ### Standalone validation
 

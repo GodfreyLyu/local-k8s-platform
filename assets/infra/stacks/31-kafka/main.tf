@@ -49,7 +49,7 @@ resource "kubernetes_manifest" "pool" {
     apiVersion = "kafka.strimzi.io/v1"
     kind       = "KafkaNodePool"
     metadata   = { name = "${local.name}-combined", namespace = local.namespace, labels = local.labels }
-    spec = {
+    spec = merge({
       replicas = 1
       roles    = ["controller", "broker"]
       storage = {
@@ -58,8 +58,14 @@ resource "kubernetes_manifest" "pool" {
         class = local.e.storage.class, deleteClaim = false, kraftMetadata = "shared" }]
       }
       resources  = local.e.kafka.resources
-      jvmOptions = { "-Xms" = "384m", "-Xmx" = "384m" }
-    }
+      jvmOptions = { "-Xms" = "${local.e.kafka.heap_mib}m", "-Xmx" = "${local.e.kafka.heap_mib}m" }
+      }, length(local.e.storage.nodes) > 0 ? {
+      template = { pod = { affinity = { nodeAffinity = {
+        requiredDuringSchedulingIgnoredDuringExecution = { nodeSelectorTerms = [{ matchExpressions = [{
+          key = "kubernetes.io/hostname", operator = "In", values = local.e.storage.nodes
+        }] }] }
+      } } } }
+    } : {})
   }
   lifecycle { prevent_destroy = true }
 }
@@ -90,9 +96,9 @@ resource "kubernetes_manifest" "kafka" {
           "transaction.state.log.replication.factor" = 1
           "transaction.state.log.min.isr"            = 1
           "auto.create.topics.enable"                = false
-          "log.retention.hours"                      = 24
-          "log.retention.bytes"                      = 268435456
-          "log.segment.bytes"                        = 67108864
+          "log.retention.hours"                      = local.e.kafka.retention_hours
+          "log.retention.bytes"                      = local.e.kafka.retention_mib * 1048576
+          "log.segment.bytes"                        = local.e.kafka.segment_mib * 1048576
         }
         }, local.e.monitoring.enabled ? {
         metricsConfig = {
@@ -122,12 +128,12 @@ resource "kubernetes_manifest" "topic" {
     }
     spec = {
       topicName  = each.value
-      partitions = 3
+      partitions = local.e.kafka.partitions
       replicas   = 1
       config = {
         "min.insync.replicas" = "1"
-        "retention.ms"        = "86400000"
-        "retention.bytes"     = "268435456"
+        "retention.ms"        = tostring(local.e.kafka.retention_hours * 3600000)
+        "retention.bytes"     = tostring(local.e.kafka.retention_mib * 1048576)
         "cleanup.policy"      = "delete"
       }
     }

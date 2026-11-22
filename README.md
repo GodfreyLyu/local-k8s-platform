@@ -8,6 +8,8 @@ A local data platform needs storage, credentials, network rules, and monitoring 
 
 The aim is to reuse the same workflow across development projects. Each environment has its own configuration, state, plans, credentials, and reports.
 
+Defaults target small local workloads. PostgreSQL requests 256Mi of memory and Kafka requests 512Mi. Each uses a 1Gi PVC. The example reuses an existing Minikube CSI driver. Training jobs, model weights, datasets, and checkpoints have separate resource budgets. See the [small local training guide](references/local-training.md).
+
 The current build has passed static validation. Live deployment and functional acceptance are still pending.
 
 ## What it does
@@ -16,9 +18,10 @@ The current build has passed static validation. Live deployment and functional a
 |---|---|
 | Configuration | Choose PostgreSQL, Kafka, or both. Set names, resource requests, storage, and application access. |
 | Environment checks | Read cluster identity, ownership, node capacity, DNS, storage, and required operators. |
+| Prerequisites | Reuse compatible installations or prepare reviewed plans for missing Operators, minimal Prometheus, and local OpenSSL. |
 | PostgreSQL | One StatefulSet with persistent storage, TLS, an application login, and a separate monitoring login. |
 | Kafka | One Strimzi KRaft broker/controller, with TLS users, topics, and scoped ACLs. |
-| Storage | Reuse a checked `WaitForFirstConsumer` / `Retain` class, or create a separate Local Path provisioner. |
+| Storage | Reuse a checked class, create a class using the existing CSI driver, or install a separate Local Path provisioner. |
 | Monitoring | Add PodMonitors and alert rules to an existing Prometheus installation. |
 | Credentials | Prepare local PostgreSQL credentials and copy selected client credentials into the application namespace. |
 | Changes | Save a plan, review its changes, and apply that exact plan. |
@@ -28,7 +31,7 @@ Only one managed platform environment is supported per cluster. Keep one workspa
 
 ## What it does not do
 
-- Create or recreate Kubernetes clusters, replace the CNI, or install and upgrade operators.
+- Create or recreate Kubernetes clusters, replace the CNI, or replace and upgrade operators.
 - Build application images, deploy applications, run schema migrations, or manage message formats.
 - Provide PostgreSQL replication, Kafka replication, automatic failover, or production high availability.
 - Set up HTTPS ingress, CNPG, object storage, WAL archiving, or point-in-time recovery.
@@ -55,16 +58,19 @@ flowchart TD
 
 `scripts/config.py` checks user input and fills in defaults. Other modules use that resolved configuration. Later checks cover files and live resources, which may change during a run.
 
-`scripts/runtime.py` handles inspection, plan review, apply, and verification. `scripts/credentials.py` handles local certificates and fixed Secret writes.
+`scripts/runtime.py` handles inspection, plan review, apply, and verification. `scripts/prerequisites.py` prepares reviewed dependency installs. `scripts/credentials.py` handles local certificates and fixed Secret writes.
+
+`scripts/capacity.py` estimates placement for individual Pods and volumes. It checks measured free memory, assigned Pod requests, disk headroom, and selected storage nodes. The estimate reports remaining capacity. Actual Kubernetes scheduling and runtime behavior still need verification.
 
 `scripts/io_utils.py` provides private JSON storage, workspace locking, and subprocess calls. Child commands use argument lists without a shell wrapper. They have per-call timeouts and a `077` umask. These controls do not add a command sandbox. See the [I/O and subprocess reference](references/io.md) for the exact behavior and limits.
 
-Terraform owns the selected Kubernetes resources. Each stage has a separate state file. Credential data stays outside Terraform.
+Terraform owns the data-platform stage resources. Each stage has a separate state file. Prerequisite resources use create-only operations and separate review records. Credential data stays outside Terraform.
 
 | Stage | Responsibility | Included when |
 |---|---|---|
 | `00-bootstrap` | Namespaces, application identity, and network policies. | Always. |
 | `05-storage` | A separate Local Path provisioner and storage class. | Storage mode is `create`. |
+| `05-storage-csi` | A retained worker-scoped class using the existing CSI driver. | Storage mode is `csi`. |
 | `30-postgres` | PostgreSQL, its PVC, Services, and optional exporter. | PostgreSQL is enabled. |
 | `31-kafka` | Kafka, topics, users, and network policies. | Kafka is enabled. |
 | `40-monitoring` | PodMonitors and alert rules. | Monitoring is enabled. |
@@ -86,9 +92,14 @@ Cluster operations also need:
 - Terraform `>=1.10,<2`, kubectl, and access to the pinned providers and images.
 - An existing Minikube cluster with Calico. The current preflight accepts Kubernetes `1.35` through `1.37`.
 - An explicit kubeconfig and context. Access must include cluster inventory and node capacity statistics.
-- An existing Strimzi `1.3.0` operator when Kafka is enabled. It must run in the configured Kafka namespace.
-- An existing Prometheus Operator installation when monitoring is enabled.
-- OpenSSL when preparing PostgreSQL credentials locally.
+
+The skill can prepare these additional dependencies through a reviewed plan:
+
+- Strimzi `1.3.0` and its CRDs when Kafka is enabled. The Operator runs in the configured Kafka namespace.
+- Prometheus Operator and a minimal Prometheus instance when monitoring is enabled.
+- Local OpenSSL for PostgreSQL credential preparation, through an existing supported package manager.
+
+Compatible existing installations are reused. New monitoring installations use Prometheus Operator `v0.95.1` and Prometheus `v3.16.0`. The [prerequisite guide](references/prerequisites.md) covers scope, permissions, local package managers, and recovery.
 
 Versions and image digests are listed in [the version record](assets/infra/versions.json). The Kafka profile uses Kafka `4.3.1`; PostgreSQL uses `17.11`.
 
@@ -102,7 +113,7 @@ cp assets/environment.example.json ../demo-environment.json
 
 Edit the copy before using it. The example enables PostgreSQL, Kafka, and monitoring. For PostgreSQL alone, set both `kafka.enabled` and `monitoring.enabled` to `false`.
 
-Choose a stable `environment_id`. Set the real storage class and cluster context. For `storage.mode=create`, list existing nodes in `storage.nodes`. When Kafka is enabled, supply the checked API Service and endpoint `/32` addresses. The [configuration reference](references/configuration.md) explains these fields and their defaults.
+Choose a stable `environment_id` and the actual cluster context. The example uses `storage.mode=csi` with workers `minikube-m02` and `minikube-m03`. Review those names and the existing driver. For `storage.mode=reuse`, supply a reviewed WFFC/Retain class. For `storage.mode=create`, select nodes for a new Local Path controller. When Kafka is enabled, supply the checked API Service and endpoint `/32` addresses. The [configuration reference](references/configuration.md) explains these fields and their defaults.
 
 Generate the local workspace:
 
@@ -112,7 +123,21 @@ python3 -B scripts/platform.py --config ../demo-environment.json --workspace "$H
 
 This command runs offline. It copies stage files and writes application interface records. For the first run, choose an empty workspace outside the repository. New directories request mode `0700`; JSON files request `0600`. The directory helper requires the current user's UID and no group or other permissions. It does not repair existing permissions.
 
-### Inspect and plan
+### Prepare prerequisites, inspect, and plan
+
+First prepare a prerequisite plan for the enabled components:
+
+```sh
+python3 -B scripts/platform.py --config ../demo-environment.json --workspace "$HOME/local-k8s-workspaces/demo" prerequisites
+```
+
+Review its target, resource list, package commands, and plan ID. After that exact change is authorized:
+
+```sh
+python3 -B scripts/platform.py --config ../demo-environment.json --workspace "$HOME/local-k8s-workspaces/demo" prerequisites --plan-id REVIEWED_PLAN_ID --execute
+```
+
+Use `--component openssl` to prepare only the local tool without accessing Kubernetes. Both preview and execution use the same component selection. The example budget is 2048Mi. Data services request 1088Mi with monitoring enabled. Installing both Operators and minimal Prometheus adds 756Mi, for 1844Mi in total. Externally reused services still consume live cluster capacity. The CSI class adds no new controller Pod.
 
 The next command reads the cluster:
 
@@ -138,7 +163,7 @@ Pull requests targeting `main` run the `CI` workflow. Its `Tests` job runs the o
 
 Required checks and review rules are GitHub repository settings. They are not defined by this workflow. The workflow alone does not block merges.
 
-The recorded build passed **72 offline tests**. Native Terraform validation passed **12 configuration profiles and 40 stage instances**, with no errors or warnings. That run used Terraform `1.15.8` and Kubernetes provider `2.38.0`.
+The current build passed **109 offline tests** on Python `3.13`. Prerequisite tests use fake Kubernetes and package tools. Prometheus and the rendered Kafka manifests passed offline CRD-schema checks. Native Terraform validation passed **18 configuration profiles and 63 stage instances**, with no errors or warnings. That run used Terraform `1.15.8` and Kubernetes provider `2.38.0`.
 
 These results cover the implementation and static provider schema. This project has not completed live deployment or functional acceptance. The [validation report](references/validation.md) records the checks and their limits.
 
@@ -164,7 +189,9 @@ The validator needs a Terraform release whose `validate` command supports `-var-
 | `scripts/` | Configuration, execution, credentials, validation, and packaging tools. |
 | `assets/infra/stacks/` | Terraform roots and PostgreSQL startup files. |
 | [Configuration reference](references/configuration.md) | Input fields, defaults, supported combinations, and application access. |
+| [Small local training guide](references/local-training.md) | Small defaults, existing CSI, worker placement, and data preservation. |
 | [Operations guide](references/operations.md) | Command effects, deployment order, credentials, and verification. |
+| [Prerequisite guide](references/prerequisites.md) | Dependency plans, reuse, installation, local OpenSSL, and recovery. |
 | [I/O and subprocess reference](references/io.md) | Private file handling, locks, command environments, and timeouts. |
 | [Design notes](references/design.md) | Architecture, ownership, and scope decisions. |
 | [Validation report](references/validation.md) | Observed results and evidence. |

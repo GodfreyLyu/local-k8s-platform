@@ -101,7 +101,7 @@ def profiles(report_dir):
         ("both", True, True),
     ):
         for monitoring in (False, True):
-            for storage in ("reuse", "create"):
+            for storage in ("reuse", "create", "csi"):
                 name = f"{data}-monitoring-{'on' if monitoring else 'off'}-storage-{storage}"
                 directory = private_dir(report_dir / "profiles" / name)
                 source = directory / "input.json"
@@ -116,7 +116,7 @@ def profiles(report_dir):
                         "storage": {
                             "mode": storage,
                             "class": "dev-retain" if storage == "reuse" else "",
-                            "nodes": ["offline-node"] if storage == "create" else [],
+                            "nodes": ["offline-node"] if storage != "reuse" else [],
                         },
                     },
                 )
@@ -148,8 +148,8 @@ def validate(report_dir, plugin_dir=None):
     report = {
         "status": "running",
         "provider": {"source": provider["source"], "version": provider["version"]},
-        "profiles_planned": 12,
-        "cases_planned": 40,
+        "profiles_planned": 18,
+        "cases_planned": 63,
         "cases": [],
         "validation_scope": "Static Terraform/provider schema; live CRD and runtime acceptance are not checked",
     }

@@ -304,7 +304,77 @@ class RuntimeTests(unittest.TestCase):
             self.workspace / "reports" / "applied-30-postgres.json",
             {"status": "applied", "memory_requests_mib": 384, "storage_mib": 4096},
         )
-        self.assertEqual(runtime._remaining_demand(config, self.workspace), (0, 0, 0))
+        self.assertEqual(runtime._remaining_workloads(config, self.workspace), [])
+
+    # Inputs: shrinking Kafka manifests and a PVC. Outputs: blocked reviews before any live request.
+    # Purpose: protect existing data when defaults and retention targets become smaller. Dependencies: Terraform change review.
+    def test_smaller_defaults_cannot_shrink_existing_data(self):
+        labels = {runtime.ENVIRONMENT_LABEL: "example"}
+        manifests = [
+            (
+                {"kind": "KafkaTopic", "spec": {"partitions": 3}},
+                {"kind": "KafkaTopic", "spec": {"partitions": 1}},
+            ),
+            (
+                {
+                    "kind": "KafkaTopic",
+                    "spec": {"partitions": 1, "config": {"retention.ms": "86400000"}},
+                },
+                {
+                    "kind": "KafkaTopic",
+                    "spec": {"partitions": 1, "config": {"retention.ms": "21600000"}},
+                },
+            ),
+            (
+                {
+                    "kind": "KafkaNodePool",
+                    "spec": {"storage": {"volumes": [{"id": 0, "size": "4Gi"}]}},
+                },
+                {
+                    "kind": "KafkaNodePool",
+                    "spec": {"storage": {"volumes": [{"id": 0, "size": "1Gi"}]}},
+                },
+            ),
+        ]
+        for old, new in manifests:
+            for item in (old, new):
+                item["metadata"] = {"name": "data", "namespace": "kafka", "labels": labels}
+            document = {
+                "resource_changes": [
+                    {
+                        "type": "kubernetes_manifest",
+                        "change": {
+                            "actions": ["update"],
+                            "before": {"manifest": old},
+                            "after": {"manifest": new},
+                        },
+                    }
+                ]
+            }
+            with (
+                self.subTest(kind=old["kind"]),
+                patch.object(runtime, "_get", side_effect=AssertionError("live request")),
+                self.assertRaises(RuntimeError),
+            ):
+                runtime._review_changes(self.config, document)
+        old = {
+            "metadata": [{"name": "data", "labels": labels}],
+            "spec": [{"resources": [{"requests": {"storage": "4Gi"}}]}],
+        }
+        new = deepcopy(old)
+        new["spec"][0]["resources"][0]["requests"]["storage"] = "1Gi"
+        with self.assertRaisesRegex(RuntimeError, "shrinking"):
+            runtime._review_changes(
+                self.config,
+                {
+                    "resource_changes": [
+                        {
+                            "type": "kubernetes_persistent_volume_claim_v1",
+                            "change": {"actions": ["update"], "before": old, "after": new},
+                        }
+                    ]
+                },
+            )
 
     # Inputs: none. Outputs: assertions only.
     # Purpose: Allow fresh plans after kubeconfig credentials refresh without retargeting the workspace. Dependencies: durable identity binding.
@@ -373,12 +443,15 @@ class RuntimeTests(unittest.TestCase):
     def inventory_fakes(self, free_mib=2048):
         node = {
             "metadata": {"name": "minikube", "labels": {"minikube.k8s.io/name": "minikube"}},
-            "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+            "status": {
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "allocatable": {"memory": "8Gi"},
+            },
         }
 
         # Inputs: configuration and GET arguments. Outputs: fake inventory resource JSON.
         # Purpose: Supply explicit baseline prerequisites. Dependencies: node fixture.
-        def getter(config, resource, name=None, namespace=None):
+        def getter(config, resource, name=None, namespace=None, **kwargs):
             if resource == "nodes":
                 return {
                     "items": [
@@ -387,6 +460,8 @@ class RuntimeTests(unittest.TestCase):
                     ]
                 }
             if resource == "namespaces":
+                return {"items": []}
+            if resource == "pods":
                 return {"items": []}
             if resource == "storageclasses.storage.k8s.io":
                 return {"volumeBindingMode": "WaitForFirstConsumer", "reclaimPolicy": "Retain"}
@@ -426,10 +501,110 @@ class RuntimeTests(unittest.TestCase):
             report = runtime.inspect(self.config, self.workspace)
         self.assertEqual(report["status"], "pass", report["checks"])
 
+    # Inputs: bootstrap with insufficient space for future services. Outputs: a valid bootstrap-only inspection.
+    # Purpose: defer database volume requirements to data stages. Dependencies: stage-scoped forecasts.
+    def test_bootstrap_does_not_reserve_future_database_volumes(self):
+        getter, runner = self.inventory_fakes(free_mib=100)
+        with (
+            patch.object(runtime, "_identity", return_value=self.identity),
+            patch.object(runtime, "_get", side_effect=getter) as calls,
+            patch.object(runtime, "run", side_effect=runner),
+        ):
+            report = runtime.inspect(self.config, self.workspace, stage="00-bootstrap")
+        self.assertEqual(report["status"], "pass", report)
+        self.assertEqual(report["capacity"]["new_memory_requests_mib"], 0)
+        self.assertEqual(report["capacity"]["new_storage_mib"], 0)
+        self.assertFalse(
+            any(call.args[1] == "storageclasses.storage.k8s.io" for call in calls.call_args_list)
+        )
+
+    # Inputs: CSI registration and owned or invalid class metadata. Outputs: dependency readiness checks.
+    # Purpose: require the actual driver, selected topology and retained class before data stages. Dependencies: read-only API fixtures.
+    def test_csi_storage_requires_registration_ownership_and_matching_topology(self):
+        config = deepcopy(self.config)
+        config["storage"] = {"mode": "csi", "class": "example-retain", "nodes": ["worker"]}
+        nodes = [
+            {
+                "metadata": {
+                    "name": "worker",
+                    "labels": {
+                        "kubernetes.io/hostname": "worker",
+                        "topology.hostpath.csi/node": "worker",
+                    },
+                }
+            }
+        ]
+        storage_class = {
+            "metadata": {"labels": {runtime.ENVIRONMENT_LABEL: "example"}},
+            "provisioner": "hostpath.csi.k8s.io",
+            "volumeBindingMode": "WaitForFirstConsumer",
+            "reclaimPolicy": "Retain",
+            "allowedTopologies": [
+                {
+                    "matchLabelExpressions": [
+                        {"key": "topology.hostpath.csi/node", "values": ["worker"]}
+                    ]
+                }
+            ],
+        }
+        responses = {
+            "csidrivers.storage.k8s.io": {"metadata": {"name": "hostpath.csi.k8s.io"}},
+            "csinodes.storage.k8s.io": {
+                "items": [
+                    {
+                        "metadata": {"name": "worker"},
+                        "spec": {
+                            "drivers": [
+                                {
+                                    "name": "hostpath.csi.k8s.io",
+                                    "topologyKeys": ["topology.hostpath.csi/node"],
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+            "daemonsets.apps": {"status": {"desiredNumberScheduled": 1, "numberReady": 1}},
+        }
+        for case in ("ready", "missing", "foreign", "wrong-topology"):
+            current = deepcopy(storage_class)
+            if case == "missing":
+                current = None
+            elif case == "foreign":
+                current["metadata"]["labels"] = {}
+            elif case == "wrong-topology":
+                current["allowedTopologies"][0]["matchLabelExpressions"][0]["values"] = ["other"]
+            responses["storageclasses.storage.k8s.io"] = current
+            with (
+                self.subTest(case=case),
+                patch.object(
+                    runtime,
+                    "_get",
+                    side_effect=lambda config, resource, *args, **kwargs: responses[resource],
+                ),
+            ):
+                checks = {
+                    name: passed
+                    for name, passed, detail in runtime._storage_checks(config, nodes, True)
+                }
+            self.assertTrue(checks["csi_driver"])
+            self.assertEqual(checks["storage_class"], case == "ready")
+        responses["csinodes.storage.k8s.io"] = {"items": []}
+        with patch.object(
+            runtime,
+            "_get",
+            side_effect=lambda config, resource, *args, **kwargs: responses[resource],
+        ):
+            checks = {
+                name: passed
+                for name, passed, detail in runtime._storage_checks(config, nodes, False)
+            }
+        self.assertFalse(checks["csi_driver"])
+
     # Inputs: none. Outputs: assertions only.
     # Purpose: Reject aggregate-only memory headroom when no individual node fits the stage. Dependencies: two small fake node summaries.
     def test_aggregate_memory_does_not_replace_single_node_fit(self):
-        getter, runner = self.inventory_fakes(free_mib=400)
+        getter, runner = self.inventory_fakes(free_mib=300)
         with (
             patch.object(runtime, "_identity", return_value=self.identity),
             patch.object(runtime, "_get", side_effect=getter),

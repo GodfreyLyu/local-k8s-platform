@@ -14,7 +14,9 @@ This skill configures a local development platform on an existing Minikube clust
 | I/O helpers | Check directories, replace JSON files, lock the workspace, and invoke commands. | Local artifacts and captured command results. |
 | Terraform assets | Manage selected resources with separate state for each stage. | Saved plans and resources. |
 | Credential helper | Prepare credentials and write fixed Secrets outside Terraform. | Protected credentials and application-local Secret references. |
+| Prerequisite helper | Reuse compatible dependencies and create missing reviewed resources or local packages. | Saved manifests, plan IDs, ownership evidence, and partial-result reports. |
 | Runtime checks | Check cluster identity, ownership, prerequisites, and readiness. | Inventory, plan review, and acceptance status. |
+| Capacity helper | Estimate joint Pod memory and volume placement from current evidence. | Suggested allocations and remaining node capacity. |
 
 The agent invokes the packaged CLI through its execution tool. Python starts child commands without a shell wrapper. This skill needs no custom server, MCP connection, background daemon, or scheduler.
 
@@ -52,6 +54,15 @@ These checks protect external state. They do not repeat the original input check
 
 The selected components determine stages, prerequisites, resource estimates, credentials, monitors, and readiness checks. A PostgreSQL-only configuration has no Kafka or CNPG dependency.
 
+Small defaults apply to new services. Data volumes are 1Gi each. Memory forecasts
+follow Pod boundaries: PostgreSQL includes its exporter, while the Kafka broker
+and Entity Operator are separate Pods. Training data, model weights, checkpoints,
+and training jobs keep their own budgets.
+
+CSI mode creates a class using the existing Minikube CSI driver. The selected
+workers appear in both StorageClass topology and data-Pod affinity. The Local Path
+mode remains available for environments that need a separate provisioner.
+
 ## I/O and subprocess boundaries
 
 The shared helpers check local permissions and replace individual JSON files atomically. They do not make workspace preparation a transaction. Their subprocess runner uses argument lists, per-call timeouts, and a child umask. It does not provide a command sandbox or cap captured output.
@@ -60,7 +71,9 @@ The standalone Terraform validator uses a separate subprocess wrapper. Its envir
 
 ## Ownership and integration
 
-The skill manages its dedicated namespaces, identities, policies, data services, optional storage, and monitoring objects. Existing Minikube, CNI, Strimzi, Prometheus, Grafana, Alertmanager, and Argo CD keep their owners. The skill does not adopt or deploy application resources.
+The skill manages its dedicated namespaces, identities, policies, data services, optional storage, and monitoring objects. It can also create missing Strimzi and Prometheus prerequisites through a reviewed plan. Existing Minikube, CNI, Strimzi, Prometheus, Grafana, Alertmanager, and Argo CD keep their owners. The skill does not adopt or deploy application resources.
+
+Prerequisites use packaged official JSON manifests and atomic create calls. They stay outside Terraform state. Their review records bind configuration, source hashes, target identity, and reused resource contents. Execution consumes the plan before writes and records each result. A fresh plan can resume unchanged owned resources after a partial failure. There is no automatic upgrade, rollback, adoption, or cleanup. See [prerequisite operations](prerequisites.md).
 
 Storage retention and deletion protection reduce accidental deletion through Terraform. They cannot prevent an administrator from deleting data, or protect against disk or host failure. Multiple VMs on one computer do not provide independent availability zones.
 
@@ -80,7 +93,7 @@ After a failure, stop writes and report what completed. Inspect the current stat
 
 Offline tests cover configuration, workspace creation, state isolation, plan integrity, command effects, credentials, and checks for the selected components. They use fake external tools where needed. Terraform formatting and provider validation check the packaged assets.
 
-The native validation run passed 40 stage instances across 12 profiles. This checks static Terraform and provider schemas, not deployed services. See [build validation](validation.md) for the evidence and remaining limits.
+The native validation run passed 63 stage instances across 18 profiles, including existing-CSI storage. This checks static Terraform and provider schemas, not deployed services. See [build validation](validation.md) for the evidence and remaining limits.
 
 `verify` reads baseline readiness and storage status. Functional acceptance needs separate checks for authentication, permissions, allowed and denied traffic, metrics, alert delivery, and restore results. This release has no automated SQL, Kafka, network, or backup acceptance runner.
 

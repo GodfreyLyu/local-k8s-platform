@@ -1,5 +1,5 @@
 {
-  "$comment": "Purpose: Record pins derived from the executable Terraform assets and their read-only reference provenance; this is not runtime certification.",
+  "$comment": "Purpose: Record Terraform image pins, official prerequisite bundles, manifest checksums and provenance; this is not runtime certification.",
   "schema_version": 1,
   "provider": {
     "source": "hashicorp/kubernetes",
@@ -26,6 +26,22 @@
     "storage_helper": {
       "reference": "docker.io/library/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4",
       "asset": "stacks/05-storage/main.tf"
+    },
+    "strimzi_operator": {
+      "reference": "quay.io/strimzi/operator:1.3.0@sha256:4deb564fa329afa4046c550a6f8f1a6d00be3b9297e556969acabe6647b6676f",
+      "asset": "../prerequisites/strimzi.json"
+    },
+    "prometheus_operator": {
+      "reference": "quay.io/prometheus-operator/prometheus-operator:v0.95.1@sha256:9c2490af910d58ec2abd77642d340e30bd5e2de5c80fd19ab4b49e28dc7bbb83",
+      "asset": "../prerequisites/monitoring.json"
+    },
+    "prometheus_config_reloader": {
+      "reference": "quay.io/prometheus-operator/prometheus-config-reloader:v0.95.1@sha256:39bdbade0c64f7c38bb6d18d6f602b14ad489bc189b709dc9266b49e6647aac1",
+      "asset": "../prerequisites/monitoring.json"
+    },
+    "prometheus": {
+      "reference": "quay.io/prometheus/prometheus:v3.16.0@sha256:9332054523223e2ddc18d8101799d54a4a8d823b030c53216f063a6c117773cd",
+      "asset": "../prerequisites/prometheus.json"
     }
   },
   "compatibility_requirements": {
@@ -38,7 +54,32 @@
     "reference_project": "platform-infra",
     "reference_record": "versions.json and stacks/05-storage/main.tf",
     "reference_review_date": "2026-11-12",
-    "note": "Pins were copied from read-only project references. The new package has not executed these images or certified target-cluster compatibility."
+    "note": "Terraform image pins came from read-only project references. Prerequisite bundle sources and image digests were checked against official releases and registries. Runtime compatibility is not certified."
   },
-  "runtime_verified": false
+  "runtime_verified": false,
+  "prerequisites": {
+    "strimzi": {
+      "version": "1.3.0",
+      "asset": "../prerequisites/strimzi.json",
+      "sha256": "5c7ca4bc2d80dfbb634d18a3c4f82a362667a9faf35217f77f3b910680de9798",
+      "source": {
+        "url": "https://github.com/strimzi/strimzi-kafka-operator/releases/download/1.3.0/strimzi-cluster-operator-1.3.0.yaml",
+        "sha256": "c58da61a66c20169d1c9c42736a9355b183ee17ac7779ab7875beaedbf972232"
+      }
+    },
+    "monitoring": {
+      "version": "v0.95.1",
+      "asset": "../prerequisites/monitoring.json",
+      "sha256": "63686a94ab27a1066c5b49f34e546ed2d8346a791203acf88d3ab941c59178a7",
+      "source": {
+        "url": "https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.95.1/bundle.yaml",
+        "sha256": "6f0faaf14999d63451ecbf0d689350ecce3eeda44576d25918878c5119d618fa"
+      }
+    },
+    "prometheus": {
+      "version": "v3.16.0",
+      "asset": "../prerequisites/prometheus.json",
+      "sha256": "6f86a31c64015066092cb427fabdc4799a20ea39c8238666dee360b1a9f691e3"
+    }
+  }
 }

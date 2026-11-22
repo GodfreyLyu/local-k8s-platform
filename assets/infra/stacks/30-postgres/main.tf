@@ -114,6 +114,22 @@ resource "kubernetes_stateful_set_v1" "postgres" {
         }
       }
       spec {
+        dynamic "affinity" {
+          for_each = length(local.e.storage.nodes) > 0 ? [1] : []
+          content {
+            node_affinity {
+              required_during_scheduling_ignored_during_execution {
+                node_selector_term {
+                  match_expressions {
+                    key      = "kubernetes.io/hostname"
+                    operator = "In"
+                    values   = local.e.storage.nodes
+                  }
+                }
+              }
+            }
+          }
+        }
         service_account_name             = kubernetes_service_account_v1.postgres.metadata[0].name
         automount_service_account_token  = false
         enable_service_links             = false

@@ -1,0 +1,56 @@
+{
+  "$comment": "Purpose: define a minimal single-instance Prometheus with scoped monitor selectors and read-only target discovery. Metrics use temporary storage; alert delivery and dashboards are separate.",
+  "items": [
+    {
+      "apiVersion": "v1",
+      "kind": "ServiceAccount",
+      "metadata": {"name": "__ENVIRONMENT__-prometheus", "namespace": "__NAMESPACE__"}
+    },
+    {
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "kind": "ClusterRole",
+      "metadata": {"name": "__ENVIRONMENT__-prometheus"},
+      "rules": [
+        {"apiGroups": [""], "resources": ["services", "endpoints", "pods", "namespaces"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get", "list", "watch"]}
+      ]
+    },
+    {
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "kind": "ClusterRoleBinding",
+      "metadata": {"name": "__ENVIRONMENT__-prometheus"},
+      "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "__ENVIRONMENT__-prometheus"},
+      "subjects": [{"kind": "ServiceAccount", "name": "__ENVIRONMENT__-prometheus", "namespace": "__NAMESPACE__"}]
+    },
+    {
+      "apiVersion": "monitoring.coreos.com/v1",
+      "kind": "Prometheus",
+      "metadata": {"name": "__ENVIRONMENT__-prometheus", "namespace": "__NAMESPACE__"},
+      "spec": {
+        "replicas": 1,
+        "version": "v3.16.0",
+        "image": "quay.io/prometheus/prometheus:v3.16.0@sha256:9332054523223e2ddc18d8101799d54a4a8d823b030c53216f063a6c117773cd",
+        "serviceAccountName": "__ENVIRONMENT__-prometheus",
+        "retention": "6h",
+        "retentionSize": "256MB",
+        "resources": {
+          "requests": {"cpu": "100m", "memory": "256Mi", "ephemeral-storage": "512Mi"},
+          "limits": {"cpu": "500m", "memory": "512Mi", "ephemeral-storage": "1Gi"}
+        },
+        "securityContext": {"runAsNonRoot": true, "runAsUser": 65534, "fsGroup": 65534, "seccompProfile": {"type": "RuntimeDefault"}},
+        "podMonitorSelector": {"matchLabels": {"release": "__RELEASE__"}},
+        "podMonitorNamespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "__NAMESPACE__"}},
+        "serviceMonitorSelector": {"matchLabels": {"release": "__RELEASE__"}},
+        "serviceMonitorNamespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "__NAMESPACE__"}},
+        "ruleSelector": {"matchLabels": {"release": "__RELEASE__"}},
+        "ruleNamespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "__NAMESPACE__"}}
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {"name": "__ENVIRONMENT__-prometheus", "namespace": "__NAMESPACE__"},
+      "spec": {"ports": [{"name": "web", "port": 9090, "targetPort": "web"}], "selector": {"prometheus": "__ENVIRONMENT__-prometheus"}}
+    }
+  ]
+}

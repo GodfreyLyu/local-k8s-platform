@@ -21,18 +21,22 @@ The configuration path is expanded and resolved before reading. Relative kubecon
 | `postgres.enabled` | Select the single-instance PostgreSQL StatefulSet stage. |
 | `postgres.storage` / `postgres.resources` | Persistent capacity and container CPU/memory `requests` and `limits`. |
 | `kafka.enabled` | Select the single-node Strimzi KRaft stage. |
-| `kafka.namespace` | Existing namespace watched by the reused Strimzi operator. |
+| `kafka.namespace` | Namespace where the reused or newly installed Strimzi Operator runs and watches Kafka. |
 | `kafka.storage` / `kafka.resources` | Broker persistent capacity and CPU/memory resources. |
 | `kafka.topics` / `kafka.consumer_group` | Application topics and consumer group. ACLs grant access to these names. |
-| `monitoring.enabled` | Add monitors and alert rules for enabled services to existing Prometheus. |
-| `monitoring.namespace` / `monitoring.release` | Existing monitoring namespace and release selector. |
+| `kafka.heap_mib` | JVM heap in MiB. Defaults to `256`. It must leave space within the enabled broker's memory request. |
+| `kafka.partitions` | Partitions per new Topic. Defaults to `1`. Existing partitions cannot be reduced by this workflow. |
+| `kafka.retention_hours` / `kafka.retention_mib` | New message retention targets. Defaults: six hours and 64Mi per partition. |
+| `kafka.segment_mib` | Log segment target. Defaults to `16`. It cannot exceed the retention-size target. |
+| `monitoring.enabled` | Select monitoring prerequisites, monitors, and alert rules for enabled services. |
+| `monitoring.namespace` / `monitoring.release` | Monitoring namespace and release selector for reused or newly prepared resources. |
 | `monitoring.pod_labels` | Actual Prometheus Pod labels used by network policy. |
-| `storage.mode` | `reuse` an audited class, or `create` a separate local provisioner and class. |
+| `storage.mode` | `reuse` a reviewed class, `csi` to create a class using the existing Minikube CSI driver, or `create` a separate Local Path provisioner. |
 | `storage.class` | Explicit class name, required for reuse. There is no default-class fallback. |
-| `storage.nodes` | Eligible existing nodes for a newly created local provisioner. |
+| `storage.nodes` | Selected volume nodes. Required for `csi` and `create`. The same names constrain PostgreSQL and Kafka Pod placement. |
 | `network.dns_namespace` / `network.dns_labels` | Actual DNS Pod location and selector used by egress policy. |
 | `network.api_server_cidrs` | Reviewed IPv4 `/32` addresses for the API Service and endpoints. Used for operator egress. |
-| `budget.max_memory_requests_mib` | Maximum new configured memory requests, excluding reused platform services. |
+| `budget.max_memory_requests_mib` | Maximum service and managed prerequisite memory requests, excluding externally reused services. |
 | `budget.min_disk_free_mib` | Required free disk headroom used by preflight. |
 
 Most fields have defaults. Review the generated configuration before planning. The entry point rejects unknown keys, unsupported combinations, invalid quantities, and conflicting names.
@@ -43,14 +47,16 @@ Resource defaults and minimum supported memory settings are:
 
 | Component container | Default CPU request / limit | Default memory request / limit | Minimum memory request / limit |
 |---|---|---|---|
-| PostgreSQL | `250m` / `1000m` | `384Mi` / `768Mi` | `256Mi` / `512Mi` |
-| Kafka broker/controller | `300m` / `1500m` | `768Mi` / `1280Mi` | `512Mi` / `768Mi` |
+| PostgreSQL | `250m` / `1000m` | `256Mi` / `512Mi` | `256Mi` / `512Mi` |
+| Kafka broker/controller | `300m` / `1500m` | `512Mi` / `768Mi` | `512Mi` / `768Mi` |
 
 Requests must not exceed limits. Memory minimums apply to enabled components. They do not prove that the cluster has enough capacity.
 
 Memory and storage accept positive whole numbers with `Mi` or `Gi`, such as `384Mi` or `4Gi`. CPU accepts positive whole cores or millicores, such as `1` or `250m`.
 
-Both budget fields default to `2048` MiB. Memory estimates also include the enabled helper containers and operators.
+The memory budget defaults to `2048` MiB. Disk headroom defaults to `512` MiB per used node. Each service's PVC defaults to `1Gi`. Service estimates include their helper containers. With monitoring enabled, PostgreSQL and its exporter request 320Mi in one Pod. Kafka requests 512Mi for its broker and 256Mi for its separate Entity Operator Pod. Their total is 1088Mi. With all new prerequisites, the total is 1844Mi. See [prerequisite capacity](prerequisites.md#operators-and-namespaces).
+
+The `csi` mode creates only a non-default StorageClass. It requires the existing `hostpath.csi.k8s.io` driver and its node topology registrations. The class uses `WaitForFirstConsumer`, `Retain`, and the selected `topology.hostpath.csi/node` values. PostgreSQL and Kafka use matching hostname affinity. CSI installation and replacement are outside this mode.
 
 Keep passwords, private keys, connection strings with credentials, and shell commands out of this file. Packaged assets pin component versions. The configuration does not accept arbitrary version overrides.
 
@@ -62,10 +68,11 @@ Enable PostgreSQL, Kafka, or both. Monitoring covers the services you enable. A 
 |---|---|
 | Cluster/network | Existing Minikube with Calico. The DNS selector must match Ready DNS Pods. |
 | PostgreSQL | StatefulSet, TLS, dedicated PVC, application login, and separate monitoring login. No CNPG dependency. |
-| Kafka | Existing compatible Strimzi operator and CRDs in a watched namespace. One broker/controller, RF1 and minISR1. |
-| Monitoring | Existing Prometheus Operator CRDs and matching selectors. No second monitoring stack is installed. |
+| Kafka | Reuse or prepare Strimzi 1.3.0 in the configured namespace. One broker/controller, RF1 and minISR1. |
+| Monitoring | Reuse a compatible installation or prepare an Operator and minimal Prometheus. Match monitor selectors and Pod labels. |
 | Reused storage | Reviewed `WaitForFirstConsumer` / `Retain` class and enough measured disk space. |
 | Created storage | Separate Local Path provisioner on selected nodes, with its own non-default class. Existing classes and volumes remain unchanged. |
+| Existing CSI | A new class using the current Minikube CSI Hostpath driver. No extra storage controller is installed. |
 
 This version does not support HTTPS ingress, cluster creation, CNPG, replication, failover, object storage, WAL/PITR, operator upgrades, or application releases. Adding a field to the JSON cannot enable them.
 
@@ -91,7 +98,7 @@ Default SQL names replace hyphens in `environment_id` with underscores. If the r
 The selected components determine the stages:
 
 1. `00-bootstrap`: dedicated namespaces, identities, and network isolation.
-2. `05-storage`: only for `storage.mode=create`.
+2. `05-storage-csi` for `storage.mode=csi`, or `05-storage` for `storage.mode=create`.
 3. `30-postgres`: only for enabled PostgreSQL.
 4. `31-kafka`: only for enabled Kafka.
 5. `40-monitoring`: only for enabled monitoring.

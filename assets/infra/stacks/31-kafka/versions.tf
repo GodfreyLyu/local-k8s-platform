@@ -24,10 +24,15 @@ variable "environment" {
       labels               = map(string)
     })
     kafka = object({
-      namespace      = string
-      storage        = string
-      topics         = list(string)
-      consumer_group = string
+      namespace       = string
+      storage         = string
+      topics          = list(string)
+      consumer_group  = string
+      heap_mib        = number
+      partitions      = number
+      retention_hours = number
+      retention_mib   = number
+      segment_mib     = number
       resources = object({
         requests = map(string)
         limits   = map(string)
@@ -45,6 +50,7 @@ variable "environment" {
     })
     storage = object({
       class = string
+      nodes = list(string)
     })
   })
 }

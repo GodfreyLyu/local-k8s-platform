@@ -3,11 +3,12 @@
 
 import argparse
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
 
-from config import load_config
+from config import load_config, memory_mib
 from io_utils import private_dir, read_json, workspace_lock, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +25,18 @@ def configure(config, workspace):
             raise ValueError(
                 "This workspace is already bound to another environment or cluster configuration"
             )
+        for component, stage in (("postgres", "30-postgres"), ("kafka", "31-kafka")):
+            if (workspace / "state" / f"{stage}.tfstate").exists():
+                if memory_mib(config[component]["storage"]) < memory_mib(
+                    previous[component]["storage"]
+                ):
+                    raise ValueError(
+                        "Existing volumes cannot be shrunk; keep their size or review a separate data migration"
+                    )
+                if config["storage"] != previous["storage"]:
+                    raise ValueError(
+                        "Changing storage nodes or class for managed data requires a separate migration"
+                    )
         removed = set(previous["derived"]["stages"]) - set(config["derived"]["stages"])
         if any((workspace / "state" / f"{stage}.tfstate").exists() for stage in removed):
             raise ValueError(
@@ -126,6 +139,12 @@ def arguments(argv=None):
     apply.add_argument("--stage", required=True)
     apply.add_argument("--plan-id", required=True)
     apply.add_argument("--execute", action="store_true")
+    prerequisites = actions.add_parser("prerequisites")
+    prerequisites.add_argument(
+        "--component", choices=("all", "strimzi", "monitoring", "openssl"), default="all"
+    )
+    prerequisites.add_argument("--plan-id")
+    prerequisites.add_argument("--execute", action="store_true")
     credentials = actions.add_parser("credentials")
     credentials.add_argument("--component", choices=("postgres", "kafka"), default="postgres")
     mode = credentials.add_mutually_exclusive_group()
@@ -134,6 +153,11 @@ def arguments(argv=None):
     args = parser.parse_args(argv)
     if args.action == "credentials" and args.component == "kafka" and args.prepare:
         parser.error("Kafka source credentials are prepared by Strimzi, not this tool")
+    if args.action == "prerequisites":
+        if args.execute and not args.plan_id:
+            parser.error("prerequisites --execute requires --plan-id")
+        if args.plan_id and not re.fullmatch(r"[0-9a-f]{64}", args.plan_id):
+            parser.error("prerequisites --plan-id must be a SHA-256 identifier")
     return args
 
 
@@ -152,6 +176,12 @@ def main(argv=None):
             raise ValueError("Stage is not enabled by this configuration")
         if args.action == "credentials" and not config[args.component]["enabled"]:
             raise ValueError("The requested credential component is disabled")
+        if args.action == "prerequisites" and args.component != "all":
+            component = {"strimzi": "kafka", "monitoring": "monitoring", "openssl": "postgres"}[
+                args.component
+            ]
+            if not config[component]["enabled"]:
+                raise ValueError("The requested prerequisite component is disabled")
         with workspace_lock(workspace):
             configured = configure(config, workspace)
             if args.action == "configure":
@@ -161,6 +191,12 @@ def main(argv=None):
 
                 report = credentials(
                     config, workspace, args.component, prepare=args.prepare, execute=args.execute
+                )
+            elif args.action == "prerequisites":
+                from prerequisites import prerequisites
+
+                report = prerequisites(
+                    config, workspace, args.component, args.plan_id, args.execute
                 )
             else:
                 import runtime

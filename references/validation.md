@@ -2,43 +2,74 @@
 
 # Validation
 
-This report includes the original build checks from 2026-11-13. Typed Terraform inputs were revalidated on 2026-11-14. The results cover the implementation and static Terraform validation. Live deployment and functional acceptance remain pending.
+This report includes build checks from 2026-11-14 for the small local profile, prerequisite automation, and existing-CSI storage. The results cover implementation, static validation, and a selected-cluster read-only preflight. Deployment and functional acceptance remain pending.
 
 ## Results
 
 | Check | Result |
 |---|---|
-| Offline Python tests | 72 passed on Python 3.10. Coverage includes configuration, workspace files, JSON I/O failure handling, plan integrity, ownership, credentials, startup, and validation orchestration. |
+| Offline Python tests | 109 passed on Python 3.13. Coverage includes capacity placement, CSI checks, data migration guards, stage scopes, prerequisites, configuration, private I/O, credentials, startup, and validation orchestration. |
+| Prerequisite orchestration | 24 tests passed with private fake kubectl, Homebrew, and OpenSSL tools. Cases include missing future storage, permissions before CRD discovery, reuse, conflicts, budgets, plan integrity, and partial recovery. Linux package commands were checked without installation. |
+| Capacity placement | Eight isolated tests covered the three-node capacity pattern, effective Pod requests, shared disk accounting, taints, and joint allocation. A low-disk control node did not block worker volumes. |
+| Vendored CRD schemas | All 10 Strimzi schemas and all 10 Prometheus Operator schemas matched their official downloaded bundles. Source and packaged checksums matched. |
+| Minimal Prometheus schema | The rendered instance passed the packaged v1 JSON schema. An invalid replica type was rejected. This check did not evaluate Kubernetes CEL or admission. |
+| Kafka manifest schemas | Exact NodePool and Topic HCL expressions were evaluated in a provider-free console. CSI and reused-class cases passed the packaged v1 schemas. The CSI NodePool included the selected worker affinity. |
+| Python compatibility | All maintained Python files parsed with Python 3.10 grammar. The new behavior was executed on Python 3.13. |
 | Local certificate preparation | OpenSSL generated and verified temporary certificates. A second run reused the credentials. Test material was removed afterward. |
-| Independent agent trial | A PostgreSQL-only request produced the expected stages and application settings. It made no calls to kubectl, Terraform, Minikube, or OpenSSL. |
+| Earlier agent trial | The original build's PostgreSQL-only trial produced the expected stages and application settings. It made no calls to external tools. |
 | Python lint and formatting | Ruff checks passed. Ruff is optional for development; the runtime needs no third-party Python packages. |
 | Skill structure and documentation | The skill validator, relative links, and required file and function comments passed inspection. |
-| Terraform formatting | All five stage roots passed recursive format checking. |
+| Portable package | Reproducibility and runtime-file exclusions passed. All 64 source hashes were checked in a temporary archive. Its extracted CLI configured the CSI profile with an empty external-tool PATH. |
+| Terraform formatting | All six stage roots passed recursive format checking. |
 | Native provider check | Schema loading passed with Terraform `1.15.8` and Kubernetes provider `2.38.0`. |
-| Native configuration matrix | All 12 profiles and 40 stage instances passed, with zero errors and zero warnings. |
-| Typed input contracts | All five exact stage variable declarations accepted the normalized environment in provider-free, resource-free console fixtures. Ten negative cases rejected missing `cluster.kubeconfig` or an invalid `cluster.context` type. |
-| Terraform IDE inspections | All 12 Terraform files passed IDE inspection with no errors or warnings after adding explicit stage input types. |
+| Native configuration matrix | All 18 profiles and 63 stage instances passed, with zero errors and zero warnings. |
+| Typed input contracts | All six exact stage variable declarations accepted normalized input in provider-free, resource-free console fixtures. Twelve negative cases rejected a missing kubeconfig or an invalid context type. |
+| Selected-cluster preflight | The private small profile passed read-only inspection. The estimate placed PostgreSQL and its 1Gi volume on one worker, Kafka and its 1Gi volume on the other, and the Entity Operator on the control node. No resources were created. |
 | Live acceptance | Pending. These checks did not deploy resources or test application connections. |
+
+## Prerequisite checks
+
+The fake Kubernetes runner used private temporary files. It simulated CRD
+establishment, Operator rollouts, and Prometheus reconciliation. No test created
+live Kubernetes resources or installed host packages. Real OpenSSL was used only
+for temporary certificate generation and verification in the credential tests.
+
+Prerequisite tests also checked that separate component plans count already managed
+resources toward the memory budget. Create-only execution preserved successful
+resources after an injected failure. A consumed plan could not run again. A fresh
+plan resumed the unchanged owned resources.
+
+The official Strimzi `1.3.0` and Prometheus Operator `v0.95.1` bundles were checked
+before conversion to packaged JSON. Image digests were read from the official
+release or registry. The local Prometheus profile uses `v3.16.0`. These source
+checks establish provenance and schema consistency. They do not prove that the
+images run correctly in a selected cluster.
+
+The small profile requests 1088Mi for data services and exporters and 2Gi for its
+two volumes. The selected cluster's existing Operators and CSI driver were reused
+in the preflight. This estimate does not reserve the proposed placement. Startup,
+connections, memory pressure, and training workloads still need runtime evidence.
 
 ## Native Terraform run
 
-The report returned `status=pass`, `provider_probe=pass`, and `cases_passed=cases_planned=40`.
+The report returned `status=pass`, `provider_probe=pass`, and `cases_passed=cases_planned=63`.
 
-The audit checked every command result. All 40 initializations and all 40 validations exited 0. Each validation returned `valid=true`, no errors, no warnings, and an empty diagnostic list.
+The audit checked every command result. All 63 initializations and all 63 validations exited 0. Each validation returned `valid=true`, no errors, no warnings, and an empty diagnostic list.
 
 These static checks cover attribute references and configuration consistency. The additional console fixtures evaluate actual input conversion against each stage's explicit `object` type. They contain no providers, resources, or remote backend.
 
-All 24 stage source files and lockfiles matched the copies used by the native run. Generated variables also matched the current configuration logic. Coverage included every Terraform root:
+All 27 stage source files and lockfiles matched the copies used by the native run. Generated variables used the selected storage modes. Coverage included every Terraform root:
 
 | Stage | Passing profile instances |
 |---|---:|
-| `00-bootstrap` | 12 |
+| `00-bootstrap` | 18 |
 | `05-storage` | 6 |
-| `30-postgres` | 8 |
-| `31-kafka` | 8 |
-| `40-monitoring` | 6 |
+| `05-storage-csi` | 6 |
+| `30-postgres` | 12 |
+| `31-kafka` | 12 |
+| `40-monitoring` | 9 |
 
-[Native validation evidence](native-validation.json) lists the profile coverage and source hashes. It also stores the original report digest and digests for all 80 command diagnostics. Private workspaces and raw TRACE logs are excluded from the package.
+[Native validation evidence](native-validation.json) lists profile coverage and source hashes. It stores the report digest and digests for all 126 command diagnostics. Private workspaces and raw TRACE logs are excluded from the package.
 
 These results establish static Terraform and provider-schema consistency. They do not prove live CRD compatibility, service connectivity, permissions, network isolation, alert delivery, or recovery.
 
@@ -68,7 +99,7 @@ For the validation matrix, choose a new private report directory outside the rep
 python3 -B scripts/validate.py --report-dir "$HOME/local-k8s-validation/new-run"
 ```
 
-The runner first checks provider communication. It then validates PostgreSQL-only, Kafka-only, and combined profiles. Each runs with monitoring off/on and storage reuse/create. That gives 12 profiles and 40 selected stage instances.
+The runner first checks provider communication. It then validates PostgreSQL-only, Kafka-only, and combined profiles. Each runs with monitoring off/on and storage reuse/create/csi. That gives 18 profiles and 63 selected stage instances.
 
 The runner uses explicit variable files. It needs a Terraform release whose `validate -help` lists `-var-file`; the tested release is `1.15.8`.
 

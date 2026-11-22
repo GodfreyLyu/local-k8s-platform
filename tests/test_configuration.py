@@ -38,8 +38,8 @@ class ConfigurationTests(unittest.TestCase):
     def test_postgres_only_omits_kafka_and_monitoring(self):
         config = self.config(kafka={"enabled": False}, monitoring={"enabled": False})
         self.assertEqual(config["derived"]["stages"], ["00-bootstrap", "30-postgres"])
-        self.assertEqual(config["derived"]["requests_memory_mib"], 384)
-        self.assertEqual(config["derived"]["total_storage_mib"], 4096)
+        self.assertEqual(config["derived"]["requests_memory_mib"], 256)
+        self.assertEqual(config["derived"]["total_storage_mib"], 1024)
 
     # Inputs: supported component combinations. Outputs: assertions. Purpose: keep selection consistent. Dependencies: normalizer.
     def test_component_matrix_has_consistent_stages(self):
@@ -76,6 +76,10 @@ class ConfigurationTests(unittest.TestCase):
             {"network": {"api_server_cidrs": ["0.0.0.0/0"]}},
             {"monitoring": {"pod_labels": {"bad label": "value"}}},
             {"storage": {"mode": "create", "nodes": []}},
+            {"storage": {"mode": "csi", "nodes": []}},
+            {"kafka": {"heap_mib": 512}},
+            {"kafka": {"partitions": 0}},
+            {"kafka": {"segment_mib": 65}},
             {
                 "application": {"namespace": "atlas-storage"},
                 "storage": {"mode": "create", "nodes": ["minikube"]},
@@ -112,6 +116,38 @@ class ConfigurationTests(unittest.TestCase):
         config = self.config(storage={"mode": "create", "nodes": ["minikube"]})
         self.assertIn("05-storage", config["derived"]["stages"])
         self.assertEqual(config["storage"]["class"], "atlas-local-retain")
+
+    # Inputs: an existing-CSI local profile. Outputs: small Pod forecasts and a class-only stage.
+    # Purpose: preserve accurate Pod boundaries without adding another provisioner. Dependencies: configuration normalization.
+    def test_csi_profile_uses_small_defaults_and_individual_pods(self):
+        config = self.config(storage={"mode": "csi", "nodes": ["worker-a", "worker-b"]})
+        self.assertEqual(config["derived"]["storage_stage"], "05-storage-csi")
+        self.assertNotIn("05-storage", config["derived"]["stages"])
+        self.assertEqual(config["derived"]["requests_memory_mib"], 1088)
+        self.assertEqual(config["derived"]["total_storage_mib"], 2048)
+        self.assertEqual(
+            {item["name"]: item["memory_mib"] for item in config["derived"]["workloads"]},
+            {"atlas-postgres": 320, "atlas-kafka": 512, "atlas-kafka-entity-operator": 256},
+        )
+
+    # Inputs: smaller volumes or changed storage placement after data state exists. Outputs: refusal before workspace refresh.
+    # Purpose: keep the light defaults from changing existing data ownership or size. Dependencies: materialization and state evidence.
+    def test_existing_data_requires_a_migration_for_smaller_or_moved_storage(self):
+        workspace = self.root / "workspace"
+        with workspace_lock(workspace):
+            previous = self.config(postgres={"storage": "4Gi"})
+            CLI.configure(previous, workspace)
+            write_json(workspace / "state" / "30-postgres.tfstate", {"resources": []})
+            with self.assertRaisesRegex(ValueError, "shrunk"):
+                CLI.configure(self.config(), workspace)
+            with self.assertRaisesRegex(ValueError, "migration"):
+                CLI.configure(
+                    self.config(
+                        postgres={"storage": "4Gi"}, storage={"mode": "csi", "nodes": ["worker"]}
+                    ),
+                    workspace,
+                )
+            self.assertEqual(read_json(workspace / "environment.json"), previous)
 
     # Inputs: two environment workspaces. Outputs: isolated generated roots. Purpose: separate state paths. Dependencies: configure.
     def test_configure_materializes_independent_private_workspaces(self):

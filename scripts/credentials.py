@@ -7,6 +7,7 @@ import re
 import secrets
 
 from io_utils import private_dir, read_json, run, write_json
+from prerequisites import find_openssl
 
 
 # Inputs: normalized config and kubectl arguments/stdin. Outputs: decoded JSON or empty mapping.
@@ -44,10 +45,10 @@ def contract(config):
     }
 
 
-# Inputs: OpenSSL argument list and private directory. Outputs: stdout.
+# Inputs: OpenSSL argument list, private directory and resolved executable. Outputs: stdout.
 # Purpose: execute certificate tooling without printing key material. Dependencies: openssl.
-def openssl(arguments, directory):
-    result = run(["openssl", *arguments], cwd=directory)
+def openssl(arguments, directory, executable):
+    result = run([executable, *arguments], cwd=directory)
     if result.returncode:
         raise RuntimeError(
             "Certificate operation failed; inspect protected material before retrying"
@@ -55,9 +56,20 @@ def openssl(arguments, directory):
     return result.stdout
 
 
-# Inputs: normalized config and prepared credential directory. Outputs: verified password bundle.
+# Inputs: none. Outputs: a resolved OpenSSL path or a preparation hint.
+# Purpose: resolve local certificate tooling once per credential operation. Dependencies: prerequisite tool discovery.
+def certificate_tool():
+    tool = find_openssl()
+    if tool is None:
+        raise RuntimeError(
+            "A supported OpenSSL is required; run prerequisites --component openssl first"
+        )
+    return tool["path"]
+
+
+# Inputs: normalized config, credential directory and optional resolved executable. Outputs: verified password bundle.
 # Purpose: verify external persisted material before reuse. Dependencies: OpenSSL and private files.
-def verify_bundle(config, directory):
+def verify_bundle(config, directory, executable=None):
     expected = contract(config)
     for filename in ("bundle.json", "ca.key", "ca.crt", "server.key", "server.crt"):
         path = directory / filename
@@ -77,14 +89,17 @@ def verify_bundle(config, directory):
         for key in ("admin_password", "app_password", "metrics_password")
     ):
         raise ValueError("Prepared password material is invalid; no password was reset")
-    openssl(["verify", "-CAfile", "ca.crt", "server.crt"], directory)
+    executable = executable or certificate_tool()
+    openssl(["verify", "-CAfile", "ca.crt", "server.crt"], directory, executable)
     for certificate, key in (("ca.crt", "ca.key"), ("server.crt", "server.key")):
-        openssl(["x509", "-in", certificate, "-noout", "-checkend", "86400"], directory)
-        public = openssl(["x509", "-in", certificate, "-noout", "-pubkey"], directory)
-        if public != openssl(["pkey", "-in", key, "-pubout"], directory):
+        openssl(["x509", "-in", certificate, "-noout", "-checkend", "86400"], directory, executable)
+        public = openssl(["x509", "-in", certificate, "-noout", "-pubkey"], directory, executable)
+        if public != openssl(["pkey", "-in", key, "-pubout"], directory, executable):
             raise ValueError("Certificate and private key do not match")
     for hostname in (expected["host"], "localhost"):
-        openssl(["x509", "-in", "server.crt", "-noout", "-checkhost", hostname], directory)
+        openssl(
+            ["x509", "-in", "server.crt", "-noout", "-checkhost", hostname], directory, executable
+        )
     return bundle
 
 
@@ -97,6 +112,7 @@ def prepare_postgres(config, workspace):
         return directory
     if any(directory.iterdir()):
         raise ValueError("Partial credential material exists; review it before recovery")
+    executable = certificate_tool()
     identity = contract(config)
     host = identity["host"]
     extensions = directory / "server.ext"
@@ -129,6 +145,7 @@ def prepare_postgres(config, workspace):
                 "ca.crt",
             ],
             directory,
+            executable,
         )
         openssl(
             [
@@ -145,6 +162,7 @@ def prepare_postgres(config, workspace):
                 "server.csr",
             ],
             directory,
+            executable,
         )
         openssl(
             [
@@ -165,6 +183,7 @@ def prepare_postgres(config, workspace):
                 "server.crt",
             ],
             directory,
+            executable,
         )
     finally:
         os.umask(previous_umask)
@@ -177,7 +196,7 @@ def prepare_postgres(config, workspace):
             "metrics_password": secrets.token_hex(32),
         },
     )
-    verify_bundle(config, directory)
+    verify_bundle(config, directory, executable)
     return directory
 
 
@@ -328,7 +347,7 @@ def credentials(config, workspace, component="postgres", *, prepare=False, execu
     if execute:
         from runtime import inspect
 
-        inventory = inspect(config, workspace)
+        inventory = inspect(config, workspace, stage="00-bootstrap")
         if inventory.get("status") in {"blocked", "failed"}:
             raise ValueError("Cluster inspection is blocked; no credentials were written")
         bootstrap = workspace / "reports" / "applied-00-bootstrap.json"
