@@ -21,7 +21,7 @@ Use English for maintained documentation and code comments. Respond in the user'
 - For implementation changes or scope decisions, read [design.md](references/design.md).
 - For offline Terraform checks or provider startup errors, read [validation.md](references/validation.md) and use `scripts/validate.py`.
 
-Support a single PostgreSQL StatefulSet, a single Strimzi KRaft node, and an optional GPU device plugin that advertises the krunkit render node as `devic.es/dri`. Enable any combination of these; a GPU-only environment disables monitoring and storage. Local storage and monitoring integration are optional. Cluster creation is create-only: it never starts, recreates, or deletes an existing profile. Operator replacement, HTTPS ingress, CNPG, PITR, and application releases are outside this version's scope. Explain unsupported requests rather than trying to enable them through configuration.
+Support a single PostgreSQL StatefulSet, a single Strimzi KRaft node, and an optional GPU device plugin that advertises the krunkit render node as `devic.es/dri`. Enable any combination of these; a GPU-only environment disables monitoring and storage. Local storage and monitoring integration are optional. Cluster creation never starts an existing profile. It recreates or deletes a profile only through an explicitly requested, separately authorized `cluster --overwrite` plan for a profile this workspace created. Operator replacement, HTTPS ingress, CNPG, PITR, and application releases are outside this version's scope. Explain unsupported requests rather than trying to enable them through configuration.
 
 ## Form an explicit configuration
 
@@ -49,6 +49,22 @@ python3 -B scripts/platform.py --config environment.json --workspace /private/pa
 The plan reads the Minikube version, profile list, machine records, and kubeconfig entry names. Present the profile name, kubeconfig, driver, nodes, CPUs, memory, disk, Kubernetes version, CNI, addons, and the exact command. A conflicting profile, machine record, or kubeconfig entry blocks creation. Obtain authorization for that exact plan, then run `cluster --plan-id REVIEWED_PLAN_ID --execute`. This authorization is separate from prerequisites, Terraform changes, and Secret writes.
 
 The result suggests `network.api_server_cidrs` for the new cluster. Review them and add them to the configuration before Kafka prerequisites or planning. A failed or interrupted start or an unverified identity keeps the profile for inspection. Report the outcome and stop.
+
+### Overwrite a created cluster
+
+Use this only when the user asks to recreate or overwrite the cluster. It applies only to a profile this workspace created.
+
+```sh
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev cluster --overwrite
+```
+
+The plan compares the profile with the workspace's records and reports one action:
+
+- `recreate-missing`: the profile no longer exists.
+- `overwrite`: the profile is readable, but its identity or a recorded object differs. The plan includes `minikube delete`.
+- `unchanged`: everything matches. There is nothing to execute.
+
+A stopped or unreachable profile blocks. For a running profile, the API queried from its control plane and the chosen context must return the same cluster UID. Present the reviewed Minikube home, action, differences, delete command, and effects. A deleted profile loses its data, and prerequisites, stages, and credentials need new plans. Obtain authorization for that plan, then run `cluster --overwrite --plan-id REVIEWED_PLAN_ID --execute`. Execution rechecks the evidence, reserves the archive, and confirms deletion and clean host records before moving the previous workspace files and starting the replacement.
 
 ## Prepare prerequisites
 

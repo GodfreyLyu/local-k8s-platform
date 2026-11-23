@@ -57,6 +57,33 @@ An existing profile with this name blocks, whether it is running, stopped, or in
 
 A failed start records `failed`. A timeout or an identity verification or binding failure records `uncertain`. These outcomes preserve the profile and block later stages. Inspect the profile with `minikube status -p NAME` and `minikube logs -p NAME` before deciding on recovery. A consumed plan cannot run again.
 
+### Overwrite a created cluster
+
+Without `--overwrite`, `cluster` on a workspace with a `created` report returns that report. Overwrite also requires the resolved Minikube home recorded at creation. Legacy reports without a home still support ordinary platform operations. Both the deletion and the replacement command use the reviewed home.
+
+The overwrite plan compares the live cluster with this workspace. The result goes to `reports/cluster-reconcile.json`.
+
+1. **Identity.** Minikube SSH reads the `kube-system` UID from the running local profile's control plane. The configured context must return that same UID. Only then can a difference from the stored creation identity count as drift. A verified identity difference skips object checks.
+2. **Terraform state.** Every managed resource in `state/*.tfstate` must exist. It must keep its recorded UID and carry this environment's ownership label. `kubernetes_manifest` entries use the UID from the stored object.
+3. **Other recorded objects.** Successfully created prerequisites and published Secrets must exist. The workspace keeps their references in `state/recorded-objects.json` across previews and retries. Earlier reports and consumed prerequisite plans also supply references. Secret reads request `PartialObjectMetadata` from the API through a temporary private Unix socket.
+
+For resources backed by CRDs, the comparison verifies the CRD before reading the instance. A confirmed missing CRD counts as absence. Discovery and permission errors block the plan. Review evidence includes the observed UID and environment ownership label of each object.
+
+Results map to plan actions:
+
+| Live evidence | Action | Execution |
+|---|---|---|
+| No profile with this name | `recreate-missing` | Archive the workspace, then start once. |
+| Readable profile, all checks match | `unchanged` | Nothing to execute. |
+| Readable profile, identity or any object differs | `overwrite` | `minikube delete --profile=NAME`, then archive and start once. |
+| Profile cannot be read (stopped, invalid, API down) | blocked | Start it outside this workflow and plan again. |
+
+Machine records or kubeconfig entries left without a profile still block `recreate-missing`, and the plan does not clean them up. Comparisons cover existence, UID, and ownership only. They ignore spec drift, which stage plans handle without deleting anything.
+
+Execution requires `--overwrite --plan-id ID --execute`, with authorization for the stated data loss. It repeats the comparison and refuses stale evidence. Keep the kubeconfig and Minikube home outside the workspace, and the workspace outside Minikube home. Execution reserves a writable private archive on the workspace filesystem before consuming the plan and deleting anything. A failed delete, timeout, or residual profile, machine, or kubeconfig record leaves the workspace files in place.
+
+Archiving moves workspace entries other than `.operation.lock` and `archive/` into `archive/<UTC time>-<plan prefix>/`, mode `0700`. The new workspace records the archive and deletion outcome in `reports/cluster-recreated.json`. The replacement start and its binding are reported separately in `reports/cluster.json`, including an uncertain start after a completed deletion. Earlier state, credentials, and plans remain in the archive. Prerequisites, stage plans, and credentials start again from new reviewed plans.
+
 ## Workspace and identity
 
 Use a private directory, for example `/private/path/foo-dev`. New helper-created directories request mode `0700`. JSON files and new lock files request `0600`. The directory check requires the current user's UID and no group or other permissions. It does not require exact owner permission bits or change existing permissions.

@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 
+import runtime
 from io_utils import private_dir, read_json, run, write_json
 from prerequisites import find_openssl
 
@@ -325,6 +326,8 @@ def kafka_documents(config):
 # Purpose: preview, prepare locally, or explicitly publish credentials. Dependencies: selected component tools.
 def credentials(config, workspace, component="postgres", *, prepare=False, execute=False):
     derived = config["derived"]
+    report_path = workspace / "reports" / f"credentials-{component}.json"
+    runtime._remember_objects(workspace, runtime._reported_objects(report_path))
     if component == "postgres":
         refs = [
             f"{derived['namespace']}/{derived['postgres_name']}-{suffix}"
@@ -368,21 +371,26 @@ def credentials(config, workspace, component="postgres", *, prepare=False, execu
             else kafka_documents(config)
         )
         report.update(status="publishing", cluster_writes=True, results=[])
-        write_json(workspace / "reports" / f"credentials-{component}.json", report)
+        write_json(report_path, report)
         try:
             for document in documents:
                 metadata = document["metadata"]
+                status = publish(config, document)
                 report["results"].append(
                     {
                         "reference": f"{metadata['namespace']}/{metadata['name']}",
-                        "status": publish(config, document),
+                        "status": status,
                     }
                 )
-                write_json(workspace / "reports" / f"credentials-{component}.json", report)
+                runtime._remember_objects(workspace, [{
+                    "source": report_path.stem, "resource": "secrets",
+                    "namespace": metadata["namespace"], "name": metadata["name"], "uid": None,
+                }])
+                write_json(report_path, report)
             report["status"] = "published"
         except (RuntimeError, ValueError, KeyError, OSError):
             report["status"] = "failed"
-            write_json(workspace / "reports" / f"credentials-{component}.json", report)
+            write_json(report_path, report)
             raise
-    write_json(workspace / "reports" / f"credentials-{component}.json", report)
+    write_json(report_path, report)
     return report

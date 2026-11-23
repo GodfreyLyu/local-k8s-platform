@@ -797,6 +797,102 @@ def _state_hash(workspace: Path, stage: str) -> str | None:
     return sha256(path) if path.exists() else None
 
 
+# Inputs: Terraform state attribute value. Outputs: the plain value.
+# Purpose: Read dynamic attributes, which local state stores as {"value", "type"}. Dependencies: none.
+def _state_value(value: object) -> object:
+    if isinstance(value, dict) and set(value) == {"value", "type"}:
+        return value["value"]
+    return value
+
+
+# Inputs: private workspace. Outputs: recorded Kubernetes identities per stage state file.
+# Purpose: Let cluster reconciliation compare live objects with Terraform state. Dependencies: local backend JSON.
+def _state_resources(workspace: Path) -> list[dict]:
+    result = []
+    directory = workspace / "state"
+    if not directory.exists():
+        return result
+    for path in sorted(directory.glob("*.tfstate")):
+        if path.is_symlink():
+            raise RuntimeError("Terraform state must not be a symbolic link.")
+        for item in read_json(path).get("resources", []):
+            if item.get("mode", "managed") != "managed":
+                continue
+            for instance in item.get("instances", []):
+                attributes = instance.get("attributes") or {}
+                if item["type"] == "kubernetes_manifest":
+                    values = {"manifest": _state_value(attributes.get("manifest")) or {}}
+                    live = _state_value(attributes.get("object")) or {}
+                    uid = live.get("metadata", {}).get("uid")
+                else:
+                    values, uid = attributes, None
+                identity = _resource_identity(item["type"], values)
+                result.append(
+                    {
+                        "source": f"terraform:{path.stem}",
+                        **{key: identity[key] for key in ("resource", "name", "namespace")},
+                        "uid": identity["uid"] or uid,
+                    }
+                )
+    return result
+
+
+# Inputs: operation report path. Outputs: successfully created or published object references.
+# Purpose: retain evidence from earlier releases and partial operations. Dependencies: private reports.
+def _reported_objects(path: Path) -> list[dict]:
+    try:
+        report = read_json(path)
+    except FileNotFoundError:
+        return []
+    references = []
+    for item in report.get("results", []):
+        if path.stem.startswith("credentials-"):
+            if item["status"] in {"created", "unchanged"}:
+                namespace, name = item["reference"].split("/", 1)
+                references.append({
+                    "source": path.stem, "resource": "secrets", "namespace": namespace,
+                    "name": name, "uid": None,
+                })
+        elif item.get("status") == "created" and item.get("reference"):
+            references.append({"source": "prerequisites", **item["reference"], "uid": None})
+    return references
+
+
+# Inputs: workspace and references. Outputs: none. Dependencies: private JSON and the workspace lock.
+# Purpose: persist positive object evidence independently of the latest operation report.
+def _remember_objects(workspace: Path, references: list[dict]) -> None:
+    if not references:
+        return
+    path = workspace / "state" / "recorded-objects.json"
+    try:
+        saved = read_json(path)
+    except FileNotFoundError:
+        saved = []
+    combined = saved + [item for item in references if item not in saved]
+    if combined != saved:
+        write_json(path, combined)
+
+
+# Inputs: workspace. Outputs: unique references for non-Terraform objects.
+# Purpose: reconcile durable and legacy evidence. Dependencies: object inventory and private reports.
+def _recorded_objects(workspace: Path) -> list[dict]:
+    try:
+        objects = read_json(workspace / "state" / "recorded-objects.json")
+    except FileNotFoundError:
+        objects = []
+    for path in (
+        *sorted((workspace / "reports").glob("prerequisites-*.json")),
+        *sorted((workspace / "reports").glob("credentials-*.json")),
+        *sorted((workspace / "plans" / "prerequisites").glob("consumed-*.json")),
+    ):
+        objects.extend(_reported_objects(path))
+    unique = {}
+    for item in objects:
+        key = (item["resource"], item["namespace"] or "", item["name"])
+        unique.setdefault(key, item)
+    return [unique[key] for key in sorted(unique)]
+
+
 # Inputs: Terraform change values and resource type. Outputs: Kubernetes resource identity and labels.
 # Purpose: Translate allowed plan resources for ownership and collision checks. Dependencies: Terraform Kubernetes provider shapes.
 def _resource_identity(resource_type: str, values: dict) -> dict:

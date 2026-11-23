@@ -14,7 +14,7 @@ This skill configures a local development platform on an existing or newly creat
 | I/O helpers | Check directories, replace JSON files, lock the workspace, and invoke commands. | Local artifacts and captured command results. |
 | Terraform assets | Manage selected resources with separate state for each stage. | Saved plans and resources. |
 | Credential helper | Prepare credentials and write fixed Secrets outside Terraform. | Protected credentials and application-local Secret references. |
-| Cluster helper | Plan and run one create-only `minikube start` for an explicitly named profile. | Review record, creation report, and suggested API addresses. |
+| Cluster helper | Plan and run one `minikube start` for an explicitly named profile. It also handles reviewed overwrites of a profile this workspace created. | Review record, creation report, reconciliation report, workspace archive, and suggested API addresses. |
 | Prerequisite helper | Reuse compatible dependencies and create missing reviewed resources or local packages. | Saved manifests, plan IDs, ownership evidence, and partial-result reports. |
 | Runtime checks | Check cluster identity, ownership, prerequisites, and readiness. | Inventory, plan review, and acceptance status. |
 | Capacity helper | Estimate joint Pod memory and volume placement from current evidence. | Suggested allocations and remaining node capacity. |
@@ -93,7 +93,13 @@ The smoke Pod stays outside Terraform state, as in the reference design. The `gp
 
 `cluster.mode=create` adds one create-only operation. The user names the profile explicitly. The review binds the configuration, sources, Minikube path and version, host platform, and absence of conflicting profile, machine, and kubeconfig entries. A stopped or invalid profile also blocks creation.
 
-The command fixes Calico, CSI addons for CSI storage, the Kubernetes version range, and `--keep-context=true`. A successful start must establish a workspace binding with the cluster's API endpoint and `kube-system` UID. Later inspections and writes compare the observed identity with the binding and creation report. Restart, resize, and deletion stay operator decisions.
+The command fixes Calico, CSI addons for CSI storage, the Kubernetes version range, and `--keep-context=true`. A successful start must establish a workspace binding with the cluster's API endpoint and `kube-system` UID. Later inspections and writes compare the observed identity with the binding and creation report. Restart and resize stay operator decisions.
+
+`cluster --overwrite` is the only path that deletes or recreates a profile. It is an operation flag, not a configuration field, because `configure` binds the workspace to its cluster configuration. Turning the flag on must not look like a configuration change. Overwrite reviews record the flag, so plain and overwrite plans cannot stand in for each other.
+
+Deletion requires a verified difference. The configured context and the API queried inside the running profile must return the same cluster UID. The creation and review records pin the resolved Minikube home. Resource evidence includes the observed UID and ownership label. Stage plans handle spec drift.
+
+Execution reserves a private archive on the workspace filesystem before deletion. After a confirmed delete and a clean host check, it moves the workspace files, prepares the new workspace, and starts the replacement. Shared kubeconfig and Minikube home paths must sit outside the archive. The archive, deletion, and replacement outcomes remain available independently.
 
 ## Plans and execution
 
