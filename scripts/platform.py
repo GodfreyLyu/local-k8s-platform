@@ -124,6 +124,15 @@ def connection_contract(config):
             "secret_keys": ["user.crt", "user.key", "ca.crt"],
             "required_pod_labels": {"local-k8s-platform/access-kafka": "true"},
         }
+    if config["gpu"]["enabled"]:
+        resource = derived["gpu_resource"]
+        result["gpu"] = {
+            "resource_name": resource,
+            "nodes": config["gpu"]["nodes"],
+            "slots_per_node": config["gpu"]["slots"],
+            "container_resources": {"requests": {resource: "1"}, "limits": {resource: "1"}},
+            "sharing": "Slots share one render device without GPU memory isolation.",
+        }
     return result
 
 
@@ -152,6 +161,8 @@ def arguments(argv=None):
     )
     prerequisites.add_argument("--plan-id")
     prerequisites.add_argument("--execute", action="store_true")
+    smoke = actions.add_parser("gpu-smoke")
+    smoke.add_argument("--execute", action="store_true")
     credentials = actions.add_parser("credentials")
     credentials.add_argument("--component", choices=("postgres", "kafka"), default="postgres")
     mode = credentials.add_mutually_exclusive_group()
@@ -173,7 +184,7 @@ def arguments(argv=None):
 def contacts_cluster(args):
     if args.action in {"inspect", "verify", "plan", "apply"}:
         return True
-    if args.action == "credentials":
+    if args.action in {"credentials", "gpu-smoke"}:
         return args.execute
     return args.action == "prerequisites" and args.component != "openssl"
 
@@ -199,6 +210,8 @@ def main(argv=None):
             ]
             if not config[component]["enabled"]:
                 raise ValueError("The requested prerequisite component is disabled")
+        if args.action == "gpu-smoke" and not config["gpu"]["enabled"]:
+            raise ValueError("The GPU smoke test requires gpu.enabled")
         if args.action == "cluster" and config["cluster"]["mode"] != "create":
             raise ValueError(
                 "The cluster action requires cluster.mode=create and an explicit cluster.name"
@@ -225,6 +238,10 @@ def main(argv=None):
                 report = credentials(
                     config, workspace, args.component, prepare=args.prepare, execute=args.execute
                 )
+            elif args.action == "gpu-smoke":
+                from gpu import smoke
+
+                report = smoke(config, workspace, args.execute)
             elif args.action == "prerequisites":
                 from prerequisites import prerequisites
 

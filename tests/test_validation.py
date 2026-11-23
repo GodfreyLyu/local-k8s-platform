@@ -54,15 +54,15 @@ class ValidationTests(unittest.TestCase):
             self.fail(f"Unexpected operation: {operation}")
         return subprocess.CompletedProcess(command, 0, output, "")
 
-    # Inputs: successful provider and stage fixtures. Outputs: 63 passing cases over 18 profiles.
+    # Inputs: successful provider and stage fixtures. Outputs: 71 passing cases over 20 profiles.
     # Purpose: prove traversal matches supported combinations without live commands. Dependencies: fake_success.
     def test_complete_profile_matrix_and_private_artifacts(self):
         with patch.object(module.subprocess, "run", side_effect=self.fake_success) as process:
             report = module.validate(self.report_dir)
         self.assertEqual(report["status"], "pass")
-        self.assertEqual(report["cases_passed"], 63)
-        self.assertEqual(len({case["profile"] for case in report["cases"]}), 18)
-        self.assertEqual(process.call_count, 130)
+        self.assertEqual(report["cases_passed"], 71)
+        self.assertEqual(len({case["profile"] for case in report["cases"]}), 20)
+        self.assertEqual(process.call_count, 146)
         self.assertEqual(report["terraform_version"], "1.15.8")
         for path in self.report_dir.rglob("*"):
             self.assertEqual(path.stat().st_mode & 0o077, 0, str(path))

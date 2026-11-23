@@ -1,0 +1,25 @@
+{
+  "$comment": "Purpose: demonstrate a GPU-only environment that runs the device plugin on an existing krunkit Minikube node; data services and monitoring stay disabled.",
+  "schema_version": 1,
+  "environment_id": "example-gpu",
+  "cluster": {
+    "type": "minikube",
+    "mode": "reuse",
+    "context": "minikube",
+    "kubeconfig": "~/.kube/config"
+  },
+  "postgres": {
+    "enabled": false
+  },
+  "kafka": {
+    "enabled": false
+  },
+  "monitoring": {
+    "enabled": false
+  },
+  "gpu": {
+    "enabled": true,
+    "nodes": ["minikube"],
+    "slots": 1
+  }
+}

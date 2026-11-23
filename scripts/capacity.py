@@ -129,7 +129,9 @@ def assess(nodes, pods, measurements, workloads, storage_nodes, disk_reserve):
         item["name"]: [
             name
             for name in eligible
-            if not item.get("storage_mib", 0) or not storage_nodes or name in storage_nodes
+            if (not item.get("storage_mib", 0) or not storage_nodes or name in storage_nodes)
+            # DaemonSet forecasts name the one node their Pod must run on.
+            and ("nodes" not in item or name in item["nodes"])
         ]
         for item in jobs
     }

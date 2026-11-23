@@ -58,6 +58,7 @@ DEFAULTS = {
         "pod_labels": {"app.kubernetes.io/name": "prometheus"},
     },
     "storage": {"mode": "reuse", "class": "", "nodes": []},
+    "gpu": {"enabled": False, "nodes": [], "slots": 1},
     "network": {
         "dns_namespace": "kube-system",
         "dns_labels": {"k8s-app": "kube-dns"},
@@ -70,6 +71,11 @@ RUNTIMES = {"containerd", "cri-o", "docker"}
 DNS = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
 SQL = r"[a-z][a-z0-9_]{0,30}"
 LABEL_MAPS = {"network.dns_labels", "monitoring.pod_labels"}
+# The krunkit driver exposes this virtio-gpu render node; the plugin advertises it under this name.
+GPU_RESOURCE = "devic.es/dri"
+GPU_DEVICE = "/dev/dri/renderD128"
+GPU_MAX_SLOTS = 16
+GPU_PLUGIN_MEMORY_MIB = 32
 
 
 # Inputs: user mapping, default mapping, field path. Outputs: merged configuration.
@@ -231,8 +237,14 @@ def load_config(path):
         "monitoring",
     }:
         raise ValueError("The application namespace must be dedicated to this environment")
-    if not config["postgres"]["enabled"] and not config["kafka"]["enabled"]:
-        raise ValueError("Enable at least PostgreSQL or Kafka")
+    data_services = config["postgres"]["enabled"] or config["kafka"]["enabled"]
+    gpu = config["gpu"]
+    if not data_services and not gpu["enabled"]:
+        raise ValueError("Enable at least PostgreSQL, Kafka or the GPU device plugin")
+    if not data_services and config["monitoring"]["enabled"]:
+        raise ValueError(
+            "Monitoring covers PostgreSQL and Kafka; disable it for a GPU-only environment"
+        )
     for component in ("kafka", "monitoring"):
         identifier(config[component]["namespace"], DNS, f"{component}.namespace")
     identifier(config["monitoring"]["release"], DNS, "monitoring.release")
@@ -241,16 +253,23 @@ def load_config(path):
         config["monitoring"]["namespace"],
         f"{env}-data",
         f"{env}-validation",
+        f"{env}-gpu",
     }:
         raise ValueError("Application and infrastructure namespaces must be distinct")
     storage = config["storage"]
     if storage["mode"] not in {"reuse", "create", "csi"}:
         raise ValueError("storage.mode must be reuse, create or csi")
+    if not data_services and (storage["mode"] != "reuse" or storage["nodes"]):
+        raise ValueError("Storage is used only by PostgreSQL and Kafka; keep storage.mode=reuse")
     storage["class"] = storage["class"] or (
         f"{env}-local-retain" if storage["mode"] != "reuse" else ""
     )
-    identifier(storage["class"], DNS, "storage.class")
+    # A GPU-only environment creates no volumes, so it needs no StorageClass name.
+    if data_services or storage["class"]:
+        identifier(storage["class"], DNS, "storage.class")
     managed_namespaces = {app["namespace"], f"{env}-data", f"{env}-validation"}
+    if gpu["enabled"]:
+        managed_namespaces.add(f"{env}-gpu")
     if storage["mode"] == "create":
         if f"{env}-storage" in managed_namespaces:
             raise ValueError("The storage namespace cannot also be an application namespace")
@@ -268,6 +287,28 @@ def load_config(path):
         raise ValueError("storage.nodes cannot contain duplicates")
     if creation is not None and not set(storage["nodes"]) <= set(creation):
         raise ValueError(f"storage.nodes must be nodes of the new cluster: {', '.join(creation)}")
+    if gpu["enabled"]:
+        if not gpu["nodes"]:
+            raise ValueError("The GPU device plugin requires explicitly selected node names")
+        for node in gpu["nodes"]:
+            if not isinstance(node, str):
+                raise ValueError("gpu.nodes must contain node names")
+            identifier(node, DNS, "gpu.nodes")
+        if len(set(gpu["nodes"])) != len(gpu["nodes"]):
+            raise ValueError("gpu.nodes cannot contain duplicates")
+        if not 1 <= gpu["slots"] <= GPU_MAX_SLOTS:
+            raise ValueError(f"gpu.slots must be an integer from 1 to {GPU_MAX_SLOTS}")
+        if creation is not None:
+            if config["cluster"]["create"]["driver"] != "krunkit":
+                raise ValueError(
+                    "A new cluster exposes the GPU render device only with driver krunkit"
+                )
+            if not set(gpu["nodes"]) <= set(creation):
+                raise ValueError(
+                    f"gpu.nodes must be nodes of the new cluster: {', '.join(creation)}"
+                )
+    elif gpu["nodes"]:
+        raise ValueError("gpu.nodes requires gpu.enabled")
     kafka = config["kafka"]
     kafka["topics"] = kafka["topics"] or [f"{env}.jobs.v1", f"{env}.jobs.dlq.v1"]
     kafka["consumer_group"] = kafka["consumer_group"] or f"{env}-worker"
@@ -341,6 +382,18 @@ def load_config(path):
                 "storage_mib": 0,
             }
         )
+    if gpu["enabled"]:
+        # A DaemonSet runs one Pod per selected node, so each forecast is pinned to its node.
+        workloads += [
+            {
+                "stage": "20-gpu",
+                "name": f"{env}-gpu-device-plugin-{node}",
+                "memory_mib": GPU_PLUGIN_MEMORY_MIB,
+                "storage_mib": 0,
+                "nodes": [node],
+            }
+            for node in gpu["nodes"]
+        ]
     requested = sum(item["memory_mib"] for item in workloads)
     total_storage = sum(item["storage_mib"] for item in workloads)
     if any(value <= 0 for value in config["budget"].values()):
@@ -355,6 +408,7 @@ def load_config(path):
     stages += [
         stage
         for component, stage in (
+            ("gpu", "20-gpu"),
             ("postgres", "30-postgres"),
             ("kafka", "31-kafka"),
             ("monitoring", "40-monitoring"),
@@ -366,6 +420,10 @@ def load_config(path):
         "validation_namespace": f"{env}-validation",
         "postgres_name": f"{env}-postgres",
         "kafka_name": f"{env}-kafka",
+        "gpu_namespace": f"{env}-gpu",
+        "gpu_plugin_name": f"{env}-gpu-device-plugin",
+        "gpu_resource": GPU_RESOURCE,
+        "gpu_device": GPU_DEVICE,
         "labels": {
             "app.kubernetes.io/managed-by": "local-k8s-platform",
             "local-k8s-platform/environment": env,

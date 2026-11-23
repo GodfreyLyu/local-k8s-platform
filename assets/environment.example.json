@@ -33,6 +33,9 @@
     "class": "example-dev-local-retain",
     "nodes": ["minikube-m02", "minikube-m03"]
   },
+  "gpu": {
+    "enabled": false
+  },
   "budget": {
     "max_memory_requests_mib": 2048,
     "min_disk_free_mib": 512

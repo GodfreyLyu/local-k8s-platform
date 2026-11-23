@@ -1,6 +1,6 @@
 ---
 name: local-k8s-platform
-description: Create a new, explicitly named Minikube cluster or reuse an existing one, prepare missing prerequisites, and configure PostgreSQL and Kafka on it. Use for local Kubernetes platform setup, reviewed installation plans, and readiness checks. Application releases are outside its scope.
+description: Create a new, explicitly named Minikube cluster or reuse an existing one, prepare missing prerequisites, and configure PostgreSQL, Kafka, and an optional GPU device plugin on it. Use for local Kubernetes platform setup, GPU plugin installation on krunkit nodes, reviewed installation plans, and readiness checks. Application releases are outside its scope.
 ---
 <!-- Purpose: Route local platform requests through validated configuration and packaged execution tools. -->
 
@@ -15,12 +15,13 @@ Use English for maintained documentation and code comments. Respond in the user'
 - For configuration, defaults, or component choices, read [configuration.md](references/configuration.md).
 - To create a new Minikube cluster, read [Create a Minikube cluster](references/operations.md#create-a-minikube-cluster).
 - For small-model local training and existing Minikube CSI storage, read [local-training.md](references/local-training.md).
+- To install the GPU device plugin or run the GPU smoke test, read [gpu.md](references/gpu.md).
 - Before inspecting a cluster, deploying resources, or writing credentials, read the relevant procedure in [operations.md](references/operations.md).
 - For missing Operators, monitoring setup, or local OpenSSL, read [prerequisites.md](references/prerequisites.md).
 - For implementation changes or scope decisions, read [design.md](references/design.md).
 - For offline Terraform checks or provider startup errors, read [validation.md](references/validation.md) and use `scripts/validate.py`.
 
-Support a single PostgreSQL StatefulSet and a single Strimzi KRaft node. Local storage and monitoring integration are optional. Cluster creation is create-only: it never starts, recreates, or deletes an existing profile. Operator replacement, HTTPS ingress, CNPG, PITR, and application releases are outside this version's scope. Explain unsupported requests rather than trying to enable them through configuration.
+Support a single PostgreSQL StatefulSet, a single Strimzi KRaft node, and an optional GPU device plugin that advertises the krunkit render node as `devic.es/dri`. Enable any combination of these; a GPU-only environment disables monitoring and storage. Local storage and monitoring integration are optional. Cluster creation is create-only: it never starts, recreates, or deletes an existing profile. Operator replacement, HTTPS ingress, CNPG, PITR, and application releases are outside this version's scope. Explain unsupported requests rather than trying to enable them through configuration.
 
 ## Form an explicit configuration
 
@@ -69,7 +70,7 @@ python3 -B scripts/platform.py --config environment.json --workspace /private/pa
 
 Check current capacity, StorageClass behavior, ownership, namespaces, and required CRDs. Stop when the evidence is missing. Do not set an ownership flag or treat resource requests as measured free capacity.
 
-Plan a stage only after its prerequisites are ready. Begin with `00-bootstrap`. Use `05-storage-csi` for an existing CSI driver, or `05-storage` for a new Local Path controller. Prepare PostgreSQL credentials before planning that stage. Add monitors and rules after the selected data services are ready.
+Plan a stage only after its prerequisites are ready. Begin with `00-bootstrap`. Use `05-storage-csi` for an existing CSI driver, or `05-storage` for a new Local Path controller. Plan `20-gpu` after bootstrap when GPU is enabled. Prepare PostgreSQL credentials before planning that stage. Add monitors and rules after the selected data services are ready.
 
 Use the small defaults for new local environments: PostgreSQL and Kafka each request a 1Gi PVC. Read the capacity report by Pod and storage node. Reuse current Operators and CSI where compatible. Keep model files, training data, and checkpoint budgets separate. Existing volumes, Topic partitions, and retention settings need their own migration review before any reduction.
 
@@ -97,6 +98,6 @@ This shows a preview. Add `--execute` only when that exact change is authorized.
 python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev verify
 ```
 
-`verify` runs read-only readiness checks. This release has no automated functional acceptance runner. Ready Pods and bound PVCs do not prove TLS, permissions, ACLs, network isolation, alerts, or recovery. Leave those results pending until authorized tests provide evidence.
+`verify` runs read-only readiness checks. With GPU enabled, `gpu-smoke --execute` creates and then deletes one test Pod to check device injection; it needs its own authorization. This release has no other automated functional acceptance runner. Ready Pods and bound PVCs do not prove TLS, permissions, ACLs, network isolation, alerts, or recovery. Leave those results pending until authorized tests provide evidence.
 
 Return the resolved configuration, created cluster profile if any, executed stages, plan IDs, and endpoints. Include required application labels, application-local Secret references, and remaining acceptance work. Keep credential values out of responses, logs, Terraform inputs, and state. Mark unexecuted checks as pending. Report full usability only after the relevant acceptance checks pass.

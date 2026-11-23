@@ -5,6 +5,7 @@ import datetime as dt
 import hashlib
 import json
 import re
+import shutil
 import time
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from io_utils import private_dir, read_json, run, sha256, write_json
 ROOT = Path(__file__).resolve().parents[1]
 IMAGES = read_json(ROOT / "assets" / "infra" / "versions.json")["images"]
 ENVIRONMENT_LABEL = "local-k8s-platform/environment"
+GPU_REGISTRATION_RETRIES = 15
 RESOURCE_TYPES = {
     "kubernetes_namespace_v1": "namespaces",
     "kubernetes_service_account_v1": "serviceaccounts",
@@ -22,6 +24,7 @@ RESOURCE_TYPES = {
     "kubernetes_service_v1": "services",
     "kubernetes_stateful_set_v1": "statefulsets.apps",
     "kubernetes_deployment_v1": "deployments.apps",
+    "kubernetes_daemon_set_v1": "daemonsets.apps",
     "kubernetes_persistent_volume_claim_v1": "persistentvolumeclaims",
     "kubernetes_network_policy_v1": "networkpolicies.networking.k8s.io",
     "kubernetes_storage_class_v1": "storageclasses.storage.k8s.io",
@@ -295,6 +298,95 @@ def _storage_checks(config: dict, nodes: list[dict], require_class: bool) -> lis
     return checks
 
 
+# Inputs: resolved configuration. Outputs: per-node advertised capacity and allocatable GPU slots.
+# Purpose: show what kubelet registered for the plugin resource. Dependencies: kubectl GET nodes.
+def _gpu_registration(config: dict) -> dict:
+    resource = config["derived"]["gpu_resource"]
+    return {
+        item["metadata"]["name"]: {
+            key: int(item["status"].get(key, {}).get(resource, "0"))
+            for key in ("capacity", "allocatable")
+        }
+        for item in _get(config, "nodes")["items"]
+    }
+
+
+# Inputs: DaemonSet object and GPU resource name. Outputs: whether it runs a device plugin for that domain.
+# Purpose: find another plugin that would register the same resource. Dependencies: generic-device-plugin flags.
+def _registers_gpu(item: dict, resource: str) -> bool:
+    domain = resource.split("/")[0]
+    containers = item.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+    return any(
+        "generic-device-plugin" in container.get("image", "")
+        or f"--domain={domain}" in container.get("args", [])
+        for container in containers
+    )
+
+
+# Inputs: resolved configuration and Node objects. Outputs: structured GPU preflight checks.
+# Purpose: confirm selected nodes, the render device, and the absence of a foreign plugin. Dependencies: kubectl GET, minikube ssh.
+def _gpu_checks(config: dict, nodes: list[dict]) -> list[tuple]:
+    derived = config["derived"]
+    by_name = {item["metadata"]["name"]: item for item in nodes}
+    selected = config["gpu"]["nodes"]
+    missing = [name for name in selected if name not in by_name]
+    checks = [("gpu_nodes", not missing, {"selected": selected, "missing": missing})]
+    owned = (derived["gpu_namespace"], derived["gpu_plugin_name"])
+    daemonsets = _get(config, "daemonsets.apps", all_namespaces=True)["items"]
+    foreign = sorted(
+        f"{item['metadata']['namespace']}/{item['metadata']['name']}"
+        for item in daemonsets
+        if _registers_gpu(item, derived["gpu_resource"])
+        and (
+            (item["metadata"]["namespace"], item["metadata"]["name"]) != owned
+            or item["metadata"].get("labels", {}).get(ENVIRONMENT_LABEL) != config["environment_id"]
+        )
+    )
+    ours = any(
+        (item["metadata"]["namespace"], item["metadata"]["name"]) == owned for item in daemonsets
+    )
+    # Capacity without our plugin means another or a removed plugin registered the resource.
+    advertised = sorted(
+        name
+        for name, item in by_name.items()
+        if int(item["status"].get("capacity", {}).get(derived["gpu_resource"], "0")) > 0
+    )
+    checks.append(
+        (
+            "gpu_plugin_owner",
+            not foreign and (ours or not advertised),
+            {
+                "resource": derived["gpu_resource"],
+                "other_plugins": foreign,
+                "nodes_already_advertising": [] if ours else advertised,
+            },
+        )
+    )
+    minikube = shutil.which("minikube")
+    if not minikube:
+        raise RuntimeError("minikube is required to check the GPU render device on each node.")
+    present = {}
+    for name in selected:
+        if name not in by_name:
+            continue
+        profile = by_name[name]["metadata"].get("labels", {}).get("minikube.k8s.io/name", "")
+        # Read-only probe; ssh runs `test`, which changes nothing on the node.
+        result = run(
+            [minikube, "--profile", profile, "ssh", "--node", name, "--"]
+            + ["test", "-c", derived["gpu_device"]],
+            timeout=60,
+        )
+        present[name] = bool(profile) and result.returncode == 0
+    checks.append(
+        (
+            "gpu_device",
+            bool(present) and all(present.values()),
+            {"device": derived["gpu_device"], "present": present},
+        )
+    )
+    return checks
+
+
 # Inputs: normalized configuration. Outputs: required in-cluster Kubernetes API /32 peers.
 # Purpose: Match restrictive Operator egress against actual Service and endpoint addresses. Dependencies: Kubernetes Service/Endpoints GET.
 def _api_peers(config: dict) -> set[str]:
@@ -334,7 +426,10 @@ def _required_images(config: dict) -> list[str]:
         images += ["kafka", "strimzi_operator"]
     if config["monitoring"]["enabled"]:
         images += ["prometheus_operator", "prometheus_config_reloader", "prometheus"]
-    return images
+    if config["gpu"]["enabled"]:
+        # The smoke-test Pod reuses the pinned BusyBox helper image.
+        images += ["gpu_device_plugin", "storage_helper"]
+    return list(dict.fromkeys(images))
 
 
 # Inputs: resolved configuration and node objects. Outputs: check result and safe detail.
@@ -462,14 +557,20 @@ def inspect(
                     "placement": "Pod memory includes assigned requests and measured availability; each volume uses one eligible node.",
                 },
             )
-        if workloads is None and (
-            stage is None or stage in {"05-storage-csi", "30-postgres", "31-kafka"}
+        data_services = config["postgres"]["enabled"] or config["kafka"]["enabled"]
+        if (
+            workloads is None
+            and data_services
+            and (stage is None or stage in {"05-storage-csi", "30-postgres", "31-kafka"})
         ):
             require_class = config["storage"]["mode"] == "reuse" or stage in {
                 "30-postgres",
                 "31-kafka",
             }
             for name, passed, detail in _storage_checks(config, nodes, require_class):
+                _check(report, name, passed, detail)
+        if workloads is None and config["gpu"]["enabled"] and stage in {None, "20-gpu"}:
+            for name, passed, detail in _gpu_checks(config, nodes):
                 _check(report, name, passed, detail)
         if check_dependencies:
             from prerequisites import installed
@@ -595,6 +696,29 @@ def _stage_ready(config: dict, stage: str) -> tuple[bool, str]:
         ) == "WaitForFirstConsumer" and item.get(
             "reclaimPolicy"
         ) == "Retain", "Owned WFFC/Retain StorageClass must be ready."
+    if stage == "20-gpu":
+        item = _get(config, "daemonsets.apps", derived["gpu_plugin_name"], derived["gpu_namespace"])
+        status = (item or {}).get("status", {})
+        nodes = config["gpu"]["nodes"]
+        rolled_out = (
+            bool(item)
+            and item["metadata"].get("labels", {}).get(ENVIRONMENT_LABEL)
+            == config["environment_id"]
+            and status.get("observedGeneration", 0) >= item["metadata"].get("generation", 1)
+            and status.get("desiredNumberScheduled") == len(nodes)
+            and status.get("numberReady") == len(nodes)
+            and status.get("updatedNumberScheduled") == len(nodes)
+        )
+        registration = _gpu_registration(config)
+        expected = {"capacity": config["gpu"]["slots"], "allocatable": config["gpu"]["slots"]}
+        registered = all(registration.get(name) == expected for name in nodes)
+        # Allocatable is total schedulable capacity; it does not drop while Pods hold slots.
+        return rolled_out and registered, {
+            "summary": "Owned plugin DaemonSet must be Ready on every selected node, and kubelet must advertise the configured slots.",
+            "resource": derived["gpu_resource"],
+            "expected_slots": config["gpu"]["slots"],
+            "registration": {name: registration.get(name) for name in nodes},
+        }
     if stage == "30-postgres":
         item = _get(config, "statefulsets.apps", derived["postgres_name"], derived["namespace"])
         ready = bool(item) and item.get("status", {}).get("readyReplicas", 0) == 1
@@ -1010,6 +1134,28 @@ def apply(config: dict, workspace: Path, stage: str, plan_id: str, execute: bool
     return record
 
 
+# Inputs: resolved configuration, workspace and current identity. Outputs: passing smoke summary or None.
+# Purpose: accept a smoke result only for this cluster and the current plugin rollout. Dependencies: gpu-smoke report, kubectl GET.
+def _gpu_smoke_current(config: dict, workspace: Path, identity: dict) -> dict | None:
+    path = workspace / "reports" / "gpu-smoke.json"
+    if not path.exists():
+        return None
+    report = read_json(path)
+    derived = config["derived"]
+    plugin = _get(config, "daemonsets.apps", derived["gpu_plugin_name"], derived["gpu_namespace"])
+    current = {
+        "uid": (plugin or {}).get("metadata", {}).get("uid"),
+        "generation": (plugin or {}).get("metadata", {}).get("generation"),
+    }
+    if (
+        report.get("status") != "pass"
+        or report.get("kube_system_uid") != identity["kube_system_uid"]
+        or report.get("plugin") != current
+    ):
+        return None
+    return {"captured_at": report.get("captured_at"), "node": report.get("node")}
+
+
 # Inputs: normalized configuration and workspace. Outputs: enabled-component baseline with explicit pending functional acceptance.
 # Purpose: Report actual readiness without treating Ready Pods as protocol, policy or recovery proof. Dependencies: kubectl GET.
 def verify(config: dict, workspace: Path) -> dict:
@@ -1034,7 +1180,24 @@ def verify(config: dict, workspace: Path) -> dict:
             return report
         for stage in config["derived"]["stages"]:
             ready, detail = _stage_ready(config, stage)
+            # Kubelet registers the plugin resource shortly after the DaemonSet becomes Ready.
+            for _ in range(GPU_REGISTRATION_RETRIES if stage == "20-gpu" else 0):
+                if ready:
+                    break
+                time.sleep(2)
+                ready, detail = _stage_ready(config, stage)
             _check(report, stage, ready, detail)
+        if config["gpu"]["enabled"]:
+            smoke = _gpu_smoke_current(config, workspace, identity)
+            if smoke:
+                _check(report, "gpu_smoke", True, smoke)
+            else:
+                report["pending_acceptance"].append(
+                    "GPU Pod device injection: run gpu-smoke --execute against the current plugin"
+                )
+            report["pending_acceptance"].append(
+                "Vulkan, model inference and GPU utilization inside the krunkit virtio GPU"
+            )
         if config["postgres"]["enabled"]:
             pvc = _get(
                 config,

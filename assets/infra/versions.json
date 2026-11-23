@@ -63,6 +63,16 @@
         "linux/ppc64le",
         "linux/riscv64",
         "linux/s390x"
+      ],
+      "note": "Also runs the GPU smoke-test Pod created by scripts/gpu.py."
+    },
+    "gpu_device_plugin": {
+      "reference": "docker.io/squat/generic-device-plugin:0.2.0@sha256:66c8d5c270eb2b721f1064c549b9b7898152a6d2f0163380a5d37dc7636c20ff",
+      "asset": "stacks/20-gpu/main.tf",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm",
+        "linux/arm64"
       ]
     },
     "strimzi_operator": {
@@ -121,7 +131,8 @@
     "reference_record": "versions.json and stacks/05-storage/main.tf",
     "reference_review_date": "2026-11-12",
     "note": "Terraform image pins came from read-only project references. Prerequisite bundle sources and image digests were checked against official releases and registries. Runtime compatibility is not certified.",
-    "platforms_note": "Image platforms were read from each pinned digest's registry index on 2026-11-22. Prometheus Operator v0.95.1 published linux/amd64 only, so v0.95.2 replaced it."
+    "platforms_note": "Image platforms were read from each pinned digest's registry index on 2026-11-22. Prometheus Operator v0.95.1 published linux/amd64 only, so v0.95.2 replaced it.",
+    "gpu_note": "The generic-device-plugin pin came from a read-only project reference. Its index digest and platforms were read from Docker Hub on 2026-11-23; the index lists linux/arm as v7."
   },
   "runtime_verified": false,
   "prerequisites": {
