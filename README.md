@@ -2,7 +2,7 @@
 
 # Local Kubernetes Platform
 
-An agent skill for creating or reusing a local Minikube cluster and setting up PostgreSQL and Kafka on it.
+An agent skill for creating or reusing a local Minikube cluster and setting up PostgreSQL, Kafka, and an optional GPU device plugin on it.
 
 A local data platform needs storage, credentials, network rules, and monitoring to work together. This project brings those pieces into one configuration and a staged Terraform workflow. The agent helps choose settings and explain results. Python and Terraform handle the actual operations.
 
@@ -17,13 +17,14 @@ The current build has passed static validation and a live deployment on a three-
 | Area | Current support |
 |---|---|
 | Cluster | Reuse an existing Minikube cluster, or create a new, explicitly named profile through a reviewed create-only plan. |
-| Configuration | Choose PostgreSQL, Kafka, or both. Set names, resource requests, storage, and application access. |
+| Configuration | Choose PostgreSQL, Kafka, the GPU plugin, or any combination. Set names, resource requests, storage, and application access. |
 | Environment checks | Read cluster identity, ownership, node capacity, DNS, storage, and required operators. |
 | Prerequisites | Reuse compatible installations or prepare reviewed plans for missing Operators, minimal Prometheus, and local OpenSSL. |
 | PostgreSQL | One StatefulSet with persistent storage, TLS, an application login, and a separate monitoring login. |
 | Kafka | One Strimzi KRaft broker/controller, with TLS users, topics, and scoped ACLs. |
 | Storage | Reuse a checked class, create a class using the existing CSI driver, or install a separate Local Path provisioner. |
 | Monitoring | Add PodMonitors and alert rules to an existing Prometheus installation. |
+| GPU | Advertise the krunkit render device as `devic.es/dri` through a device plugin on selected nodes, and run an authorized smoke-test Pod. See [GPU device plugin](references/gpu.md). |
 | Credentials | Prepare local PostgreSQL credentials and copy selected client credentials into the application namespace. |
 | Changes | Save a plan, review its changes, and apply that exact plan. |
 | Verification | Run read-only readiness checks and report functional checks that are still pending. |

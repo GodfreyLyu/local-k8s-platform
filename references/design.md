@@ -18,6 +18,7 @@ This skill configures a local development platform on an existing or newly creat
 | Prerequisite helper | Reuse compatible dependencies and create missing reviewed resources or local packages. | Saved manifests, plan IDs, ownership evidence, and partial-result reports. |
 | Runtime checks | Check cluster identity, ownership, prerequisites, and readiness. | Inventory, plan review, and acceptance status. |
 | Capacity helper | Estimate joint Pod memory and volume placement from current evidence. | Suggested allocations and remaining node capacity. |
+| GPU smoke helper | Create one restricted test Pod that requests the GPU resource, read its result, and delete it. | Smoke report bound to the cluster and plugin rollout. |
 
 The agent invokes the packaged CLI through its execution tool. Python starts child commands without a shell wrapper. This skill needs no custom server, MCP connection, background daemon, or scheduler.
 
@@ -79,6 +80,14 @@ Prerequisites use packaged official JSON manifests and atomic create calls. They
 Storage retention and deletion protection reduce accidental deletion through Terraform. They cannot prevent an administrator from deleting data, or protect against disk or host failure. Multiple VMs on one computer do not provide independent availability zones.
 
 The platform creates database accounts and Kafka access rules. Applications own schemas, migrations, release settings, and business behavior. Copying client credentials into the application namespace is a separate step from creating a Service.
+
+## GPU device plugin
+
+The GPU plugin is a Terraform stage, not a prerequisite. This environment owns it, and a reviewed plan can update its slots. A device plugin is node-level and cluster-wide: two plugins for the same resource conflict at kubelet. Preflight therefore blocks when another plugin or an unexplained `devic.es/dri` registration exists. The workflow never adopts or replaces a plugin.
+
+The plugin needs privileged host access. Only the dedicated `<environment_id>-gpu` namespace is privileged; the bootstrap namespaces stay restricted. Node selection is explicit, like storage nodes, because nodes without the render device would fail the hostPath mount. Capacity forecasts pin each plugin Pod to its node.
+
+The smoke Pod stays outside Terraform state, as in the reference design. The `gpu-smoke` action creates it and always deletes it by UID. Its report counts as evidence only for the current cluster and plugin generation. See [GPU device plugin](gpu.md).
 
 ## Cluster creation
 

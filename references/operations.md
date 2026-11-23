@@ -29,6 +29,8 @@ Every `platform.py` action loads the configuration and locks the workspace. It r
 | `credentials --component kafka` | Show Kafka credential mappings. | None. |
 | `credentials --component kafka --execute` | Record handoff results. | Read selected Strimzi client fields and write application client Secrets. |
 | `verify` | Save baseline results and pending acceptance items. | Read-only checks for enabled components. |
+| `gpu-smoke` | Show the smoke-test Pod and its effects. | None. |
+| `gpu-smoke --execute` | Record `reports/gpu-smoke.json`. | Create one test Pod in the validation namespace, read its log, and delete it. |
 
 The CLI has no destroy, import, cluster deletion, restart, or cleanup command. `cluster` only creates a profile that does not exist yet. Configuration and preview commands do not authorize later writes. Building this project does not install the skill globally.
 
@@ -97,7 +99,7 @@ Check free disk space on selected storage nodes and verify binding and retention
 
 ## Plan and execute by stage
 
-Generate a plan for the next stage whose prerequisites are ready. Each plan and apply checks that stage's new Pods and volumes. Bootstrap creates dedicated namespaces and identities. `05-storage-csi` creates a class using the existing CSI driver; `05-storage` installs a separate Local Path controller. PostgreSQL needs its namespace, storage class, and source Secrets. Kafka needs ready Strimzi CRDs and an Operator in its configured namespace. The monitoring stage needs a ready monitoring installation, matching selectors, and ready data services.
+Generate a plan for the next stage whose prerequisites are ready. Each plan and apply checks that stage's new Pods and volumes. Bootstrap creates dedicated namespaces and identities. `20-gpu` needs bootstrap, the render device on every selected node, and no other plugin for `devic.es/dri` ([GPU device plugin](gpu.md)). `05-storage-csi` creates a class using the existing CSI driver; `05-storage` installs a separate Local Path controller. PostgreSQL needs its namespace, storage class, and source Secrets. Kafka needs ready Strimzi CRDs and an Operator in its configured namespace. The monitoring stage needs a ready monitoring installation, matching selectors, and ready data services.
 
 Unchanged applied stages are excluded from new capacity demand. A resource increase retains full replacement-Pod headroom. Data-stage state blocks automatic volume shrinking or storage-node/class changes. Plan review also rejects shrinking Kafka volumes, reducing existing Topic partitions, or shortening existing message retention.
 
@@ -190,6 +192,7 @@ This release checks baseline readiness only. The table below also lists evidence
 | Network-policy acceptance | Allowed traffic succeeds and denied traffic fails from scoped clients. |
 | Monitoring acceptance | Actual samples and an isolated alert delivered through the intended route. |
 | Recovery acceptance | Create a protected backup, restore it to isolated resources, and verify the test data. |
+| GPU acceptance | `gpu-smoke --execute` passes against the current plugin. Vulkan, inference, and utilization need separate workload tests. |
 
 Functional probes may create Pods, write data, or send alerts. Read-only verification does not authorize those actions. Use isolated fixtures and dedicated identities. Set time limits and review cleanup. Do not change business topics, credentials, replicas, or application data to demonstrate a test.
 

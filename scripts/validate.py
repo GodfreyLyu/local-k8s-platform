@@ -92,7 +92,7 @@ def copy_stage(source, destination):
 
 
 # Inputs: private report root. Outputs: normalized named environment profiles.
-# Purpose: cover supported data-service, monitoring, and storage combinations. Dependencies: config.load_config boundary.
+# Purpose: cover supported data-service, monitoring, storage, and GPU combinations. Dependencies: config.load_config boundary.
 def profiles(report_dir):
     private_dir(report_dir / "profiles")
     for data, postgres, kafka in (
@@ -121,6 +121,23 @@ def profiles(report_dir):
                     },
                 )
                 yield name, directory, load_config(source)
+    # GPU profiles: GPU-only, and GPU alongside every data-service stage.
+    for name, data in (("gpu-only", False), ("gpu-with-both-monitoring-on-storage-csi", True)):
+        directory = private_dir(report_dir / "profiles" / name)
+        source = directory / "input.json"
+        write_json(
+            source,
+            {
+                "environment_id": "validation",
+                "cluster": {"kubeconfig": str(report_dir / "offline.kubeconfig")},
+                "postgres": {"enabled": data},
+                "kafka": {"enabled": data},
+                "monitoring": {"enabled": data},
+                "storage": {"mode": "csi", "nodes": ["offline-node"]} if data else {},
+                "gpu": {"enabled": True, "nodes": ["offline-node"]},
+            },
+        )
+        yield name, directory, load_config(source)
 
 
 # Inputs: report directory and optional provider mirror. Outputs: persisted validation summary.
@@ -148,8 +165,8 @@ def validate(report_dir, plugin_dir=None):
     report = {
         "status": "running",
         "provider": {"source": provider["source"], "version": provider["version"]},
-        "profiles_planned": 18,
-        "cases_planned": 63,
+        "profiles_planned": 20,
+        "cases_planned": 71,
         "cases": [],
         "validation_scope": "Static Terraform/provider schema; live CRD and runtime acceptance are not checked",
     }

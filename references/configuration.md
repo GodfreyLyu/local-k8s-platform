@@ -39,6 +39,7 @@ The configuration path is expanded and resolved before reading. Relative kubecon
 | `storage.mode` | `reuse` a reviewed class, `csi` to create a class using the existing Minikube CSI driver, or `create` a separate Local Path provisioner. |
 | `storage.class` | Explicit class name, required for reuse. There is no default-class fallback. |
 | `storage.nodes` | Selected volume nodes. Required for `csi` and `create`. The same names constrain PostgreSQL and Kafka Pod placement. |
+| `gpu.enabled` / `gpu.nodes` / `gpu.slots` | Select the GPU device plugin stage, the nodes that expose the krunkit render device, and allocation slots per node (1–16, default 1). See [GPU device plugin](gpu.md). |
 | `network.dns_namespace` / `network.dns_labels` | Actual DNS Pod location and selector used by egress policy. |
 | `network.api_server_cidrs` | Reviewed IPv4 `/32` addresses for the API Service and endpoints. Used for operator egress. |
 | `budget.max_memory_requests_mib` | Maximum service and managed prerequisite memory requests, excluding externally reused services. |
@@ -73,7 +74,7 @@ Keep passwords, private keys, connection strings with credentials, and shell com
 
 ## Supported combinations
 
-Enable PostgreSQL, Kafka, or both. Monitoring covers the services you enable. A disabled component adds no stage, credential requirement, or required runtime check.
+Enable PostgreSQL, Kafka, the GPU device plugin, or any combination. Monitoring covers the data services you enable. A GPU-only environment must disable monitoring and keep `storage.mode=reuse`; it needs no StorageClass. A disabled component adds no stage, credential requirement, or required runtime check.
 
 | Selection | Prerequisites and behavior |
 |---|---|
@@ -84,6 +85,7 @@ Enable PostgreSQL, Kafka, or both. Monitoring covers the services you enable. A 
 | Reused storage | Reviewed `WaitForFirstConsumer` / `Retain` class and enough measured disk space. |
 | Created storage | Separate Local Path provisioner on selected nodes, with its own non-default class. Existing classes and volumes remain unchanged. |
 | Existing CSI | A new class using the current Minikube CSI Hostpath driver. No extra storage controller is installed. |
+| GPU | A privileged plugin DaemonSet in its own namespace on the selected nodes. New clusters require the `krunkit` driver. |
 
 This version does not start, recreate, resize, or delete clusters. It does not support HTTPS ingress, CNPG, replication, failover, object storage, WAL/PITR, operator upgrades, or application releases. Adding a field to the JSON cannot enable them.
 
@@ -96,6 +98,7 @@ This version does not start, recreate, resize, or delete clusters. It does not s
 | PostgreSQL | `<environment_id>-postgres` |
 | Kafka | `<environment_id>-kafka` |
 | Default application namespace | `<environment_id>-app` |
+| GPU namespace / plugin | `<environment_id>-gpu` / `<environment_id>-gpu-device-plugin` |
 
 Managed resources carry two labels:
 
@@ -110,9 +113,10 @@ The selected components determine the stages:
 
 1. `00-bootstrap`: dedicated namespaces, identities, and network isolation.
 2. `05-storage-csi` for `storage.mode=csi`, or `05-storage` for `storage.mode=create`.
-3. `30-postgres`: only for enabled PostgreSQL.
-4. `31-kafka`: only for enabled Kafka.
-5. `40-monitoring`: only for enabled monitoring.
+3. `20-gpu`: only for enabled GPU.
+4. `30-postgres`: only for enabled PostgreSQL.
+5. `31-kafka`: only for enabled Kafka.
+6. `40-monitoring`: only for enabled monitoring.
 
 The workspace receives `environment.json` with resolved values. Each stage receives `environment.auto.tfvars.json`. To change settings, edit the source configuration and rerun the entry point. Do not edit generated stage variables.
 
@@ -121,6 +125,8 @@ The workspace receives `environment.json` with resolved values. Each stage recei
 The platform creates database accounts, Kafka topics and ACLs, storage, and infrastructure monitors. Applications own images, releases, schema migrations, runtime processes, and message formats.
 
 PostgreSQL provides a stable Service. Clients use `sslmode=verify-full`. Kafka uses internal TLS, client certificates, and named topics and consumer groups. One Kafka node cannot replicate data across brokers. One PostgreSQL StatefulSet does not provide database failover.
+
+With GPU enabled, the handoff adds the resource name `devic.es/dri`, the selected nodes, and slots per node. Containers request it with `resources.requests` and `resources.limits` of `devic.es/dri: 1`.
 
 The handoff includes endpoints, account names, public CA references, application-local Secrets, and required network-policy labels:
 

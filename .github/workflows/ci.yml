@@ -43,6 +43,6 @@ jobs:
       - name: Check Terraform formatting
         run: terraform fmt -check -recursive assets/infra
 
-      # Validate all 18 profiles and 63 stage instances in a private directory outside the repo.
+      # Validate all 20 profiles and 71 stage instances in a private directory outside the repo.
       - name: Validate Terraform profiles
         run: python3 -B scripts/validate.py --report-dir "$RUNNER_TEMP/terraform-validation"
