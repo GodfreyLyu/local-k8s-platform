@@ -16,4 +16,6 @@ The build task allows file creation, local validation, and isolated tests. It do
 
 Create a cluster only as a new, explicitly named Minikube profile through a reviewed `cluster` plan with its own authorization. Do not recreate, restart, or delete clusters, replace operators or CNI, or import resources as a side effect. Do not destroy environments or clean up unknown data.
 
+The one exception is `cluster --overwrite`, and only for a profile whose creation report is in the same workspace. It may recreate a profile that no longer exists. It may delete and recreate a profile only when a successful comparison shows that its identity or recorded objects no longer match. An unreadable or stopped cluster never counts as a mismatch. The overwrite plan needs its own authorization, which covers the stated data loss. Move the previous workspace files to `archive/` instead of deleting them.
+
 Check changed behavior with focused offline tests. Use fake tools to test command orchestration. Keep test files in private temporary directories. Runtime acceptance needs evidence from the selected environment.

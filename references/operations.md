@@ -57,6 +57,31 @@ An existing profile with this name blocks, whether it is running, stopped, or in
 
 A failed start records `failed`. A timeout or an identity verification or binding failure records `uncertain`. These outcomes preserve the profile and block later stages. Inspect the profile with `minikube status -p NAME` and `minikube logs -p NAME` before deciding on recovery. A consumed plan cannot run again.
 
+### Overwrite a created cluster
+
+Without `--overwrite`, `cluster` on a workspace with a `created` report only returns that report. `cluster --overwrite` requires that report. Without one, it refuses. After a failed attempt, inspect the profile and plan a normal creation instead.
+
+The overwrite plan compares the live cluster with this workspace. The result goes to `reports/cluster-reconcile.json`.
+
+1. **Identity.** The context, kubeconfig path, API server, and `kube-system` UID must match the creation report. A different UID means the profile was replaced outside this workflow, and the object checks are skipped.
+2. **Terraform state.** Every managed resource in `state/*.tfstate` must exist. It must keep its recorded UID and carry this environment's ownership label. `kubernetes_manifest` entries use the UID from the stored object.
+3. **Other recorded objects.** Prerequisite objects recorded as `created` and Secrets listed in credential reports must exist. Secrets are read by name only, so their data is never loaded.
+
+Results map to plan actions:
+
+| Live evidence | Action | Execution |
+|---|---|---|
+| No profile with this name | `recreate-missing` | Archive the workspace, then start once. |
+| Readable profile, all checks match | `unchanged` | Nothing to execute. |
+| Readable profile, identity or any object differs | `overwrite` | `minikube delete --profile=NAME`, then archive and start once. |
+| Profile cannot be read (stopped, invalid, API down) | blocked | Start it outside this workflow and plan again. |
+
+Machine records or kubeconfig entries left without a profile still block `recreate-missing`, and the plan does not clean them up. Comparisons cover existence, UID, and ownership only. They ignore spec drift, which stage plans handle without deleting anything.
+
+Execution requires `--overwrite --plan-id ID --execute`, with authorization for the stated data loss. It repeats the comparison and refuses if anything changed since review. A plan prepared with `--overwrite` cannot run without it, and the reverse is also refused. The plan is consumed before the delete runs. If the delete fails or times out, the workspace stays as it was. If any profile, machine, or kubeconfig record remains after the delete, execution also stops, and the workspace stays as it was.
+
+Archiving moves every workspace entry except `.operation.lock` and `archive/` into `archive/<UTC time>-<plan prefix>/`, mode `0700`. It renames entries and copies nothing. `configure` ignores `archive/` and never reads from it. The new workspace gets `reports/cluster-recreated.json`, which points to the archive. Then the normal creation flow runs: start, binding, and `reports/cluster.json`. Earlier state, credentials, and plans remain only in the archive. Prerequisites, stage plans, and credentials start again from new reviewed plans.
+
 ## Workspace and identity
 
 Use a private directory, for example `/private/path/foo-dev`. New helper-created directories request mode `0700`. JSON files and new lock files request `0600`. The directory check requires the current user's UID and no group or other permissions. It does not require exact owner permission bits or change existing permissions.

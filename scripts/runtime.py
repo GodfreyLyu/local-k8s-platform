@@ -797,6 +797,46 @@ def _state_hash(workspace: Path, stage: str) -> str | None:
     return sha256(path) if path.exists() else None
 
 
+# Inputs: Terraform state attribute value. Outputs: the plain value.
+# Purpose: Read dynamic attributes, which local state stores as {"value", "type"}. Dependencies: none.
+def _state_value(value: object) -> object:
+    if isinstance(value, dict) and set(value) == {"value", "type"}:
+        return value["value"]
+    return value
+
+
+# Inputs: private workspace. Outputs: recorded Kubernetes identities per stage state file.
+# Purpose: Let cluster reconciliation compare live objects with Terraform state. Dependencies: local backend JSON.
+def _state_resources(workspace: Path) -> list[dict]:
+    result = []
+    directory = workspace / "state"
+    if not directory.exists():
+        return result
+    for path in sorted(directory.glob("*.tfstate")):
+        if path.is_symlink():
+            raise RuntimeError("Terraform state must not be a symbolic link.")
+        for item in read_json(path).get("resources", []):
+            if item.get("mode", "managed") != "managed":
+                continue
+            for instance in item.get("instances", []):
+                attributes = instance.get("attributes") or {}
+                if item["type"] == "kubernetes_manifest":
+                    values = {"manifest": _state_value(attributes.get("manifest")) or {}}
+                    live = _state_value(attributes.get("object")) or {}
+                    uid = live.get("metadata", {}).get("uid")
+                else:
+                    values, uid = attributes, None
+                identity = _resource_identity(item["type"], values)
+                result.append(
+                    {
+                        "source": f"terraform:{path.stem}",
+                        **{key: identity[key] for key in ("resource", "name", "namespace")},
+                        "uid": identity["uid"] or uid,
+                    }
+                )
+    return result
+
+
 # Inputs: Terraform change values and resource type. Outputs: Kubernetes resource identity and labels.
 # Purpose: Translate allowed plan resources for ownership and collision checks. Dependencies: Terraform Kubernetes provider shapes.
 def _resource_identity(resource_type: str, values: dict) -> dict:

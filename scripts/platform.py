@@ -46,8 +46,11 @@ def configure(config, workspace):
             raise ValueError(
                 "Disabling a managed stage requires a separate data and ownership migration"
             )
-    elif any(item.name != ".operation.lock" for item in workspace.iterdir()):
+    elif any(item.name not in {".operation.lock", "archive"} for item in workspace.iterdir()):
+        # Overwrite archives a previous workspace under archive/; it is history, never adopted.
         raise ValueError("Choose an empty workspace; existing files will not be adopted")
+    if (workspace / "archive").exists():
+        private_dir(workspace / "archive")
     source = ROOT / "assets" / "infra" / "stacks"
     for directory in ("stages", "state", "plans", "reports", "credentials"):
         private_dir(workspace / directory)
@@ -148,7 +151,8 @@ def arguments(argv=None):
     cluster = actions.add_parser("cluster")
     cluster.add_argument("--plan-id")
     cluster.add_argument("--execute", action="store_true")
-    plan = actions.add_parser("plan")
+    cluster.add_argument("--overwrite", action="store_true")
+    plan =actions.add_parser("plan")
     plan.add_argument("--stage", required=True)
     plan.add_argument("--plugin-dir", type=Path)
     apply = actions.add_parser("apply")
@@ -231,7 +235,14 @@ def main(argv=None):
             elif args.action == "cluster":
                 from cluster import cluster
 
-                report = cluster(config, workspace, args.plan_id, args.execute)
+                report = cluster(
+                    config,
+                    workspace,
+                    args.plan_id,
+                    args.execute,
+                    overwrite=args.overwrite,
+                    materialize=configure,
+                )
             elif args.action == "credentials":
                 from credentials import credentials
 

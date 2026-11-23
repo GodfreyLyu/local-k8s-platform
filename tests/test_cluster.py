@@ -1,4 +1,4 @@
-"""Purpose: test reviewed, create-only Minikube profile creation with private fake tools."""
+"""Purpose: test reviewed Minikube profile creation and overwrite with private fake tools."""
 
 import importlib.util
 import io
@@ -51,6 +51,17 @@ elif arguments[:1] == ["start"]:
     state["clusters"].append(name)
     state["users"].append(name)
     path.write_text(json.dumps(state))
+elif arguments[:1] == ["delete"]:
+    if state.get("fail_delete"):
+        sys.exit(1)
+    name = next(item.split("=", 1)[1] for item in arguments if item.startswith("--profile="))
+    keys = ["valid", "invalid", "clusters", "users"]
+    if not state.get("keep_context"):
+        keys.append("contexts")
+    for key in keys:
+        state[key] = [item for item in state[key] if item != name]
+    state["objects"] = {}
+    path.write_text(json.dumps(state))
 else:
     sys.exit(64)
 """
@@ -81,8 +92,20 @@ if "view" in arguments:
             "clusters": [{"name": name} for name in state["clusters"]],
             "users": [{"name": name} for name in state["users"]],
         }))
+elif state.get("unreachable"):
+    sys.exit(1)
 elif "namespaces" in arguments and "kube-system" in arguments:
     print(json.dumps({"metadata": {"uid": state["uid"]}}))
+elif "get" in arguments:
+    index = arguments.index("get")
+    resource, name = arguments[index + 1], arguments[index + 2]
+    namespace = arguments[arguments.index("--namespace") + 1] if "--namespace" in arguments else ""
+    item = state.get("objects", {}).get(f"{resource}/{namespace}/{name}")
+    if item is not None:
+        if arguments[-1] == "name":
+            print(f"{resource}/{name}")
+        else:
+            print(json.dumps({"metadata": {"name": name, **item}}))
 else:
     sys.exit(64)
 """
@@ -133,6 +156,7 @@ class ClusterTests(unittest.TestCase):
         users=(),
         uid="cluster-a",
         server="https://cluster-a.invalid",
+        **extra,
     ):
         self.state.write_text(
             json.dumps(
@@ -145,10 +169,87 @@ class ClusterTests(unittest.TestCase):
                     "uid": uid,
                     "server": server,
                     "fail_start": fail_start,
+                    **extra,
                 }
             ),
             encoding="utf-8",
         )
+
+    # Inputs: field overrides. Outputs: none. Purpose: change one fake-tool field and keep the rest.
+    # Dependencies: private JSON state file read by the fake tools.
+    def update_state(self, **fields):
+        state = json.loads(self.state.read_text())
+        state.update(fields)
+        self.state.write_text(json.dumps(state), encoding="utf-8")
+
+    # Inputs: none. Outputs: creation report. Purpose: create the profile through the reviewed flow.
+    # Dependencies: fake tools and mocked API peer discovery.
+    def create(self):
+        self.write_config()
+        _, planned = self.cli("cluster")
+        with patch.object(runtime, "_api_peers", return_value=set()):
+            status, report = self.cli("cluster", "--plan-id", planned["plan_id"], "--execute")
+        self.assertEqual((status, report["status"]), (0, "created"), report)
+        return report
+
+    # Inputs: none. Outputs: none. Purpose: record a namespace, a manifest, and a published Secret,
+    # and make the same objects live. Dependencies: local-backend state shape and private reports.
+    def record_objects(self):
+        label = {runtime.ENVIRONMENT_LABEL: "atlas"}
+        manifest = {
+            "apiVersion": "kafka.strimzi.io/v1beta2",
+            "kind": "KafkaTopic",
+            "metadata": {"name": "jobs", "namespace": "kafka", "labels": label},
+        }
+        write_json(
+            self.workspace / "state" / "00-bootstrap.tfstate",
+            {
+                "version": 4,
+                "resources": [
+                    {
+                        "mode": "managed",
+                        "type": "kubernetes_namespace_v1",
+                        "name": "platform",
+                        "instances": [
+                            {"attributes": {"metadata": [{"name": "atlas", "labels": label, "uid": "ns-1"}]}}
+                        ],
+                    },
+                    {"mode": "data", "type": "kubernetes_namespace_v1", "name": "x", "instances": []},
+                    {
+                        "mode": "managed",
+                        "type": "kubernetes_manifest",
+                        "name": "topic",
+                        "instances": [
+                            {
+                                "attributes": {
+                                    "manifest": {"value": manifest, "type": ["object", {}]},
+                                    "object": {
+                                        "value": {"metadata": {"uid": "topic-1"}},
+                                        "type": ["object", {}],
+                                    },
+                                }
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
+        write_json(
+            self.workspace / "reports" / "credentials-postgres.json",
+            {"status": "published", "results": [{"reference": "atlas-app/pg-client", "status": "created"}]},
+        )
+        self.update_state(
+            objects={
+                "namespaces//atlas": {"uid": "ns-1", "labels": label},
+                "kafkatopics.kafka.strimzi.io/kafka/jobs": {"uid": "topic-1", "labels": label},
+                "secrets/atlas-app/pg-client": {"uid": "secret-1"},
+            }
+        )
+
+    # Inputs: none. Outputs: fake tool calls by first argument. Purpose: count start/delete effects.
+    # Dependencies: the private fake-tool log.
+    def count(self, verb):
+        return len([call for call in self.calls() if call["argv"][:1] == [verb]])
 
     # Inputs: optional cluster and storage overrides. Outputs: config path. Purpose: build user input.
     # Dependencies: JSON configuration boundary.
@@ -506,6 +607,184 @@ class ClusterTests(unittest.TestCase):
             del legacy["cluster"][key]
         saved.write_text(json.dumps(legacy))
         self.assertEqual(CLI.configure(config, self.workspace)["status"], "configured")
+
+    # Inputs: a workspace without a creation report. Outputs: refusal without Minikube calls.
+    # Purpose: limit overwrite to profiles this workspace created. Dependencies: CLI entry point.
+    def test_overwrite_requires_a_created_profile(self):
+        self.write_config()
+        status, report = self.cli("cluster", "--overwrite")
+        self.assertEqual(status, 2)
+        self.assertIn("applies only", report["error"])
+        self.assertEqual(self.calls(), [])
+
+    # Inputs: local-backend state with resource and data entries. Outputs: recorded identities.
+    # Purpose: read plain and dynamic (kubernetes_manifest) attributes. Dependencies: runtime helper.
+    def test_state_resources_read_plain_and_manifest_identities(self):
+        self.write_config()
+        self.assertEqual(self.cli("configure")[0], 0)
+        self.record_objects()
+        resources = runtime._state_resources(self.workspace)
+        self.assertEqual(
+            [(item["resource"], item["namespace"], item["name"], item["uid"]) for item in resources],
+            [
+                ("namespaces", None, "atlas", "ns-1"),
+                ("kafkatopics.kafka.strimzi.io", "kafka", "jobs", "topic-1"),
+            ],
+        )
+
+    # Inputs: a created profile that the user deleted. Outputs: archived workspace and a new profile.
+    # Purpose: recreate a missing profile only through a reviewed --overwrite plan. Dependencies: fake tools.
+    def test_missing_profile_is_recreated_after_archiving_the_workspace(self):
+        self.create()
+        self.record_objects()
+        self.write_state(uid="cluster-b", server="https://cluster-b.invalid")
+        status, plain = self.cli("cluster")
+        self.assertEqual((status, plain["status"]), (0, "created"))
+        self.assertIn("--overwrite", plain["note"])
+        status, planned = self.cli("cluster", "--overwrite")
+        self.assertEqual((status, planned["status"]), (0, "planned"), planned)
+        self.assertEqual(planned["overwrite"]["action"], "recreate-missing")
+        self.assertIsNone(planned["overwrite"]["delete_command"])
+        self.assertTrue(planned["requires_execute"])
+        status, refused = self.cli("cluster", "--plan-id", planned["plan_id"], "--execute")
+        self.assertEqual((status, refused["status"]), (0, "created"))
+        self.assertEqual(self.count("start"), 1)
+        with patch.object(runtime, "_api_peers", return_value=set()):
+            status, report = self.cli(
+                "cluster", "--overwrite", "--plan-id", planned["plan_id"], "--execute"
+            )
+        self.assertEqual((status, report["status"]), (0, "created"), report)
+        self.assertEqual(report["identity"]["kube_system_uid"], "cluster-b")
+        self.assertEqual((self.count("start"), self.count("delete")), (2, 0))
+        archive = Path(report["archive"])
+        self.assertEqual(archive.parent, self.workspace / "archive")
+        self.assertEqual(archive.stat().st_mode & 0o777, 0o700)
+        self.assertTrue((archive / "state" / "00-bootstrap.tfstate").is_file())
+        previous = read_json(archive / "reports" / "cluster.json")
+        self.assertEqual(previous["identity"]["kube_system_uid"], "cluster-a")
+        self.assertFalse((self.workspace / "state" / "00-bootstrap.tfstate").exists())
+        self.assertFalse((self.workspace / "reports" / "credentials-postgres.json").exists())
+        self.assertEqual(
+            read_json(self.workspace / "cluster-binding.json")["identity"]["kube_system_uid"],
+            "cluster-b",
+        )
+        recreated = read_json(self.workspace / "reports" / "cluster-recreated.json")
+        self.assertEqual((recreated["action"], recreated["archive"]), ("recreate-missing", str(archive)))
+        self.assertEqual(self.cli("configure")[0], 0)
+        status, replay = self.cli("cluster", "--overwrite", "--plan-id", planned["plan_id"], "--execute")
+        self.assertEqual(status, 2)
+        self.assertIn("consumed", replay["error"])
+        self.assertEqual(self.count("start"), 2)
+
+    # Inputs: a running profile whose objects match recorded state. Outputs: unchanged, no writes.
+    # Purpose: never overwrite a consistent cluster. Dependencies: fake live objects.
+    def test_consistent_profile_is_left_unchanged(self):
+        self.create()
+        self.record_objects()
+        status, planned = self.cli("cluster", "--overwrite")
+        self.assertEqual((status, planned["status"]), (0, "unchanged"), planned)
+        self.assertFalse(planned["requires_execute"])
+        reconcile = planned["overwrite"]["reconcile"]
+        self.assertEqual((reconcile["checked"], reconcile["differences"]), (3, []))
+        status, refused = self.cli("cluster", "--overwrite", "--plan-id", planned["plan_id"], "--execute")
+        self.assertEqual(status, 2)
+        self.assertIn("no change", refused["error"])
+        self.assertEqual((self.count("start"), self.count("delete")), (1, 0))
+        self.assertFalse((self.workspace / "archive").exists())
+
+    # Inputs: drifted objects or a replaced cluster under the same profile. Outputs: delete, archive, start.
+    # Purpose: overwrite only on definite differences, deleting before archiving. Dependencies: fake tools.
+    def test_drifted_profile_is_deleted_archived_and_recreated(self):
+        label = {runtime.ENVIRONMENT_LABEL: "atlas"}
+        cases = {
+            "missing": lambda: self.update_state(objects={}),
+            "uid": lambda: self.update_state(
+                objects={
+                    "namespaces//atlas": {"uid": "ns-2", "labels": label},
+                    "kafkatopics.kafka.strimzi.io/kafka/jobs": {"uid": "topic-1", "labels": label},
+                    "secrets/atlas-app/pg-client": {},
+                }
+            ),
+            "identity": lambda: self.update_state(uid="cluster-c"),
+        }
+        for name, drift in cases.items():
+            with self.subTest(drift=name):
+                self.setUp()
+                self.create()
+                self.record_objects()
+                drift()
+                status, planned = self.cli("cluster", "--overwrite")
+                self.assertEqual((status, planned["status"]), (0, "planned"), planned)
+                summary = planned["overwrite"]
+                self.assertEqual(summary["action"], "overwrite")
+                self.assertEqual(summary["delete_command"][-2:], ["delete", "--profile=atlas-dev"])
+                self.assertIn("lost", summary["effects"])
+                if name == "identity":
+                    self.assertEqual(summary["reconcile"]["identity"]["status"], "mismatch")
+                else:
+                    self.assertTrue(summary["reconcile"]["differences"])
+                self.assertEqual(self.count("delete"), 0)
+                with patch.object(runtime, "_api_peers", return_value=set()):
+                    status, report = self.cli(
+                        "cluster", "--overwrite", "--plan-id", planned["plan_id"], "--execute"
+                    )
+                self.assertEqual((status, report["status"]), (0, "created"), report)
+                verbs = [call["argv"][0] for call in self.calls() if call["tool"] == "minikube"]
+                self.assertLess(verbs.index("delete"), len(verbs) - 1 - verbs[::-1].index("start"))
+                self.assertEqual((self.count("start"), self.count("delete")), (2, 1))
+                self.assertTrue((Path(report["archive"]) / "state" / "00-bootstrap.tfstate").exists())
+
+    # Inputs: a stopped or unreachable profile. Outputs: blocked plan, no delete.
+    # Purpose: an unreadable cluster may hold intact data and is never overwritten. Dependencies: fake tools.
+    def test_unreadable_profile_is_never_overwritten(self):
+        self.create()
+        self.record_objects()
+        self.update_state(unreachable=True)
+        status, planned = self.cli("cluster", "--overwrite")
+        self.assertEqual((status, planned["status"]), (2, "blocked"), planned)
+        self.assertIn("minikube start -p atlas-dev", planned["blockers"][0])
+        self.assertFalse(planned["requires_execute"])
+        status, refused = self.cli("cluster", "--overwrite", "--plan-id", planned["plan_id"], "--execute")
+        self.assertEqual(status, 2)
+        self.assertEqual(self.count("delete"), 0)
+
+    # Inputs: drift that disappears after review. Outputs: stale-plan refusal, no delete.
+    # Purpose: bind execution to the reviewed comparison. Dependencies: fake live objects.
+    def test_changed_comparison_invalidates_overwrite_plan(self):
+        self.create()
+        self.record_objects()
+        objects = json.loads(self.state.read_text())["objects"]
+        self.update_state(objects={})
+        _, planned = self.cli("cluster", "--overwrite")
+        self.update_state(objects=objects)
+        status, refused = self.cli("cluster", "--overwrite", "--plan-id", planned["plan_id"], "--execute")
+        self.assertEqual(status, 2)
+        self.assertIn("changed since review", refused["error"])
+        self.assertEqual((self.count("start"), self.count("delete")), (1, 0))
+
+    # Inputs: a failing delete, or a delete that leaves a kubeconfig context. Outputs: refusals.
+    # Purpose: keep the workspace unarchived and start nothing when the host is not clean. Dependencies: fake tools.
+    def test_failed_or_incomplete_delete_keeps_the_workspace(self):
+        for flag, message in (("fail_delete", "delete failed"), ("keep_context", "records remain")):
+            with self.subTest(flag=flag):
+                self.setUp()
+                self.create()
+                self.record_objects()
+                self.update_state(objects={}, **{flag: True})
+                _, planned = self.cli("cluster", "--overwrite")
+                status, refused = self.cli(
+                    "cluster", "--overwrite", "--plan-id", planned["plan_id"], "--execute"
+                )
+                self.assertEqual(status, 2, refused)
+                self.assertIn(message, refused["error"])
+                self.assertIn("not archived", refused["error"])
+                self.assertFalse((self.workspace / "archive").exists())
+                self.assertTrue((self.workspace / "state" / "00-bootstrap.tfstate").exists())
+                consumed = read_json(
+                    self.workspace / "plans" / "cluster" / f"consumed-{planned['plan_id']}.json"
+                )
+                self.assertEqual(consumed["status"], "failed")
+                self.assertEqual(self.count("start"), 1)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ The current build has passed static validation and a live deployment on a three-
 
 | Area | Current support |
 |---|---|
-| Cluster | Reuse an existing Minikube cluster, or create a new, explicitly named profile through a reviewed create-only plan. |
+| Cluster | Reuse an existing Minikube cluster, or create a new, explicitly named profile through a reviewed plan. A separately reviewed `--overwrite` plan recreates that profile when it is missing or no longer matches the workspace records. The previous workspace is archived. |
 | Configuration | Choose PostgreSQL, Kafka, the GPU plugin, or any combination. Set names, resource requests, storage, and application access. |
 | Environment checks | Read cluster identity, ownership, node capacity, DNS, storage, and required operators. |
 | Prerequisites | Reuse compatible installations or prepare reviewed plans for missing Operators, minimal Prometheus, and local OpenSSL. |
@@ -33,7 +33,7 @@ Only one managed platform environment is supported per cluster. Keep one workspa
 
 ## What it does not do
 
-- Start, recreate, resize, or delete existing clusters, replace the CNI, or replace and upgrade operators.
+- Start, resize, or delete clusters it did not create, replace the CNI, or replace and upgrade operators. Recreating its own profile requires an explicit, reviewed `cluster --overwrite` plan.
 - Build application images, deploy applications, run schema migrations, or manage message formats.
 - Provide PostgreSQL replication, Kafka replication, automatic failover, or production high availability.
 - Set up HTTPS ingress, CNPG, object storage, WAL archiving, or point-in-time recovery.
