@@ -484,6 +484,11 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertEqual(status, 0, fresh)
         self.assertLess(len(fresh["changes"]), len(plan["changes"]))
         self.assertEqual(self.request("strimzi", "--plan-id", fresh["plan_id"], "--execute")[0], 0)
+        inventory = read_json(self.workspace / "state" / "recorded-objects.json")
+        self.assertEqual(
+            [{key: item[key] for key in ("resource", "namespace", "name")} for item in inventory],
+            [change["reference"] for change in plan["changes"]],
+        )
 
     # Inputs: failure after creating Strimzi. Outputs: a fresh plan for only the remaining resources.
     # Purpose: recover an owned Deployment after empty EnvVar values are omitted. Dependencies: fake API.

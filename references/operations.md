@@ -59,13 +59,15 @@ A failed start records `failed`. A timeout or an identity verification or bindin
 
 ### Overwrite a created cluster
 
-Without `--overwrite`, `cluster` on a workspace with a `created` report only returns that report. `cluster --overwrite` requires that report. Without one, it refuses. After a failed attempt, inspect the profile and plan a normal creation instead.
+Without `--overwrite`, `cluster` on a workspace with a `created` report returns that report. Overwrite also requires the resolved Minikube home recorded at creation. Legacy reports without a home still support ordinary platform operations. Both the deletion and the replacement command use the reviewed home.
 
 The overwrite plan compares the live cluster with this workspace. The result goes to `reports/cluster-reconcile.json`.
 
-1. **Identity.** The context, kubeconfig path, API server, and `kube-system` UID must match the creation report. A different UID means the profile was replaced outside this workflow, and the object checks are skipped.
+1. **Identity.** Minikube SSH reads the `kube-system` UID from the running local profile's control plane. The configured context must return that same UID. Only then can a difference from the stored creation identity count as drift. A verified identity difference skips object checks.
 2. **Terraform state.** Every managed resource in `state/*.tfstate` must exist. It must keep its recorded UID and carry this environment's ownership label. `kubernetes_manifest` entries use the UID from the stored object.
-3. **Other recorded objects.** Prerequisite objects recorded as `created` and Secrets listed in credential reports must exist. Secrets are read by name only, so their data is never loaded.
+3. **Other recorded objects.** Successfully created prerequisites and published Secrets must exist. The workspace keeps their references in `state/recorded-objects.json` across previews and retries. Earlier reports and consumed prerequisite plans also supply references. Secret reads request `PartialObjectMetadata` from the API through a temporary private Unix socket.
+
+For resources backed by CRDs, the comparison verifies the CRD before reading the instance. A confirmed missing CRD counts as absence. Discovery and permission errors block the plan. Review evidence includes the observed UID and environment ownership label of each object.
 
 Results map to plan actions:
 
@@ -78,9 +80,9 @@ Results map to plan actions:
 
 Machine records or kubeconfig entries left without a profile still block `recreate-missing`, and the plan does not clean them up. Comparisons cover existence, UID, and ownership only. They ignore spec drift, which stage plans handle without deleting anything.
 
-Execution requires `--overwrite --plan-id ID --execute`, with authorization for the stated data loss. It repeats the comparison and refuses if anything changed since review. A plan prepared with `--overwrite` cannot run without it, and the reverse is also refused. The plan is consumed before the delete runs. If the delete fails or times out, the workspace stays as it was. If any profile, machine, or kubeconfig record remains after the delete, execution also stops, and the workspace stays as it was.
+Execution requires `--overwrite --plan-id ID --execute`, with authorization for the stated data loss. It repeats the comparison and refuses stale evidence. Keep the kubeconfig and Minikube home outside the workspace, and the workspace outside Minikube home. Execution reserves a writable private archive on the workspace filesystem before consuming the plan and deleting anything. A failed delete, timeout, or residual profile, machine, or kubeconfig record leaves the workspace files in place.
 
-Archiving moves every workspace entry except `.operation.lock` and `archive/` into `archive/<UTC time>-<plan prefix>/`, mode `0700`. It renames entries and copies nothing. `configure` ignores `archive/` and never reads from it. The new workspace gets `reports/cluster-recreated.json`, which points to the archive. Then the normal creation flow runs: start, binding, and `reports/cluster.json`. Earlier state, credentials, and plans remain only in the archive. Prerequisites, stage plans, and credentials start again from new reviewed plans.
+Archiving moves workspace entries other than `.operation.lock` and `archive/` into `archive/<UTC time>-<plan prefix>/`, mode `0700`. The new workspace records the archive and deletion outcome in `reports/cluster-recreated.json`. The replacement start and its binding are reported separately in `reports/cluster.json`, including an uncertain start after a completed deletion. Earlier state, credentials, and plans remain in the archive. Prerequisites, stage plans, and credentials start again from new reviewed plans.
 
 ## Workspace and identity
 

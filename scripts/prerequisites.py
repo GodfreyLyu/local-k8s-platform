@@ -805,6 +805,7 @@ def _execute(config, workspace, review):
     }
     consumed = workspace / "plans" / "prerequisites" / f"consumed-{plan_id}.json"
     report = workspace / "reports" / f"prerequisites-{review['component']}.json"
+    runtime._remember_objects(workspace, runtime._reported_objects(report))
     write_json(consumed, record)
     write_json(report, record)
     crds = [
@@ -860,6 +861,10 @@ def _execute(config, workspace, review):
             record["results"][-1]["status"] = (
                 "created" if change["action"] == "create" else "installed"
             )
+            if change["action"] == "create":
+                runtime._remember_objects(
+                    workspace, [{"source": "prerequisites", **change["reference"], "uid": None}]
+                )
             write_json(report, record)
         if not waited:
             _wait(config, crds)

@@ -64,7 +64,7 @@ The plan compares the profile with the workspace's records and reports one actio
 - `overwrite`: the profile is readable, but its identity or a recorded object differs. The plan includes `minikube delete`.
 - `unchanged`: everything matches. There is nothing to execute.
 
-A stopped or unreachable profile blocks; ask the user to start it and plan again. Present the action, the differences, the delete command, and the stated effects. Every workspace file moves to `archive/`. Data on a deleted profile is lost, and prerequisites, stages, and credentials need new plans. Obtain authorization for that plan, then run `cluster --overwrite --plan-id REVIEWED_PLAN_ID --execute`. Execution repeats the comparison and refuses a stale plan. It deletes the profile, confirms that no profile, machine, or kubeconfig record remains, and only then archives the workspace and starts the new cluster.
+A stopped or unreachable profile blocks. For a running profile, the API queried from its control plane and the chosen context must return the same cluster UID. Present the reviewed Minikube home, action, differences, delete command, and effects. A deleted profile loses its data, and prerequisites, stages, and credentials need new plans. Obtain authorization for that plan, then run `cluster --overwrite --plan-id REVIEWED_PLAN_ID --execute`. Execution rechecks the evidence, reserves the archive, and confirms deletion and clean host records before moving the previous workspace files and starting the replacement.
 
 ## Prepare prerequisites
 

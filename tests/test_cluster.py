@@ -7,13 +7,15 @@ import os
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
+import cluster as cluster_module
 import runtime
+import secret_metadata
 from config import load_config
 from io_utils import read_json, write_json
 
@@ -31,7 +33,7 @@ path = Path(os.environ["FAKE_STATE"])
 state = json.loads(path.read_text())
 arguments = sys.argv[1:]
 with Path(os.environ["FAKE_LOG"]).open("a") as log:
-    log.write(json.dumps({"tool": "minikube", "argv": arguments, "kubeconfig": os.environ.get("KUBECONFIG")}) + "\\n")
+    log.write(json.dumps({"tool": "minikube", "argv": arguments, "kubeconfig": os.environ.get("KUBECONFIG"), "home": os.environ.get("MINIKUBE_HOME")}) + "\\n")
 if arguments[:1] == ["version"]:
     print(json.dumps({"minikubeVersion": "v1.39.0", "commit": "fake"}))
 elif arguments[:2] == ["profile", "list"]:
@@ -46,15 +48,31 @@ elif arguments[:1] == ["start"]:
     if state.get("fail_start"):
         sys.exit(1)
     name = next(item.split("=", 1)[1] for item in arguments if item.startswith("--profile="))
+    version = next(item.split("=", 1)[1] for item in arguments if item.startswith("--kubernetes-version="))
+    profile = Path(os.environ["MINIKUBE_HOME"]) / "profiles" / name
+    profile.mkdir(parents=True)
+    (profile / "config.json").write_text(json.dumps({"KubernetesConfig": {"KubernetesVersion": version}}))
+    kubeconfig = Path(os.environ["KUBECONFIG"])
+    if not kubeconfig.exists():
+        kubeconfig.write_text("apiVersion: v1\\nkind: Config\\n")
     state["valid"].append(name)
     state["contexts"].append(name)
     state["clusters"].append(name)
     state["users"].append(name)
     path.write_text(json.dumps(state))
+elif arguments[:1] == ["ssh"]:
+    if state.get("stopped") or state.get("unreachable") or not any(arg.startswith("--profile=") for arg in arguments):
+        sys.exit(1)
+    if "--kubeconfig=/var/lib/minikube/kubeconfig" not in arguments:
+        sys.exit(64)
+    print(state.get("local_uid", state["uid"]))
 elif arguments[:1] == ["delete"]:
     if state.get("fail_delete"):
         sys.exit(1)
     name = next(item.split("=", 1)[1] for item in arguments if item.startswith("--profile="))
+    profile = Path(os.environ["MINIKUBE_HOME"]) / "profiles" / name
+    (profile / "config.json").unlink()
+    profile.rmdir()
     keys = ["valid", "invalid", "clusters", "users"]
     if not state.get("keep_context"):
         keys.append("contexts")
@@ -100,7 +118,12 @@ elif "get" in arguments:
     index = arguments.index("get")
     resource, name = arguments[index + 1], arguments[index + 2]
     namespace = arguments[arguments.index("--namespace") + 1] if "--namespace" in arguments else ""
-    item = state.get("objects", {}).get(f"{resource}/{namespace}/{name}")
+    objects = state.get("objects", {})
+    if resource in state.get("denied_resources", []) or resource == "secrets":
+        sys.exit(1)
+    if resource == "kafkatopics.kafka.strimzi.io" and f"customresourcedefinitions.apiextensions.k8s.io//{resource}" not in objects:
+        sys.exit(1)
+    item = objects.get(f"{resource}/{namespace}/{name}")
     if item is not None:
         if arguments[-1] == "name":
             print(f"{resource}/{name}")
@@ -140,8 +163,36 @@ class ClusterTests(unittest.TestCase):
         )
         environment.start()
         self.addCleanup(environment.stop)
+        proxy = patch.object(secret_metadata, "proxy", return_value=nullcontext(self.root / "api.sock"))
+        request = patch.object(secret_metadata, "_request", side_effect=self.metadata_request)
+        proxy.start()
+        request.start()
+        self.addCleanup(proxy.stop)
+        self.addCleanup(request.stop)
         self.workspace = self.root / "workspace"
         self.source = self.root / "environment.json"
+
+    # Inputs: proxy socket path, API route and requested media type. Outputs: a fake metadata response.
+    # Purpose: exercise content negotiation and error handling without binding a socket.
+    def metadata_request(self, path, route, accept):
+        self.assertEqual(path, self.root / "api.sock")
+        self.assertEqual(accept, "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1")
+        _, api, version, namespaced, namespace, resource, name = route.split("/")
+        self.assertEqual((api, version, namespaced, resource), ("api", "v1", "namespaces", "secrets"))
+        with self.log.open("a") as log:
+            log.write(json.dumps({"tool": "metadata", "argv": ["get", route, accept]}) + "\n")
+        state = json.loads(self.state.read_text())
+        if state.get("secret_api_denied"):
+            return 403, {}
+        item = state.get("objects", {}).get(f"secrets/{namespace}/{name}")
+        if item is None:
+            return 404, {
+                "kind": "Status", "reason": "NotFound", "details": {"name": name, "kind": "secrets"}
+            }
+        return 200, {
+            "kind": "PartialObjectMetadata", "apiVersion": "meta.k8s.io/v1",
+            "metadata": {**item, "name": name, "namespace": namespace},
+        }
 
     # Inputs: fake profile names, kubeconfig names and start/identity outcomes. Outputs: none.
     # Dependencies: private JSON state file read by the fake tools.
@@ -241,6 +292,7 @@ class ClusterTests(unittest.TestCase):
         self.update_state(
             objects={
                 "namespaces//atlas": {"uid": "ns-1", "labels": label},
+                "customresourcedefinitions.apiextensions.k8s.io//kafkatopics.kafka.strimzi.io": {"uid": "crd-1"},
                 "kafkatopics.kafka.strimzi.io/kafka/jobs": {"uid": "topic-1", "labels": label},
                 "secrets/atlas-app/pg-client": {"uid": "secret-1"},
             }
@@ -637,6 +689,9 @@ class ClusterTests(unittest.TestCase):
     def test_missing_profile_is_recreated_after_archiving_the_workspace(self):
         self.create()
         self.record_objects()
+        profile = self.root / "minikube-home" / ".minikube" / "profiles" / "atlas-dev"
+        (profile / "config.json").unlink()
+        profile.rmdir()
         self.write_state(uid="cluster-b", server="https://cluster-b.invalid")
         status, plain = self.cli("cluster")
         self.assertEqual((status, plain["status"]), (0, "created"))
@@ -686,6 +741,10 @@ class ClusterTests(unittest.TestCase):
         self.assertFalse(planned["requires_execute"])
         reconcile = planned["overwrite"]["reconcile"]
         self.assertEqual((reconcile["checked"], reconcile["differences"]), (3, []))
+        resources = read_json(self.workspace / "reports" / "cluster-reconcile.json")["resources"]
+        secret = next(item for item in resources if item["resource"] == "secrets")
+        self.assertEqual(secret["observed_uid"], "secret-1")
+        self.assertTrue(any(call["tool"] == "metadata" for call in self.calls()))
         status, refused = self.cli("cluster", "--overwrite", "--plan-id", planned["plan_id"], "--execute")
         self.assertEqual(status, 2)
         self.assertIn("no change", refused["error"])
@@ -701,8 +760,9 @@ class ClusterTests(unittest.TestCase):
             "uid": lambda: self.update_state(
                 objects={
                     "namespaces//atlas": {"uid": "ns-2", "labels": label},
+                    "customresourcedefinitions.apiextensions.k8s.io//kafkatopics.kafka.strimzi.io": {"uid": "crd-1"},
                     "kafkatopics.kafka.strimzi.io/kafka/jobs": {"uid": "topic-1", "labels": label},
-                    "secrets/atlas-app/pg-client": {},
+                    "secrets/atlas-app/pg-client": {"uid": "secret-1"},
                 }
             ),
             "identity": lambda: self.update_state(uid="cluster-c"),
@@ -732,6 +792,10 @@ class ClusterTests(unittest.TestCase):
                 verbs = [call["argv"][0] for call in self.calls() if call["tool"] == "minikube"]
                 self.assertLess(verbs.index("delete"), len(verbs) - 1 - verbs[::-1].index("start"))
                 self.assertEqual((self.count("start"), self.count("delete")), (2, 1))
+                self.assertEqual(report["deletion"], "completed")
+                for call in self.calls():
+                    if call["argv"][0] in {"start", "delete", "ssh"}:
+                        self.assertEqual(call["home"], report["minikube_home"])
                 self.assertTrue((Path(report["archive"]) / "state" / "00-bootstrap.tfstate").exists())
 
     # Inputs: a stopped or unreachable profile. Outputs: blocked plan, no delete.
@@ -762,6 +826,216 @@ class ClusterTests(unittest.TestCase):
         self.assertIn("changed since review", refused["error"])
         self.assertEqual((self.count("start"), self.count("delete")), (1, 0))
 
+    # Inputs: matching and repointed contexts and a stopped profile. Outputs: blocked plans and execution.
+    # Purpose: allow comparison only against the API of the running local profile. Dependencies: fake Minikube SSH.
+    def test_overwrite_refuses_a_repointed_context_and_a_stopped_profile(self):
+        self.create()
+        self.record_objects()
+        self.update_state(objects={})
+        status, approved = self.cli("cluster", "--overwrite")
+        self.assertEqual((status, approved["status"]), (0, "planned"), approved)
+        self.update_state(uid="foreign-cluster", local_uid="cluster-a")
+        status, refused = self.cli("cluster", "--overwrite", "--plan-id", approved["plan_id"], "--execute")
+        self.assertEqual(status, 2, refused)
+        self.assertIn("changed since review", refused["error"])
+        status, blocked = self.cli("cluster", "--overwrite")
+        self.assertEqual(status, 2, blocked)
+        self.assertIn("does not reach", blocked["blockers"][0])
+
+        self.update_state(stopped=True)
+        status, blocked = self.cli("cluster", "--overwrite")
+        self.assertEqual(status, 2, blocked)
+        self.assertIn("running local profile", blocked["blockers"][0])
+        self.assertEqual(self.count("delete"), 0)
+
+    # Inputs: two homes with the same profile and evidence. Outputs: stale plan and wrong-home refusal.
+    # Purpose: scope deletion authorization to the creation home. Dependencies: fake profiles on disk.
+    def test_overwrite_home_cannot_change_after_review(self):
+        created = self.create()
+        self.record_objects()
+        self.update_state(objects={})
+        status, planned = self.cli("cluster", "--overwrite")
+        self.assertEqual((status, planned["status"]), (0, "planned"), planned)
+        home = Path(created["minikube_home"])
+        alternate = self.root / "other-home" / ".minikube"
+        profile = alternate / "profiles" / "atlas-dev"
+        profile.mkdir(parents=True)
+        (profile / "config.json").write_bytes((home / "profiles" / "atlas-dev" / "config.json").read_bytes())
+        self.assertIn(f"MINIKUBE_HOME={home}", planned["overwrite"]["delete_command"])
+        self.assertIn(f"MINIKUBE_HOME={home}", planned["command"])
+        with patch.dict(os.environ, {"MINIKUBE_HOME": str(alternate.parent)}):
+            status, blocked = self.cli("cluster", "--overwrite", "--plan-id", planned["plan_id"], "--execute")
+            self.assertEqual(status, 2, blocked)
+            status, fresh = self.cli("cluster", "--overwrite")
+            self.assertEqual(status, 2, fresh)
+            self.assertIn("Minikube home differs", fresh["blockers"][0])
+        self.assertTrue((home / "profiles" / "atlas-dev").is_dir())
+        self.assertTrue(profile.is_dir())
+        self.assertEqual(self.count("delete"), 0)
+
+    # Inputs: legacy creation report without a home. Outputs: normal report and blocked overwrite.
+    # Purpose: prevent a guess from authorizing deletion. Dependencies: private creation history.
+    def test_legacy_creation_reports_cannot_authorize_overwrite(self):
+        self.create()
+        report_path = self.workspace / "reports" / "cluster.json"
+        report = read_json(report_path)
+        del report["minikube_home"]
+        write_json(report_path, report)
+        self.assertEqual(self.cli("cluster")[0], 0)
+        status, blocked = self.cli("cluster", "--overwrite")
+        self.assertEqual(status, 2, blocked)
+        self.assertIn("no recorded Minikube home", blocked["blockers"][0])
+        self.assertEqual(self.count("delete"), 0)
+
+    # Inputs: new UID or owner with the same drift status. Outputs: stale approval and no delete.
+    # Purpose: compare actual evidence on execution. Dependencies: fake Kubernetes GET.
+    def test_changed_uid_or_owner_invalidates_same_status(self):
+        self.create()
+        self.record_objects()
+        objects = json.loads(self.state.read_text())["objects"]
+        atlas = "namespaces//atlas"
+        first = {"uid": "ns-2", "labels": {runtime.ENVIRONMENT_LABEL: "foreign"}}
+        objects[atlas] = first
+        self.update_state(objects=objects)
+        status, reviewed = self.cli("cluster", "--overwrite")
+        self.assertEqual(status, 0, reviewed)
+        difference = reviewed["overwrite"]["reconcile"]["differences"][0]
+        self.assertEqual(
+            (difference["status"], difference["observed_uid"], difference["observed_owner"]),
+            ("uid_mismatch", "ns-2", "foreign"),
+        )
+        for live in (
+            {**first, "uid": "ns-3"},
+            {**first, "labels": {runtime.ENVIRONMENT_LABEL: "foreign-2"}},
+        ):
+            with self.subTest(live=live):
+                objects[atlas] = live
+                self.update_state(objects=objects)
+                status, refused = self.cli("cluster", "--overwrite", "--plan-id", reviewed["plan_id"], "--execute")
+                self.assertEqual(status, 2, refused)
+                self.assertIn("changed since review", refused["error"])
+        self.assertEqual(self.count("delete"), 0)
+
+    # Inputs: a workspace containing the kubeconfig or Minikube home. Outputs: blocked archiving.
+    # Purpose: preserve shared configuration paths. Dependencies: private fake home and kubeconfig.
+    def test_overwrite_keeps_shared_configuration_out_of_archives(self):
+        for shared in ("kubeconfig", "home"):
+            with self.subTest(shared=shared):
+                self.setUp()
+                if shared == "kubeconfig":
+                    self.kubeconfig = self.workspace / "shared-kubeconfig"
+                else:
+                    environment = patch.dict(os.environ, {
+                        "MINIKUBE_HOME": str(self.workspace / "shared-home")
+                    })
+                    environment.start()
+                    self.addCleanup(environment.stop)
+                created = self.create()
+                status, blocked = self.cli("cluster", "--overwrite")
+                self.assertEqual(status, 2, blocked)
+                self.assertIn("separate archive paths", blocked["blockers"][0])
+                self.assertEqual(self.count("delete"), 0)
+                self.assertTrue(Path(created["minikube_home"]).is_dir())
+                self.assertTrue(self.kubeconfig.exists())
+
+    # Inputs: an unwritable archive parent. Outputs: execution refusal before deletion.
+    # Purpose: reserve the archive while the existing workspace is intact. Dependencies: file mode bits.
+    def test_archive_reservation_failure_blocks_delete(self):
+        self.create()
+        self.record_objects()
+        self.update_state(objects={})
+        status, reviewed = self.cli("cluster", "--overwrite")
+        self.assertEqual(status, 0, reviewed)
+        archive = self.workspace / "archive"
+        archive.mkdir(mode=0o500)
+        self.addCleanup(archive.chmod, 0o700)
+        status, refused = self.cli("cluster", "--overwrite", "--plan-id", reviewed["plan_id"], "--execute")
+        self.assertEqual(status, 2, refused)
+        self.assertIn("Cannot reserve the archive", refused["error"])
+        self.assertTrue((self.workspace / "state" / "00-bootstrap.tfstate").exists())
+        self.assertEqual((self.count("start"), self.count("delete")), (1, 0))
+
+    # Inputs: missing CRD and denied reads. Outputs: verified absence or blocked comparison.
+    # Purpose: distinguish missing APIs from permission and discovery errors. Dependencies: fake kubectl.
+    def test_crd_absence_is_drift_but_unreadable_apis_block(self):
+        self.create()
+        self.record_objects()
+        objects = json.loads(self.state.read_text())["objects"]
+        crd = "customresourcedefinitions.apiextensions.k8s.io"
+        topic = "kafkatopics.kafka.strimzi.io"
+        key = f"{crd}//{topic}"
+        schema = objects.pop(key)
+        self.update_state(objects=objects)
+        before = len(self.calls())
+        status, reviewed = self.cli("cluster", "--overwrite")
+        self.assertEqual(status, 0, reviewed)
+        difference = reviewed["overwrite"]["reconcile"]["differences"][0]
+        self.assertEqual((difference["resource"], difference["status"]), (topic, "missing"))
+        self.assertFalse(any(
+            argv[argv.index("get") + 1] == topic
+            for argv in (call["argv"] for call in self.calls()[before:] if call["tool"] == "kubectl")
+            if "get" in argv
+        ))
+
+        objects[key] = schema
+        self.update_state(objects=objects)
+        for denial in ({"denied_resources": [crd]}, {"denied_resources": [topic]},
+                       {"denied_resources": [], "secret_api_denied": True}):
+            with self.subTest(denial=denial):
+                self.update_state(**denial)
+                status, blocked = self.cli("cluster", "--overwrite")
+                self.assertEqual(status, 2, blocked)
+                self.assertIn("Cannot read", blocked["blockers"][0])
+        self.assertEqual(self.count("delete"), 0)
+
+    # Inputs: a legacy Secret publication and older prerequisite attempt. Outputs: retained drift evidence.
+    # Purpose: preserve ownership records across previews and retries. Dependencies: private reports.
+    def test_overwrite_uses_records_after_preview_and_prerequisite_retry(self):
+        self.create()
+        self.record_objects()
+        self.assertEqual(self.cli("credentials")[0], 0)
+        self.assertEqual(read_json(self.workspace / "reports" / "credentials-postgres.json")["status"], "preview")
+        earlier = {"resource": "deployments.apps", "namespace": "kafka", "name": "previous"}
+        write_json(self.workspace / "plans" / "prerequisites" / "consumed-previous.json", {
+            "results": [{"status": "created", "reference": earlier}]
+        })
+        write_json(self.workspace / "reports" / "prerequisites-strimzi.json", {"results": []})
+        objects = json.loads(self.state.read_text())["objects"]
+        del objects["secrets/atlas-app/pg-client"]
+        self.update_state(objects=objects)
+        status, reviewed = self.cli("cluster", "--overwrite")
+        self.assertEqual(status, 0, reviewed)
+        differences = reviewed["overwrite"]["reconcile"]["differences"]
+        self.assertEqual({item["name"]: item["status"] for item in differences},
+                         {"pg-client": "missing", "previous": "missing"})
+
+    # Inputs: a successful delete followed by a replacement timeout. Outputs: separate durable outcomes.
+    # Purpose: make completed deletion visible after a failed replacement. Dependencies: fake Minikube and runner.
+    def test_replacement_timeout_reports_completed_deletion_and_archive(self):
+        self.create()
+        self.record_objects()
+        self.update_state(objects={})
+        status, reviewed = self.cli("cluster", "--overwrite")
+        self.assertEqual(status, 0, reviewed)
+        real_run = cluster_module.run
+
+        # Inputs: command and runner options. Outputs: result or simulated timeout.
+        # Purpose: inject a timeout only at replacement start. Dependencies: fake runner.
+        def timeout_start(command, **options):
+            if "start" in command:
+                raise RuntimeError("Command timed out")
+            return real_run(command, **options)
+
+        with patch.object(cluster_module, "run", side_effect=timeout_start):
+            status, result = self.cli("cluster", "--overwrite", "--plan-id", reviewed["plan_id"], "--execute")
+        self.assertEqual(status, 2, result)
+        self.assertIn("previous profile was deleted", result["error"])
+        self.assertIn("minikube start did not finish", result["error"])
+        report = read_json(self.workspace / "reports" / "cluster.json")
+        self.assertEqual((report["status"], report["deletion"]), ("uncertain", "completed"))
+        self.assertIn(report["archive"], result["error"])
+        self.assertTrue((Path(report["archive"]) / "state" / "00-bootstrap.tfstate").exists())
+
     # Inputs: a failing delete, or a delete that leaves a kubeconfig context. Outputs: refusals.
     # Purpose: keep the workspace unarchived and start nothing when the host is not clean. Dependencies: fake tools.
     def test_failed_or_incomplete_delete_keeps_the_workspace(self):
@@ -778,13 +1052,38 @@ class ClusterTests(unittest.TestCase):
                 self.assertEqual(status, 2, refused)
                 self.assertIn(message, refused["error"])
                 self.assertIn("not archived", refused["error"])
-                self.assertFalse((self.workspace / "archive").exists())
+                self.assertEqual(list((self.workspace / "archive").iterdir()), [])
                 self.assertTrue((self.workspace / "state" / "00-bootstrap.tfstate").exists())
                 consumed = read_json(
                     self.workspace / "plans" / "cluster" / f"consumed-{planned['plan_id']}.json"
                 )
                 self.assertEqual(consumed["status"], "failed")
                 self.assertEqual(self.count("start"), 1)
+
+
+class SecretMetadataTests(unittest.TestCase):
+    # Inputs: a synthetic API response stream. Outputs: exact request and decoded metadata.
+    # Purpose: verify HTTP negotiation without opening a socket. Dependencies: mocked socket and HTTP parser.
+    def test_get_sends_a_metadata_only_accept_header(self):
+        metadata = {"name": "pg-client", "namespace": "atlas-app", "uid": "secret-1"}
+        body = json.dumps({
+            "kind": "PartialObjectMetadata", "apiVersion": "meta.k8s.io/v1",
+            "metadata": metadata,
+        }).encode()
+        response = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+        with patch.object(secret_metadata.socket, "socket") as factory:
+            connection = factory.return_value.__enter__.return_value
+            connection.makefile.return_value = io.BytesIO(response)
+            result = secret_metadata.get(Path("/unused/api.sock"), "atlas-app", "pg-client")
+        self.assertEqual(result, metadata)
+        connection.connect.assert_called_once_with("/unused/api.sock")
+        request = connection.sendall.call_args.args[0]
+        self.assertIn(b"GET /api/v1/namespaces/atlas-app/secrets/pg-client HTTP/1.1\r\n", request)
+        self.assertIn(b"Accept: application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1\r\n", request)
 
 
 if __name__ == "__main__":

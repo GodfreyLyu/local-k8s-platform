@@ -4,18 +4,22 @@ through a separately reviewed overwrite plan for a profile this workspace create
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import sys
+from contextlib import nullcontext, suppress
 from pathlib import Path
 
 import runtime
-from io_utils import private_dir, read_json, run, write_json
+import secret_metadata
+from io_utils import private_dir, read_json, run, sha256, write_json
 from prerequisites import _sources
 
 START_TIMEOUT_SECONDS = 1800
 DELETE_TIMEOUT_SECONDS = 600
 # Workspace entries that survive an archive: the held lock and earlier archives.
 ARCHIVE_KEEP = {".operation.lock", "archive"}
+CRD_RESOURCES = {*runtime.MANIFEST_KINDS.values(), "prometheuses.monitoring.coreos.com"}
 
 
 # Inputs: none. Outputs: absolute minikube path and its reported version.
@@ -43,8 +47,17 @@ def _minikube_home():
     configured = os.environ.get("MINIKUBE_HOME")
     if not configured:
         return Path.home() / ".minikube"
-    home = Path(os.path.normpath(configured))
+    home = Path(os.path.abspath(configured))
     return home if home.name == ".minikube" else home / ".minikube"
+
+
+# Inputs: configuration, Minikube binary, and absolute home argument. Outputs: command prefix.
+# Purpose: select the same paths for inspection and execution. Dependencies: Minikube environment.
+def _minikube_command(config, minikube, home):
+    kubeconfig = config["cluster"]["kubeconfig"]
+    if os.pathsep in kubeconfig:
+        raise ValueError("Minikube requires one kubeconfig path without a path-list separator.")
+    return ["/usr/bin/env", f"KUBECONFIG={kubeconfig}", f"MINIKUBE_HOME={home}", minikube]
 
 
 # Inputs: record path. Outputs: whether a directory entry exists, including a dangling symlink.
@@ -57,13 +70,13 @@ def _record_exists(path):
     return True
 
 
-# Inputs: minikube path, home, and profile name. Outputs: whether any profile record uses that name.
+# Inputs: Minikube command prefix, home, and profile name. Outputs: whether any profile uses that name.
 # Purpose: enforce create-only behavior for valid, stopped, and invalid profiles. Dependencies: minikube profile list.
-def _profile_exists(minikube, home, name):
+def _profile_exists(command, home, name):
     profiles = home / "profiles"
     if _record_exists(profiles / name):
         return True
-    result = run([minikube, "profile", "list", "-o", "json"], timeout=60)
+    result = run(command + ["profile", "list", "-o", "json"], timeout=60)
     try:
         listing = json.loads(result.stdout)
     except json.JSONDecodeError:
@@ -108,15 +121,12 @@ def _kubeconfig_conflicts(kubeconfig, name):
     return conflicts
 
 
-# Inputs: resolved configuration and absolute minikube path. Outputs: fixed argument list.
+# Inputs: resolved configuration and Minikube command prefix. Outputs: fixed argument list.
 # Purpose: express every reviewed cluster property explicitly. Dependencies: minikube start flags.
-def _command(config, minikube):
+def _command(config, command):
     cluster, create = config["cluster"], config["cluster"]["create"]
     derived = config["derived"]["cluster"]
-    command = [
-        "/usr/bin/env",
-        f"KUBECONFIG={cluster['kubeconfig']}",
-        minikube,
+    command = command + [
         "start",
         f"--profile={cluster['name']}",
         f"--driver={create['driver']}",
@@ -130,21 +140,31 @@ def _command(config, minikube):
     ]
     command += [f"--addons={addon}" for addon in derived["addons"]]
     # Keep the user's current context; every later command selects the context explicitly.
-    command += ["--keep-context=true", "--interactive=false", "--wait=all"]
+    command += [
+        "--keep-context=true",
+        "--interactive=false",
+        "--delete-on-failure=false",
+        "--wait=all",
+    ]
     return command
 
 
-# Inputs: resolved configuration. Outputs: read-only host and target evidence with the planned command.
+# Inputs: configuration and optional reviewed home argument. Outputs: host and target evidence.
 # Purpose: bind a review to the host, tool, and absence of conflicting records. Dependencies: minikube, kubectl.
-def _snapshot(config):
+def _snapshot(config, *, home=None):
     minikube, version = _minikube()
     name = config["cluster"]["name"]
-    home = _minikube_home()
-    profile_exists = _profile_exists(minikube, home, name)
+    home = home or _minikube_home()
+    resolved_home = home.resolve()
+    # Minikube appends ".minikube" unless the argument already has that basename.
+    if resolved_home.name == ".minikube":
+        home = resolved_home
+    command = _minikube_command(config, minikube, home)
+    profile_exists = _profile_exists(command, resolved_home, name)
     machines = [
         node
         for node in config["derived"]["cluster"]["nodes"]
-        if _record_exists(home / "machines" / node)
+        if _record_exists(resolved_home / "machines" / node)
     ]
     kubeconfig_conflicts = _kubeconfig_conflicts(Path(config["cluster"]["kubeconfig"]), name)
     blockers = []
@@ -163,74 +183,81 @@ def _snapshot(config):
     return {
         "host": {"platform": sys.platform, "machine": os.uname().machine},
         "minikube": {"path": minikube, "version": version},
+        "minikube_home": str(resolved_home),
+        "home_argument": str(home),
         "profile": name,
         "kubeconfig": config["cluster"]["kubeconfig"],
         "profile_exists": profile_exists,
         "machine_conflicts": machines,
         "kubeconfig_conflicts": kubeconfig_conflicts,
         "blockers": blockers,
-        "command": _command(config, minikube),
+        "command": _command(config, command),
     }
 
 
-# Inputs: resolved configuration and absolute minikube path. Outputs: fixed delete argument list.
-# Purpose: express the reviewed overwrite deletion explicitly. Dependencies: minikube delete flags.
-def _delete_command(config, minikube):
-    return [
-        "/usr/bin/env",
-        f"KUBECONFIG={config['cluster']['kubeconfig']}",
-        minikube,
-        "delete",
-        f"--profile={config['cluster']['name']}",
-    ]
+# Inputs: configuration and host snapshot. Outputs: the profile's in-guest kube-system UID.
+# Purpose: verify the running local profile independently of the host context. Dependencies: Minikube SSH.
+def _profile_uid(config, snapshot):
+    name = snapshot["profile"]
+    path = Path(snapshot["minikube_home"]) / "profiles" / name / "config.json"
+    version = read_json(path)["KubernetesConfig"]["KubernetesVersion"]
+    if not isinstance(version, str) or not re.fullmatch(
+        r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?", version
+    ):
+        raise RuntimeError("Cannot establish the Kubernetes version of the local profile.")
+    command = _minikube_command(config, snapshot["minikube"]["path"], snapshot["home_argument"])
+    # Minikube's kubeadm bootstrapper installs both files in the guest's persistent directory.
+    result = run(
+        command + [
+            "ssh",
+            f"--profile={name}",
+            "--",
+            "sudo",
+            "-n",
+            f"/var/lib/minikube/binaries/{version}/kubectl",
+            "--kubeconfig=/var/lib/minikube/kubeconfig",
+            "--request-timeout=10s",
+            "get",
+            "namespace",
+            "kube-system",
+            "-o=jsonpath='{.metadata.uid}'",
+        ],
+        timeout=30,
+    )
+    uid = result.stdout.strip()
+    if result.returncode or not re.fullmatch(r"[A-Za-z0-9-]+", uid):
+        raise RuntimeError("Cannot read the API identity from the running local profile.")
+    return uid
 
 
-# Inputs: resolved configuration and one recorded reference. Outputs: live uid/labels, or None when absent.
+# Inputs: configuration, one recorded reference, CRD cache and optional metadata socket.
+# Outputs: live metadata, or None when absent.
 # Purpose: read existence and ownership without loading Secret data. Dependencies: kubectl GET.
-def _live(config, reference):
-    if reference["resource"] == "secrets":
-        command = runtime._kube(config) + ["get", "secrets", reference["name"]]
-        command += ["--namespace", reference["namespace"], "--ignore-not-found=true", "-o", "name"]
-        result = run(command, timeout=20)
-        if result.returncode:
-            raise RuntimeError("Cannot read secrets; check API access and permissions.")
-        return {"uid": None, "labels": None} if result.stdout.strip() else None
-    item = runtime._get(config, reference["resource"], reference["name"], reference["namespace"])
-    if item is None:
-        return None
-    metadata = item.get("metadata", {})
-    return {"uid": metadata.get("uid"), "labels": metadata.get("labels", {})}
+def _live(config, reference, crds, socket_path):
+    resource, name, namespace = (reference[key] for key in ("resource", "name", "namespace"))
+    if resource == "secrets":
+        return secret_metadata.get(socket_path, namespace, name)
+    if resource in CRD_RESOURCES:
+        if resource not in crds:
+            crd = runtime._get(config, "customresourcedefinitions.apiextensions.k8s.io", resource)
+            crds[resource] = crd is not None
+        if not crds[resource]:
+            return None
+    item = runtime._get(config, resource, name, namespace)
+    return item.get("metadata", {}) if item is not None else None
 
 
-# Inputs: private workspace. Outputs: references created outside Terraform by this workspace.
-# Purpose: include prerequisite objects and published Secrets in reconciliation. Dependencies: private reports.
-def _recorded_extras(workspace):
-    references = []
-    for path in sorted((workspace / "reports").glob("prerequisites-*.json")):
-        for item in read_json(path).get("results", []):
-            if item.get("status") == "created" and item.get("reference"):
-                references.append({"source": path.stem, **item["reference"], "uid": None})
-    for path in sorted((workspace / "reports").glob("credentials-*.json")):
-        for item in read_json(path).get("results", []):
-            namespace, name = item["reference"].split("/", 1)
-            references.append(
-                {
-                    "source": path.stem,
-                    "resource": "secrets",
-                    "name": name,
-                    "namespace": namespace,
-                    "uid": None,
-                }
-            )
-    return references
-
-
-# Inputs: resolved configuration and a workspace whose creation report exists. Outputs: comparison record.
+# Inputs: configuration, workspace, host snapshot, and creation report. Outputs: comparison record.
 # Purpose: compare the live cluster with the recorded identity, Terraform state, and other objects this
 # workspace created; raises RuntimeError when the cluster cannot be read. Dependencies: kubectl, private files.
-def _reconcile(config, workspace):
-    recorded = runtime._creation_report(config, workspace)["identity"]
+def _reconcile(config, workspace, snapshot, creation):
+    profile_uid = _profile_uid(config, snapshot)
+    recorded = creation["identity"]
+    kubeconfig = Path(snapshot["kubeconfig"])
+    config_hash = sha256(kubeconfig)
     observed = runtime._identity(config)
+    if profile_uid != observed["kube_system_uid"]:
+        raise RuntimeError("The selected context does not reach the running local profile.")
     # The kubeconfig hash changes with unrelated profiles; identity is the endpoint and kube-system UID.
     keys = ("context", "kubeconfig", "server", "kube_system_uid")
     identity = {
@@ -239,25 +266,47 @@ def _reconcile(config, workspace):
         "observed": {key: observed[key] for key in ("server", "kube_system_uid")},
     }
     resources = []
+    crds = {}
     # Objects on a different cluster say nothing about this workspace's state, so skip them.
     if identity["status"] == "match":
-        for reference in runtime._state_resources(workspace) + _recorded_extras(workspace):
-            live = _live(config, reference)
-            if live is None:
-                status = "missing"
-            elif reference["uid"] and live["uid"] != reference["uid"]:
-                status = "uid_mismatch"
-            elif (
-                reference["source"].startswith("terraform:")
-                and live["labels"].get(runtime.ENVIRONMENT_LABEL) != config["environment_id"]
-            ):
-                status = "owner_mismatch"
-            else:
-                status = "ok"
-            resources.append({**reference, "status": status})
+        references = runtime._state_resources(workspace) + runtime._recorded_objects(workspace)
+        needs_proxy = any(item["resource"] == "secrets" for item in references)
+        with (secret_metadata.proxy(config) if needs_proxy else nullcontext()) as socket_path:
+            for reference in references:
+                live = _live(config, reference, crds, socket_path)
+                observed_uid = live.get("uid") if live is not None else None
+                if live is not None and (not isinstance(observed_uid, str) or not observed_uid):
+                    raise RuntimeError(
+                        f"Cannot establish the UID of {reference['resource']}/{reference['name']}."
+                    )
+                labels = (live or {}).get("labels") or {}
+                owner = labels.get(runtime.ENVIRONMENT_LABEL)
+                if live is None:
+                    status = "missing"
+                elif reference["uid"] and observed_uid != reference["uid"]:
+                    status = "uid_mismatch"
+                elif (
+                    reference["source"].startswith("terraform:")
+                    and owner != config["environment_id"]
+                ):
+                    status = "owner_mismatch"
+                else:
+                    status = "ok"
+                resources.append(
+                    {
+                        **reference,
+                        "status": status,
+                        "observed_uid": observed_uid,
+                        "observed_owner": owner,
+                    }
+                )
+    if config_hash != sha256(kubeconfig):
+        raise RuntimeError("The selected kubeconfig changed during comparison.")
     return {
         "identity": identity,
         "resources": resources,
+        "crd_presence": crds,
+        "kubeconfig_sha256": config_hash,
         "consistent": identity["status"] == "match"
         and all(item["status"] == "ok" for item in resources),
     }
@@ -269,13 +318,34 @@ def _reconcile(config, workspace):
 def _overwrite_snapshot(config, workspace):
     snapshot = _snapshot(config)
     name = config["cluster"]["name"]
+    creation = runtime._creation_report(config, workspace)
     snapshot.update(reconcile=None, delete_command=None)
+    home = Path(snapshot["minikube_home"])
+    kubeconfig = Path(snapshot["kubeconfig"])
+    blocker = None
+    if creation is None or not creation.get("minikube_home"):
+        blocker = "The creation report has no recorded Minikube home to verify for overwrite."
+    elif creation["minikube_home"] != str(home):
+        blocker = "The resolved Minikube home differs from the creation report."
+    elif (
+        home.is_relative_to(workspace)
+        or workspace.is_relative_to(home)
+        or kubeconfig.is_relative_to(workspace)
+        or Path(snapshot["home_argument"]).is_relative_to(workspace)
+    ):
+        blocker = (
+            "Overwrite requires separate archive paths. Keep Minikube home and kubeconfig "
+            "outside the workspace and the workspace outside Minikube home."
+        )
+    if blocker:
+        snapshot.update(action="none", blockers=[blocker])
+        return snapshot
     if not snapshot["profile_exists"]:
         # Leftover machine or kubeconfig records stay blockers; they are not ours to clean.
         snapshot["action"] = "recreate-missing"
         return snapshot
     try:
-        reconcile = _reconcile(config, workspace)
+        reconcile = _reconcile(config, workspace, snapshot, creation)
     except (RuntimeError, ValueError, KeyError, TypeError, OSError) as error:
         # A stopped or unreachable cluster may still hold intact data, so it never counts as drift.
         snapshot.update(
@@ -295,21 +365,45 @@ def _overwrite_snapshot(config, workspace):
     snapshot.update(
         action="overwrite",
         blockers=[],
-        delete_command=_delete_command(config, snapshot["minikube"]["path"]),
+        delete_command=(
+            _minikube_command(config, snapshot["minikube"]["path"], snapshot["home_argument"])
+            + ["delete", f"--profile={name}"]
+        ),
     )
     return snapshot
 
 
-# Inputs: workspace and plan ID. Outputs: archive directory path.
-# Purpose: keep every previous workspace file privately instead of deleting it. Dependencies: same-filesystem rename.
-def _archive_workspace(workspace, plan_id):
+# Inputs: workspace and plan ID. Outputs: reserved private archive directory.
+# Purpose: verify archive placement before delete. Dependencies: writable directories on one filesystem.
+def _reserve_archive(workspace, plan_id):
+    parent = private_dir(workspace / "archive")
+    if any((path.stat().st_mode & 0o300) != 0o300 for path in (workspace, parent)):
+        raise RuntimeError(
+            "Cannot reserve the archive. The workspace and archive directory must be writable."
+        )
+    if parent.stat().st_dev != workspace.stat().st_dev:
+        raise RuntimeError("The archive must be on the same filesystem as the workspace.")
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    archive = private_dir(workspace / "archive") / f"{stamp}-{plan_id[:12]}"
+    archive = parent / f"{stamp}-{plan_id[:12]}"
     archive.mkdir(mode=0o700)
+    return archive
+
+
+# Inputs: workspace and reserved archive. Outputs: none.
+# Purpose: preserve workspace files after deletion is confirmed. Dependencies: same-filesystem rename.
+def _archive_workspace(workspace, archive):
     for item in sorted(workspace.iterdir()):
         if item.name not in ARCHIVE_KEEP:
             item.rename(archive / item.name)
-    return archive
+
+
+# Inputs: reviewed snapshot. Outputs: the pinned Minikube home argument.
+# Purpose: ensure a home alias still resolves to the reviewed directory. Dependencies: local paths.
+def _reviewed_home(snapshot):
+    home = Path(snapshot["home_argument"])
+    if str(home.resolve()) != snapshot["minikube_home"]:
+        raise RuntimeError("The resolved Minikube home changed since review.")
+    return home
 
 
 # Inputs: resolved configuration, workspace, reviewed overwrite record, and a materialize callback.
@@ -318,61 +412,89 @@ def _archive_workspace(workspace, plan_id):
 def _execute_overwrite(config, workspace, review, materialize):
     plan_id, snapshot = review["plan_id"], review["snapshot"]
     consumed = workspace / "plans" / "cluster" / f"consumed-{plan_id}.json"
-    record = {"status": "attempting", "plan_id": plan_id, "action": snapshot["action"]}
-    write_json(consumed, record)
-    if snapshot["action"] == "overwrite":
-        try:
-            result = run(snapshot["delete_command"], timeout=DELETE_TIMEOUT_SECONDS)
-        except RuntimeError:
-            record["status"] = "uncertain"
-            write_json(consumed, record)
-            raise RuntimeError(
-                "minikube delete did not finish; inspect the profile. The workspace was not archived."
-            ) from None
-        if result.returncode:
-            record["status"] = "failed"
-            write_json(consumed, record)
-            raise RuntimeError(
-                "minikube delete failed; the workspace was not archived. Inspect the profile before a new plan."
-            )
-    # Creation needs a clean host, whether the profile was deleted here or by the user.
-    residual = _snapshot(config)["blockers"]
-    if residual:
-        record.update(status="failed", residual=residual)
+    archive = _reserve_archive(workspace, plan_id)
+    record = {
+        "status": "attempting",
+        "plan_id": plan_id,
+        "action": snapshot["action"],
+        "deletion": "not-needed",
+        "archive": str(archive),
+    }
+    try:
+        home = _reviewed_home(snapshot)
         write_json(consumed, record)
-        raise RuntimeError(
-            "Profile, machine, or kubeconfig records remain; the workspace was not archived. "
-            + " ".join(residual)
-        )
+        if snapshot["action"] == "overwrite":
+            if sha256(Path(snapshot["kubeconfig"])) != snapshot["reconcile"]["kubeconfig_sha256"]:
+                raise RuntimeError("The selected kubeconfig changed since review.")
+            record["deletion"] = "uncertain"
+            write_json(consumed, record)
+            try:
+                result = run(snapshot["delete_command"], timeout=DELETE_TIMEOUT_SECONDS)
+            except RuntimeError:
+                record["status"] = "uncertain"
+                raise RuntimeError(
+                    "minikube delete did not finish. Inspect the profile. "
+                    "The workspace was not archived."
+                ) from None
+            if result.returncode:
+                record["deletion"] = "failed"
+                raise RuntimeError(
+                    "minikube delete failed. The workspace was not archived. "
+                    "Inspect the profile before a new plan."
+                )
+            record["deletion"] = "completed"
+            write_json(consumed, record)
+        # Inspect the reviewed home even if the ambient environment has changed.
+        _reviewed_home(snapshot)
+        residual = _snapshot(config, home=home)["blockers"]
+        if residual:
+            record["residual"] = residual
+            raise RuntimeError(
+                "Profile, machine, or kubeconfig records remain. The workspace was not archived. "
+                + " ".join(residual)
+            )
+    except (RuntimeError, ValueError, OSError):
+        if record["status"] == "attempting":
+            record["status"] = "failed"
+        with suppress(OSError):
+            archive.rmdir()
+        write_json(consumed, record)
+        raise
     record["status"] = "archiving"
     write_json(consumed, record)
-    archive = _archive_workspace(workspace, plan_id)
+    progress = {key: record[key] for key in ("action", "deletion", "archive")}
+    deletion = "The previous profile was deleted. " if record["deletion"] == "completed" else ""
     try:
+        _archive_workspace(workspace, archive)
         materialize(config, workspace)
         write_json(workspace / "plans" / "cluster" / f"{plan_id}.json", review)
         write_json(
             workspace / "reports" / "cluster-recreated.json",
             {
                 "plan_id": plan_id,
-                "action": snapshot["action"],
-                "archive": str(archive),
+                **progress,
                 "reconcile": snapshot["reconcile"],
                 "recreated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             },
         )
     except (RuntimeError, ValueError, OSError) as error:
         raise RuntimeError(
-            f"The previous workspace was archived at {archive}, but the new workspace could not be "
-            f"prepared ({error}); inspect it before any new plan. No cluster was started."
+            f"{deletion}Preparing the archive at {archive} or the new workspace failed "
+            f"({error}). Inspect both directories before any new plan."
         ) from None
-    report = _execute(config, workspace, review)
-    return {**report, "action": snapshot["action"], "archive": str(archive)}
+    try:
+        return _execute(config, workspace, review, previous=progress)
+    except (RuntimeError, ValueError, OSError) as error:
+        raise RuntimeError(
+            f"{deletion}The previous workspace was archived at {archive}. Replacement: {error}"
+        ) from None
 
 
-# Inputs: resolved configuration, workspace, and reviewed record. Outputs: creation report.
+# Inputs: configuration, workspace, reviewed record, and optional overwrite progress. Outputs: creation report.
 # Purpose: run the exact reviewed command once and preserve any partial result. Dependencies: minikube, kubectl.
-def _execute(config, workspace, review):
-    plan_id = review["plan_id"]
+def _execute(config, workspace, review, *, previous=None):
+    plan_id, snapshot = review["plan_id"], review["snapshot"]
+    _reviewed_home(snapshot)
     consumed = workspace / "plans" / "cluster" / f"consumed-{plan_id}.json"
     report_path = workspace / "reports" / "cluster.json"
     record = {
@@ -380,18 +502,20 @@ def _execute(config, workspace, review):
         "plan_id": plan_id,
         "profile": config["cluster"]["name"],
         "context": config["cluster"]["context"],
+        "minikube_home": snapshot["minikube_home"],
         "runtime_acceptance": "pending",
+        **(previous or {}),
     }
     write_json(consumed, record)
     write_json(report_path, record)
     try:
-        result = run(review["snapshot"]["command"], timeout=START_TIMEOUT_SECONDS)
+        result = run(snapshot["command"], timeout=START_TIMEOUT_SECONDS)
     except RuntimeError:
         record["status"] = "uncertain"
         write_json(consumed, record)
         write_json(report_path, record)
         raise RuntimeError(
-            "minikube start did not finish; inspect the profile before any further step. Nothing was deleted."
+            "minikube start did not finish. Inspect the profile before any further step."
         ) from None
     if result.returncode:
         record["status"] = "failed"
@@ -537,6 +661,7 @@ def cluster(config, workspace, plan_id=None, execute=False, overwrite=False, mat
         "profile": snapshot["profile"],
         "kubeconfig": snapshot["kubeconfig"],
         "minikube": snapshot["minikube"],
+        "minikube_home": snapshot["minikube_home"],
         "host": snapshot["host"],
         "cluster": {**config["cluster"]["create"], **config["derived"]["cluster"]},
         "blockers": snapshot["blockers"],

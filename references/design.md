@@ -97,9 +97,9 @@ The command fixes Calico, CSI addons for CSI storage, the Kubernetes version ran
 
 `cluster --overwrite` is the only path that deletes or recreates a profile. It is an operation flag, not a configuration field, because `configure` binds the workspace to its cluster configuration. Turning the flag on must not look like a configuration change. Overwrite reviews record the flag, so plain and overwrite plans cannot stand in for each other.
 
-The trigger is a successful comparison that shows a difference. A failed comparison is not one. A stopped profile may hold intact volumes, so an unreadable cluster blocks instead of being overwritten. Comparisons cover existence, UID, and ownership. Spec drift is excluded: controllers and defaults rewrite fields, and false positives would lead to destructive deletes. Stage plans still handle spec drift.
+Deletion requires a verified difference. The configured context and the API queried inside the running profile must return the same cluster UID. The creation and review records pin the resolved Minikube home. Resource evidence includes the observed UID and ownership label. Stage plans handle spec drift.
 
-The order is delete, recheck, archive, materialize, start. A failed delete leaves the workspace untouched for inspection. Previous files are archived, not deleted, because they hold credentials, state, and diagnostics that cannot be rebuilt. The archive is a same-filesystem rename inside the private workspace. `configure` treats `archive/` as history and never adopts it. The CLI passes `configure` into the cluster helper, which avoids importing the command module.
+Execution reserves a private archive on the workspace filesystem before deletion. After a confirmed delete and a clean host check, it moves the workspace files, prepares the new workspace, and starts the replacement. Shared kubeconfig and Minikube home paths must sit outside the archive. The archive, deletion, and replacement outcomes remain available independently.
 
 ## Plans and execution
 
