@@ -86,6 +86,34 @@ Execution requires `--overwrite --plan-id ID --execute`, with authorization for 
 
 Archiving moves workspace entries other than `.operation.lock` and `archive/` into `archive/<UTC time>-<plan prefix>/`, mode `0700`. The new workspace records the archive and deletion outcome in `reports/cluster-recreated.json`. The replacement start and its binding are reported separately in `reports/cluster.json`, including an uncertain start after a completed deletion. Earlier state, credentials, and plans remain in the archive. Prerequisites, stage plans, and credentials start again from new reviewed plans.
 
+## Delete a created cluster
+
+Use this only with `cluster.mode=create` and a workspace whose creation report records the Minikube home. Choose how to handle the workspace files with `--workspace-files`, which has no default:
+
+| Mode | Workspace files after deletion | Next step |
+|---|---|---|
+| `keep` | Stay in place. `reports/cluster.json` becomes `deleted`, and `reports/cluster-delete.json` records the outcome. | Cluster actions and plain `cluster` refuse. `cluster --overwrite` plans `recreate-missing`, which archives these files first. A later `delete --workspace-files archive` or `purge` handles them without touching Minikube. |
+| `archive` | Move to `archive/<UTC time>-<plan prefix>/`, mode `0700`. The new workspace holds `environment.json`, empty directories, and `reports/cluster-deleted.json`. | A plain `cluster` plan creates a new profile. |
+| `purge` | `environment.json`, `cluster-binding.json`, `stages/`, `state/`, `plans/`, `reports/`, and `credentials/` are removed. When nothing else remains, the workspace directory is removed too. | The result exists only in the command output. Removal is an ordinary unlink, not a secure erase. |
+
+`archive/` is never removed. Purge blocks while the workspace holds any other entry or a symbolic link in place of a known entry. Move those away yourself first.
+
+1. Run `delete --workspace-files MODE`. The plan reports one action:
+
+   | Live evidence | Action | Execution |
+   |---|---|---|
+   | Running profile. Minikube SSH, the configured context, and the creation report agree on the `kube-system` UID and endpoint. | `delete` | `minikube delete --profile=NAME`, then the workspace mode. |
+   | No profile with this name, and no machine or kubeconfig records remain | `already-absent` | The workspace mode only. |
+   | Stopped, invalid, or unreadable profile | blocked | Start it yourself with `minikube start -p NAME` and plan again. |
+   | Identity differs from the creation report | blocked | The profile is not this workspace's cluster. Delete it yourself if that is intended. |
+   | Profile present after a `keep` deletion | blocked | It was created elsewhere. |
+   | Leftover machine or kubeconfig records without a profile | blocked | Inspect and remove them yourself. |
+
+2. Review `data_loss`. It records live UIDs from listable Kubernetes APIs, including PVCs, PVs, ConfigMaps, Secret metadata, and custom resources. A claim needs its own workspace record or a verified live controller reference. A PV needs a verified binding to a managed claim. The presence of an object in a managed or system namespace gives no ownership evidence. Unmanaged objects, including system objects without ownership evidence, require `--include-unmanaged`. Incomplete discovery or list access blocks the plan. A context that references a profile-named cluster or user also blocks deletion.
+3. After authorization of that plan, run `delete --workspace-files MODE [--include-unmanaged] --plan-id ID --execute` with the same options. Execution repeats the live inventory and detects replaced objects by UID. `archive` reserves its directory before deleting anything. `purge` reviews nested artifacts, blocks on unknown entries, and unlinks only the reviewed files.
+
+A failed or timed-out delete, or any profile, machine, or kubeconfig record left afterward, leaves the workspace files in place and the creation report `created`. Krunkit cleanup also requires independent confirmation that every recorded VM process is gone. Other drivers currently report `uncertain` and preserve the workspace files after a delete attempt. The consumed plan preserves this evidence, so absent Minikube records alone cannot authorize cleanup on a retry. If handling the workspace files fails after a confirmed deletion, the error reports both outcomes.
+
 ## Workspace and identity
 
 Use a private directory, for example `/private/path/foo-dev`. New helper-created directories request mode `0700`. JSON files and new lock files request `0600`. The directory check requires the current user's UID and no group or other permissions. It does not require exact owner permission bits or change existing permissions.

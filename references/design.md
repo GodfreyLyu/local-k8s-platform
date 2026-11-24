@@ -14,7 +14,7 @@ This skill configures a local development platform on an existing or newly creat
 | I/O helpers | Check directories, replace JSON files, lock the workspace, and invoke commands. | Local artifacts and captured command results. |
 | Terraform assets | Manage selected resources with separate state for each stage. | Saved plans and resources. |
 | Credential helper | Prepare credentials and write fixed Secrets outside Terraform. | Protected credentials and application-local Secret references. |
-| Cluster helper | Plan and run one `minikube start` for an explicitly named profile. It also handles reviewed overwrites of a profile this workspace created. | Review record, creation report, reconciliation report, workspace archive, and suggested API addresses. |
+| Cluster helper | Plan and run one `minikube start` for an explicitly named profile. It also handles reviewed overwrites and deletions of a profile this workspace created. | Review record, creation report, reconciliation report, deletion report, workspace archive, and suggested API addresses. |
 | Prerequisite helper | Reuse compatible dependencies and create missing reviewed resources or local packages. | Saved manifests, plan IDs, ownership evidence, and partial-result reports. |
 | Runtime checks | Check cluster identity, ownership, prerequisites, and readiness. | Inventory, plan review, and acceptance status. |
 | Capacity helper | Estimate joint Pod memory and volume placement from current evidence. | Suggested allocations and remaining node capacity. |
@@ -95,11 +95,15 @@ The smoke Pod stays outside Terraform state, as in the reference design. The `gp
 
 The command fixes Calico, CSI addons for CSI storage, the Kubernetes version range, and `--keep-context=true`. A successful start must establish a workspace binding with the cluster's API endpoint and `kube-system` UID. Later inspections and writes compare the observed identity with the binding and creation report. Restart and resize stay operator decisions.
 
-`cluster --overwrite` is the only path that deletes or recreates a profile. It is an operation flag, not a configuration field, because `configure` binds the workspace to its cluster configuration. Turning the flag on must not look like a configuration change. Overwrite reviews record the flag, so plain and overwrite plans cannot stand in for each other.
+`cluster --overwrite` is the only path that recreates a profile. It and `delete` are the only paths that delete one. It is an operation flag, not a configuration field, because `configure` binds the workspace to its cluster configuration. Turning the flag on must not look like a configuration change. Overwrite reviews record the flag, so plain and overwrite plans cannot stand in for each other.
 
 Deletion requires a verified difference. The configured context and the API queried inside the running profile must return the same cluster UID. The creation and review records pin the resolved Minikube home. Resource evidence includes the observed UID and ownership label. Stage plans handle spec drift.
 
 Execution reserves a private archive on the workspace filesystem before deletion. After a confirmed delete and a clean host check, it moves the workspace files, prepares the new workspace, and starts the replacement. Shared kubeconfig and Minikube home paths must sit outside the archive. The archive, deletion, and replacement outcomes remain available independently.
+
+`delete` requires a verified match between the running profile, the configured context, and the creation report. The review binds `--workspace-files` and `--include-unmanaged`, live object identities, and the workspace inventory. Namespace membership provides no evidence of an object's ownership. Purge adds a nested artifact inventory. The workflow preserves the workspace when the driver cannot confirm VM removal. Delete and overwrite retain separate plan directories.
+
+Workspace files change only after a confirmed delete and a clean host check. `keep` marks the creation report `deleted` instead of removing the binding. That status closes every cluster-contacting action. A later overwrite treats the profile as missing and archives the kept files first. A profile that appears under the same name after a kept deletion was created elsewhere, so it is never deleted or overwritten. `purge` removes only the entries `configure` and the helpers write. It is the one path that removes workspace history, and it still leaves `archive/` alone.
 
 ## Plans and execution
 

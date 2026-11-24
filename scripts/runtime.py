@@ -131,9 +131,10 @@ def _check(report: dict, name: str, passed: bool, detail: object) -> None:
     )
 
 
-# Inputs: configuration and workspace. Outputs: a complete creation report for this target, or None.
-# Purpose: require identity observed during creation before running later stages. Dependencies: private JSON report.
-def _creation_report(config: dict, workspace: Path) -> dict | None:
+# Inputs: configuration, workspace, and the required report status. Outputs: a complete creation report
+# for this target, or None. Purpose: require identity observed during creation before later stages;
+# "deleted" reads a report whose profile this workspace deleted. Dependencies: private JSON report.
+def _creation_report(config: dict, workspace: Path, status: str = "created") -> dict | None:
     try:
         report = read_json(workspace / "reports" / "cluster.json")
     except FileNotFoundError:
@@ -142,7 +143,7 @@ def _creation_report(config: dict, workspace: Path) -> dict | None:
     identity = report.get("identity") if isinstance(report, dict) else None
     if (
         not isinstance(identity, dict)
-        or report.get("status") != "created"
+        or report.get("status") != status
         or report.get("profile") != cluster["name"]
         or identity.get("context") != cluster["context"]
         or identity.get("kubeconfig") != cluster["kubeconfig"]

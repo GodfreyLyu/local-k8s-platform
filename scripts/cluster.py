@@ -1,5 +1,6 @@
-"""Purpose: create one explicitly named Minikube profile through a reviewed plan, and recreate it only
-through a separately reviewed overwrite plan for a profile this workspace created."""
+"""Purpose: create one explicitly named Minikube profile through a reviewed plan, recreate it only
+through a separately reviewed overwrite plan, and delete it only through a separately reviewed delete
+plan, both for a profile this workspace created."""
 
 import datetime as dt
 import json
@@ -10,6 +11,7 @@ import sys
 from contextlib import nullcontext, suppress
 from pathlib import Path
 
+import delete_safety
 import runtime
 import secret_metadata
 from io_utils import private_dir, read_json, run, sha256, write_json
@@ -19,6 +21,7 @@ START_TIMEOUT_SECONDS = 1800
 DELETE_TIMEOUT_SECONDS = 600
 # Workspace entries that survive an archive: the held lock and earlier archives.
 ARCHIVE_KEEP = {".operation.lock", "archive"}
+WORKSPACE_FILES = ("keep", "archive", "purge")
 CRD_RESOURCES = {*runtime.MANIFEST_KINDS.values(), "prometheuses.monitoring.coreos.com"}
 # Unix sockets that a driver creates in each machine directory. krunkit binds its REST API and
 # vmnet-helper network sockets there; other drivers are not checked because their names are unverified.
@@ -101,11 +104,11 @@ def _profile_exists(command, home, name):
     raise RuntimeError("Cannot list Minikube profiles; inspect the Minikube installation.")
 
 
-# Inputs: kubeconfig path and profile name. Outputs: the kinds of conflicting kubeconfig entries.
-# Purpose: preserve all entries Minikube could overwrite. Dependencies: non-raw kubectl config view.
-def _kubeconfig_conflicts(kubeconfig, name):
+# Inputs: kubeconfig path. Outputs: decoded config with credentials redacted.
+# Purpose: inspect entry names and references. Dependencies: non-raw kubectl config view.
+def _kubeconfig_view(kubeconfig):
     if not _record_exists(kubeconfig):
-        return []
+        return {}
     result = run(
         ["kubectl", "--kubeconfig", str(kubeconfig), "config", "view", "-o", "json"],
         timeout=20,
@@ -118,6 +121,13 @@ def _kubeconfig_conflicts(kubeconfig, name):
         raise RuntimeError("Cannot decode the selected kubeconfig.") from None
     if not isinstance(view, dict) or view.get("kind") != "Config":
         raise RuntimeError("Cannot decode the selected kubeconfig.")
+    return view
+
+
+# Inputs: kubeconfig path and profile name. Outputs: kinds of conflicting entries.
+# Purpose: preserve all entries Minikube could overwrite. Dependencies: _kubeconfig_view.
+def _kubeconfig_conflicts(kubeconfig, name):
+    view = _kubeconfig_view(kubeconfig)
     conflicts = []
     for kind in ("context", "cluster", "user"):
         entries = view.get(kind + "s")
@@ -130,6 +140,17 @@ def _kubeconfig_conflicts(kubeconfig, name):
         if any(item["name"] == name for item in entries):
             conflicts.append(kind)
     return conflicts
+
+
+# Inputs: config path and profile name. Outputs: other contexts using profile-named entries.
+# Purpose: prevent Minikube deletion from breaking another context. Dependencies: kubectl.
+def _shared_kubeconfig_contexts(kubeconfig, name):
+    return sorted(
+        entry["name"]
+        for entry in _kubeconfig_view(kubeconfig).get("contexts") or []
+        if entry["name"] != name
+        and any(entry["context"].get(key) == name for key in ("cluster", "user"))
+    )
 
 
 # Inputs: resolved configuration and Minikube command prefix. Outputs: fixed argument list.
@@ -343,6 +364,55 @@ def _profile_uid(config, snapshot):
     return uid
 
 
+# Inputs: configuration and host snapshot. Outputs: the context's identity, verified against the guest.
+# Purpose: prove the configured context reaches the running local profile. Dependencies: Minikube SSH, kubectl.
+def _verified_identity(config, snapshot):
+    profile_uid = _profile_uid(config, snapshot)
+    observed = runtime._identity(config)
+    if profile_uid != observed["kube_system_uid"]:
+        raise RuntimeError("The selected context does not reach the running local profile.")
+    return observed
+
+
+# Inputs: recorded and observed identities. Outputs: whether they name the same cluster.
+# Purpose: compare durable identity fields only. Dependencies: none.
+def _same_identity(recorded, observed):
+    # The kubeconfig hash changes with unrelated profiles; identity is the endpoint and kube-system UID.
+    keys = ("context", "kubeconfig", "server", "kube_system_uid")
+    return all(recorded.get(key) == observed[key] for key in keys)
+
+
+# Inputs: resolved configuration and workspace. Outputs: (creation report, deleted flag), or (None, False).
+# Purpose: accept a profile this workspace created, including one it later deleted. Dependencies: runtime reports.
+def _workspace_creation(config, workspace):
+    report = runtime._creation_report(config, workspace)
+    if report is not None:
+        return report, False
+    report = runtime._creation_report(config, workspace, status="deleted")
+    return report, report is not None
+
+
+# Inputs: workspace, host snapshot, and creation report. Outputs: blocker text, or None.
+# Purpose: pin the creation home and keep shared paths outside archived or purged files. Dependencies: none.
+def _home_blocker(workspace, snapshot, creation):
+    home = Path(snapshot["minikube_home"])
+    if not creation.get("minikube_home"):
+        return "The creation report has no recorded Minikube home to verify."
+    if creation["minikube_home"] != str(home):
+        return "The resolved Minikube home differs from the creation report."
+    if (
+        home.is_relative_to(workspace)
+        or workspace.is_relative_to(home)
+        or Path(snapshot["kubeconfig"]).is_relative_to(workspace)
+        or Path(snapshot["home_argument"]).is_relative_to(workspace)
+    ):
+        return (
+            "This requires separate archive paths. Keep Minikube home and kubeconfig outside the "
+            "workspace and the workspace outside Minikube home."
+        )
+    return None
+
+
 # Inputs: configuration, one recorded reference, CRD cache and optional metadata socket.
 # Outputs: live metadata, or None when absent.
 # Purpose: read existence and ownership without loading Secret data. Dependencies: kubectl GET.
@@ -364,17 +434,12 @@ def _live(config, reference, crds, socket_path):
 # Purpose: compare the live cluster with the recorded identity, Terraform state, and other objects this
 # workspace created; raises RuntimeError when the cluster cannot be read. Dependencies: kubectl, private files.
 def _reconcile(config, workspace, snapshot, creation):
-    profile_uid = _profile_uid(config, snapshot)
     recorded = creation["identity"]
     kubeconfig = Path(snapshot["kubeconfig"])
     config_hash = sha256(kubeconfig)
-    observed = runtime._identity(config)
-    if profile_uid != observed["kube_system_uid"]:
-        raise RuntimeError("The selected context does not reach the running local profile.")
-    # The kubeconfig hash changes with unrelated profiles; identity is the endpoint and kube-system UID.
-    keys = ("context", "kubeconfig", "server", "kube_system_uid")
+    observed = _verified_identity(config, snapshot)
     identity = {
-        "status": "match" if all(recorded.get(k) == observed[k] for k in keys) else "mismatch",
+        "status": "match" if _same_identity(recorded, observed) else "mismatch",
         "recorded": {key: recorded.get(key) for key in ("server", "kube_system_uid")},
         "observed": {key: observed[key] for key in ("server", "kube_system_uid")},
     }
@@ -431,32 +496,28 @@ def _reconcile(config, workspace, snapshot, creation):
 def _overwrite_snapshot(config, workspace):
     snapshot = _snapshot(config)
     name = config["cluster"]["name"]
-    creation = runtime._creation_report(config, workspace)
+    creation, deleted = _workspace_creation(config, workspace)
     snapshot.update(reconcile=None, delete_command=None)
-    home = Path(snapshot["minikube_home"])
-    kubeconfig = Path(snapshot["kubeconfig"])
-    blocker = None
-    if creation is None or not creation.get("minikube_home"):
-        blocker = "The creation report has no recorded Minikube home to verify for overwrite."
-    elif creation["minikube_home"] != str(home):
-        blocker = "The resolved Minikube home differs from the creation report."
-    elif (
-        home.is_relative_to(workspace)
-        or workspace.is_relative_to(home)
-        or kubeconfig.is_relative_to(workspace)
-        or Path(snapshot["home_argument"]).is_relative_to(workspace)
-    ):
-        blocker = (
-            "Overwrite requires separate archive paths. Keep Minikube home and kubeconfig "
-            "outside the workspace and the workspace outside Minikube home."
-        )
-    if blocker:
+    if blocker := _home_blocker(workspace, snapshot, creation):
         snapshot.update(action="none", blockers=[blocker])
         return snapshot
     if not snapshot["profile_exists"]:
         # Leftover machine or kubeconfig records stay blockers; they are not ours to clean.
+        if _unconfirmed_delete(workspace):
+            snapshot.update(action="none", blockers=["The prior delete has unconfirmed VM removal."])
+            return snapshot
         snapshot["action"] = "recreate-missing"
         return _check_startup(config, snapshot)
+    if deleted:
+        # This workspace deleted its own profile, so a profile with the name now has another creator.
+        snapshot.update(
+            action="none",
+            blockers=[
+                f"This workspace deleted its profile {name}; the existing profile with that name "
+                "was created elsewhere and is never overwritten here."
+            ],
+        )
+        return snapshot
     try:
         reconcile = _reconcile(config, workspace, snapshot, creation)
     except (RuntimeError, ValueError, KeyError, TypeError, OSError) as error:
@@ -700,11 +761,18 @@ def _overwrite_summary(workspace, snapshot):
 # Purpose: one reviewed create workflow plus an explicit overwrite path. Dependencies: private plans.
 def cluster(config, workspace, plan_id=None, execute=False, overwrite=False, materialize=None):
     directory = workspace / "plans" / "cluster"
-    is_created = created(config, workspace)
-    if overwrite and not is_created:
+    creation, deleted = _workspace_creation(config, workspace)
+    is_created = creation is not None and not deleted
+    if overwrite and creation is None:
         raise RuntimeError(
             "--overwrite applies only to a profile this workspace created; without a creation report, "
             "plan a normal creation and inspect any earlier failed attempt first."
+        )
+    if deleted and not overwrite:
+        # The kept state and binding describe the deleted cluster; a new one needs a fresh workspace.
+        raise RuntimeError(
+            "This workspace deleted its profile and kept its files. Use `cluster --overwrite` to "
+            "archive them and recreate the profile, or `delete --workspace-files archive` first."
         )
     if is_created and not overwrite:
         report = read_json(workspace / "reports" / "cluster.json")
@@ -790,3 +858,336 @@ def cluster(config, workspace, plan_id=None, execute=False, overwrite=False, mat
     if overwrite:
         result["overwrite"] = _overwrite_summary(workspace, snapshot)
     return result
+
+
+# Inputs: workspace. Outputs: sorted top-level entry names other than the lock and archives.
+# Purpose: bind the files a delete plan archives or removes to the review. Dependencies: directory listing.
+def _workspace_entries(workspace):
+    return sorted(item.name for item in workspace.iterdir() if item.name not in ARCHIVE_KEEP)
+
+
+# Inputs: workspace. Outputs: whether a prior delete still lacks independent VM confirmation.
+# Purpose: prevent absent Minikube records from bypassing a failed or interrupted removal check.
+def _unconfirmed_delete(workspace):
+    for path in (workspace / "plans" / "cluster-delete").glob("consumed-*.json"):
+        record = read_json(path)
+        if record.get("deletion") in {"uncertain", "failed"} and not delete_safety.machines_removed(
+            record.get("machine_evidence")
+        ):
+            return True
+    return False
+
+
+# Inputs: configuration, workspace, file mode, unmanaged-data acceptance, and optional reviewed ID.
+# Outputs: delete evidence with action delete, already-absent, or none.
+# Purpose: delete only a verified profile this workspace created. Dependencies: _snapshot, _verified_identity.
+def _delete_snapshot(config, workspace, files, include_unmanaged, *, plan_id=None):
+    snapshot = _snapshot(config)
+    name = config["cluster"]["name"]
+    creation, deleted = _workspace_creation(config, workspace)
+    # The start command and its collision blockers describe a new profile, not this deletion.
+    del snapshot["command"]
+    entries = _workspace_entries(workspace)
+    snapshot.update(
+        action="none",
+        blockers=[],
+        delete_command=None,
+        data_loss=None,
+        kubeconfig_sha256=None,
+        workspace_entries=entries,
+        machine_evidence=None,
+    )
+    blockers = snapshot["blockers"]
+    if blocker := _home_blocker(workspace, snapshot, creation):
+        blockers.append(blocker)
+        return snapshot
+    if files == "purge":
+        # The plan cannot contain its own filename before its ID has been computed.
+        exclude = (f"plans/cluster-delete/{plan_id}.json",) if plan_id else ()
+        inventory = delete_safety.purge_inventory(workspace, exclude=exclude)
+        snapshot["purge_inventory"] = inventory
+        if inventory["unknown"]:
+            blockers.append(
+                "Purge found unknown workspace entries. Move them and prepare a new plan: "
+                + ", ".join(inventory["unknown"])
+            )
+    if not snapshot["profile_exists"]:
+        if _unconfirmed_delete(workspace):
+            blockers.append("The prior delete has unconfirmed VM removal. Workspace files are preserved.")
+        leftovers = [
+            *(f"machine {node}" for node in snapshot["machine_conflicts"]),
+            *(f"kubeconfig {kind} {name}" for kind in snapshot["kubeconfig_conflicts"]),
+        ]
+        if leftovers:
+            # Records without a profile are not proven to be ours, so they are never cleaned here.
+            blockers.append(
+                f"Profile {name} is absent but these records remain: {', '.join(leftovers)}. "
+                "Inspect and remove them yourself, then prepare a new plan."
+            )
+        if deleted and files == "keep":
+            blockers.append("This workspace already deleted its profile and kept its files.")
+        snapshot["action"] = "already-absent"
+        return snapshot
+    if deleted:
+        blockers.append(
+            f"This workspace already deleted its profile {name}; the existing profile with that "
+            "name was created elsewhere and is never deleted here."
+        )
+        return snapshot
+    kubeconfig = Path(snapshot["kubeconfig"])
+    try:
+        config_hash = sha256(kubeconfig)
+        if shared := _shared_kubeconfig_contexts(kubeconfig, name):
+            blockers.append("Other kubeconfig contexts use profile entries: " + ", ".join(shared))
+            return snapshot
+        observed = _verified_identity(config, snapshot)
+        if not _same_identity(creation["identity"], observed):
+            snapshot["identity"] = {
+                "recorded": {
+                    key: creation["identity"].get(key) for key in ("server", "kube_system_uid")
+                },
+                "observed": {key: observed[key] for key in ("server", "kube_system_uid")},
+            }
+            blockers.append(
+                f"Profile {name} is not the cluster this workspace created; it is never deleted "
+                "here. Inspect it and delete it yourself if that is intended."
+            )
+            return snapshot
+        data_loss = delete_safety.data_loss(config, workspace)
+        machine_evidence = delete_safety.machine_evidence(Path(snapshot["minikube_home"]), name)
+        if config_hash != sha256(kubeconfig):
+            raise RuntimeError("The selected kubeconfig changed during inspection.")
+    except (RuntimeError, ValueError, KeyError, TypeError, OSError) as error:
+        # A stopped or unreachable profile cannot prove its identity, so it is never deleted.
+        blockers.append(
+            f"Cannot verify profile {name}: {error} Start it yourself with `minikube start -p {name}` "
+            "and prepare a new plan; an unverified profile is never deleted."
+        )
+        return snapshot
+    unmanaged = data_loss["unmanaged"]
+    if not include_unmanaged and any(unmanaged.values()):
+        blockers.append(
+            "The cluster holds unmanaged data listed in data_loss. Prepare a new plan with "
+            "--include-unmanaged to accept its loss."
+        )
+    snapshot.update(
+        action="delete",
+        data_loss=data_loss,
+        kubeconfig_sha256=config_hash,
+        machine_evidence=machine_evidence,
+        delete_command=(
+            _minikube_command(config, snapshot["minikube"]["path"], snapshot["home_argument"])
+            + ["delete", f"--profile={name}"]
+        ),
+    )
+    return snapshot
+
+
+# Inputs: workspace, reviewed inventory, and executing plan ID. Outputs: removed top-level entries.
+# Purpose: verify late workspace changes and unlink approved artifacts while the workspace lock is held.
+def _purge_workspace(workspace, reviewed, plan_id):
+    generated = (
+        f"plans/cluster-delete/{plan_id}.json",
+        f"plans/cluster-delete/consumed-{plan_id}.json",
+    )
+    inventory = delete_safety.purge_inventory(workspace, exclude=generated)
+    if inventory != reviewed:
+        raise RuntimeError("The nested workspace inventory changed after review.")
+    removed = _workspace_entries(workspace)
+    inventory["files"].extend(generated)
+    delete_safety.purge(workspace, inventory)
+    if [item.name for item in workspace.iterdir()] == [".operation.lock"]:
+        # The held descriptor keeps the lock valid; a concurrent new lock makes rmdir fail harmlessly.
+        (workspace / ".operation.lock").unlink()
+        with suppress(OSError):
+            workspace.rmdir()
+    return removed
+
+
+# Inputs: configuration, workspace, reviewed delete record, and the CLI's configure function.
+# Outputs: deletion report. Purpose: delete once, confirm no records remain, then keep, archive, or purge.
+# Dependencies: minikube, kubectl; materialize is passed in to avoid an import cycle.
+def _execute_delete(config, workspace, review, materialize):
+    plan_id, snapshot = review["plan_id"], review["snapshot"]
+    files = review["delete"]["workspace_files"]
+    consumed = workspace / "plans" / "cluster-delete" / f"consumed-{plan_id}.json"
+    report_path = workspace / "reports" / "cluster-delete.json"
+    # The archive is reserved before anything is deleted, so a failure here changes nothing.
+    archive = _reserve_archive(workspace, plan_id) if files == "archive" else None
+    record = {
+        "status": "attempting",
+        "plan_id": plan_id,
+        "profile": snapshot["profile"],
+        "action": snapshot["action"],
+        "workspace_files": files,
+        "deletion": "not-needed",
+        "archive": str(archive) if archive else None,
+        "machine_evidence": snapshot["machine_evidence"],
+    }
+    try:
+        home = _reviewed_home(snapshot)
+        write_json(consumed, record)
+        if snapshot["action"] == "delete":
+            if sha256(Path(snapshot["kubeconfig"])) != snapshot["kubeconfig_sha256"]:
+                raise RuntimeError("The selected kubeconfig changed since review.")
+            record["deletion"] = "uncertain"
+            write_json(consumed, record)
+            try:
+                result = run(snapshot["delete_command"], timeout=DELETE_TIMEOUT_SECONDS)
+            except RuntimeError:
+                record["status"] = "uncertain"
+                raise RuntimeError(
+                    "minikube delete did not finish. Inspect the profile; the workspace files are "
+                    "unchanged."
+                ) from None
+            if result.returncode:
+                record["deletion"] = "failed"
+                raise RuntimeError(
+                    "minikube delete failed. The workspace files are unchanged; inspect the "
+                    "profile before a new plan."
+                )
+            if not delete_safety.machines_removed(snapshot["machine_evidence"]):
+                record["status"] = "uncertain"
+                raise RuntimeError("VM removal could not be confirmed. Workspace files are unchanged.")
+            record["deletion"] = "completed"
+            write_json(consumed, record)
+        _reviewed_home(snapshot)
+        residual = _snapshot(config, home=home)["blockers"]
+        if residual:
+            record["residual"] = residual
+            raise RuntimeError(
+                "Profile, machine, or kubeconfig records remain. The workspace files are unchanged. "
+                + " ".join(residual)
+            )
+    except (RuntimeError, ValueError, OSError):
+        if record["status"] == "attempting":
+            record["status"] = "failed"
+        if archive is not None:
+            with suppress(OSError):
+                archive.rmdir()
+        write_json(consumed, record)
+        write_json(report_path, record)
+        raise
+    record.update(status="deleted", deleted_at=dt.datetime.now(dt.timezone.utc).isoformat())
+    write_json(consumed, record)
+    deletion = "The profile was deleted. " if record["deletion"] == "completed" else ""
+    try:
+        if files == "keep":
+            # A deleted status closes every cluster-contacting action for this workspace.
+            creation, _ = _workspace_creation(config, workspace)
+            write_json(
+                workspace / "reports" / "cluster.json",
+                {
+                    **creation,
+                    "status": "deleted",
+                    "deleted_at": record["deleted_at"],
+                    "delete_plan_id": plan_id,
+                },
+            )
+            write_json(report_path, record)
+        elif files == "archive":
+            _archive_workspace(workspace, archive)
+            materialize(config, workspace)
+            write_json(workspace / "reports" / "cluster-deleted.json", record)
+        else:
+            record["removed"] = _purge_workspace(workspace, snapshot["purge_inventory"], plan_id)
+    except (RuntimeError, ValueError, OSError) as error:
+        raise RuntimeError(
+            f"{deletion}Handling the workspace files ({files}) failed: {error}. Inspect the "
+            "workspace before any new plan."
+        ) from None
+    return record
+
+
+# Inputs: create-mode configuration, workspace, workspace-file mode, optional reviewed ID, execution
+# and unmanaged-data flags, and the CLI's configure function. Outputs: plan, preview, or deletion report.
+# Purpose: reviewed deletion of a profile this workspace created. Dependencies: private plans.
+def delete(
+    config, workspace, files, plan_id=None, execute=False, include_unmanaged=False, materialize=None
+):
+    directory = workspace / "plans" / "cluster-delete"
+    if _workspace_creation(config, workspace)[0] is None:
+        raise RuntimeError(
+            "delete applies only to a profile this workspace created; this workspace has no "
+            "complete creation report."
+        )
+    options = {"workspace_files": files, "include_unmanaged": include_unmanaged}
+    if plan_id is None:
+        private_dir(directory)
+        review = {
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "config_sha256": runtime._digest(config),
+            "source_hashes": _sources(),
+            "delete": options,
+            "snapshot": _delete_snapshot(config, workspace, files, include_unmanaged),
+        }
+        review["plan_id"] = runtime._digest(review)
+        write_json(directory / f"{review['plan_id']}.json", review)
+    else:
+        try:
+            review = read_json(directory / f"{plan_id}.json")
+        except FileNotFoundError:
+            raise RuntimeError("This workspace has no delete plan with that ID.") from None
+        recorded = review.pop("plan_id")
+        if recorded != plan_id or runtime._digest(review) != plan_id:
+            raise RuntimeError("Delete plan ID or contents changed; prepare a fresh plan.")
+        review["plan_id"] = recorded
+        if review["delete"] != options:
+            raise RuntimeError(
+                "This delete plan was prepared with different --workspace-files or "
+                "--include-unmanaged options; repeat them exactly."
+            )
+        if (directory / f"consumed-{plan_id}.json").exists():
+            raise RuntimeError(
+                "Delete plan was consumed; inspect the profile and its report before any new plan."
+            )
+        if (
+            review["config_sha256"] != runtime._digest(config)
+            or review["source_hashes"] != _sources()
+        ):
+            raise RuntimeError("Configuration or sources changed; prepare a fresh delete plan.")
+        if review["snapshot"]["blockers"]:
+            raise RuntimeError("The reviewed delete plan is blocked; resolve it and prepare a new plan.")
+        if execute:
+            if _delete_snapshot(config, workspace, files, include_unmanaged, plan_id=plan_id) != review["snapshot"]:
+                raise RuntimeError(
+                    "Host, Minikube, profile, identity, cluster data, or workspace evidence changed "
+                    "since review; prepare a fresh plan."
+                )
+            return _execute_delete(config, workspace, review, materialize)
+    snapshot = review["snapshot"]
+    effects = {
+        "keep": "Workspace files stay in place and the creation report becomes `deleted`; "
+        "cluster actions stop. `cluster --overwrite` can later archive them and recreate the profile.",
+        "archive": "Every workspace file moves to the archive directory, and the workspace starts "
+        "again empty for a new `cluster` plan.",
+        "purge": "Workspace files this skill wrote are removed, including credentials; `archive/` "
+        "stays. Removal is an ordinary unlink, not a secure erase.",
+    }[files]
+    if snapshot["action"] == "delete":
+        effects = (
+            "All data on the profile is lost, including PersistentVolumes and objects this "
+            "environment does not manage. Shared Minikube caches, other profiles, and host mounts "
+            "are untouched. " + effects
+        )
+        if snapshot["machine_evidence"]["pids"] is None:
+            effects += " Native VM removal cannot be verified for this driver. Workspace files will be kept."
+    return {
+        "status": "blocked" if snapshot["blockers"] else "planned" if plan_id is None else "preview",
+        "plan_id": review["plan_id"],
+        "review": str(directory / f"{review['plan_id']}.json"),
+        "profile": snapshot["profile"],
+        "kubeconfig": snapshot["kubeconfig"],
+        "minikube": snapshot["minikube"],
+        "minikube_home": snapshot["minikube_home"],
+        "action": snapshot["action"],
+        "delete_command": snapshot["delete_command"],
+        "workspace_files": files,
+        "include_unmanaged": include_unmanaged,
+        "data_loss": snapshot["data_loss"],
+        "machine_evidence": snapshot["machine_evidence"],
+        "identity": snapshot.get("identity"),
+        "effects": effects,
+        "blockers": snapshot["blockers"],
+        "requires_execute": not snapshot["blockers"],
+    }

@@ -14,6 +14,7 @@ from unittest.mock import patch
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import cluster as cluster_module
+import delete_safety
 import runtime
 import secret_metadata
 from config import load_config
@@ -59,6 +60,7 @@ elif arguments[:1] == ["start"]:
     state["contexts"].append(name)
     state["clusters"].append(name)
     state["users"].append(name)
+    state["vm_present"] = True
     path.write_text(json.dumps(state))
 elif arguments[:1] == ["ssh"]:
     if state.get("stopped") or state.get("unreachable") or not any(arg.startswith("--profile=") for arg in arguments):
@@ -79,6 +81,8 @@ elif arguments[:1] == ["delete"]:
     for key in keys:
         state[key] = [item for item in state[key] if item != name]
     state["objects"] = {}
+    if not state.get("retain_vm"):
+        state["vm_present"] = False
     path.write_text(json.dumps(state))
 else:
     sys.exit(64)
@@ -101,10 +105,10 @@ if "view" in arguments:
         print(json.dumps({
             "kind": "Config",
             "contexts": [
-                {"name": name, "context": {
+                {"name": name, "context": state.get("context_refs", {}).get(name, {
                     "cluster": (state["clusters"] or [name])[0],
                     "user": (state["users"] or [name])[0],
-                }}
+                })}
                 for name in state["contexts"]
             ],
             "clusters": [{"name": name} for name in state["clusters"]],
@@ -112,8 +116,27 @@ if "view" in arguments:
         }))
 elif state.get("unreachable"):
     sys.exit(1)
+elif "api-resources" in arguments:
+    if state.get("incomplete_discovery"):
+        sys.exit(1)
+    namespaced = "--namespaced=true" in arguments
+    core = {"configmaps", "persistentvolumeclaims", "secrets"} if namespaced else {"namespaces", "persistentvolumes"}
+    observed = {kind for kind, ns, _ in (key.split("/", 2) for key in state.get("objects", {})) if bool(ns) == namespaced}
+    print("\\n".join(sorted(core | observed)))
 elif "namespaces" in arguments and "kube-system" in arguments:
     print(json.dumps({"metadata": {"uid": state["uid"]}}))
+elif "get" in arguments and arguments[arguments.index("get") + 2].startswith("-"):
+    resource = arguments[arguments.index("get") + 1]
+    if resource in state.get("denied_resources", []):
+        sys.exit(1)
+    items = []
+    for key, item in sorted(state.get("objects", {}).items()):
+        kind, namespace, name = key.split("/", 2)
+        if kind == resource:
+            metadata = {key: value for key, value in item.items() if key not in {"spec", "status"}}
+            payload = {key: item[key] for key in ("spec", "status") if key in item}
+            items.append({**payload, "metadata": {**metadata, "name": name, **({"namespace": namespace} if namespace else {})}})
+    print(json.dumps({"kind": "List", "items": items}))
 elif "get" in arguments:
     index = arguments.index("get")
     resource, name = arguments[index + 1], arguments[index + 2]
@@ -189,6 +212,17 @@ class ClusterTests(unittest.TestCase):
         request.start()
         self.addCleanup(proxy.stop)
         self.addCleanup(request.stop)
+        machine = patch.object(
+            delete_safety, "machine_evidence", return_value={"driver": "krunkit", "pids": [12345]}
+        )
+        process = patch.object(
+            delete_safety, "_process_exists",
+            side_effect=lambda pid: json.loads(self.state.read_text()).get("vm_present", False),
+        )
+        machine.start()
+        process.start()
+        self.addCleanup(machine.stop)
+        self.addCleanup(process.stop)
         # Temporary roots can exceed the real socket limit; the dedicated tests set exact limits.
         limit = patch.object(cluster_module, "SOCKET_PATH_MAX", 4096)
         limit.start()
@@ -208,6 +242,19 @@ class ClusterTests(unittest.TestCase):
     # Purpose: exercise content negotiation and error handling without binding a socket.
     def metadata_request(self, path, route, accept):
         self.assertEqual(path, self.root / "api.sock")
+        if route == "/api/v1/secrets":
+            self.assertEqual(accept, "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1")
+            state = json.loads(self.state.read_text())
+            if state.get("secret_api_denied"):
+                return 403, {}
+            items = []
+            for key, item in state.get("objects", {}).items():
+                resource, namespace, name = key.split("/", 2)
+                if resource == "secrets":
+                    items.append({"metadata": {**item, "name": name, "namespace": namespace}})
+            return 200, {
+                "kind": "PartialObjectMetadataList", "apiVersion": "meta.k8s.io/v1", "items": items
+            }
         self.assertEqual(accept, "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1")
         _, api, version, namespaced, namespace, resource, name = route.split("/")
         self.assertEqual((api, version, namespaced, resource), ("api", "v1", "namespaces", "secrets"))
@@ -1259,6 +1306,463 @@ class ClusterTests(unittest.TestCase):
                 )
                 self.assertEqual(consumed["status"], "failed")
                 self.assertEqual(self.count("start"), 1)
+
+    # Inputs: delete arguments after the action name. Outputs: plan report. Purpose: plan one deletion.
+    # Dependencies: the CLI boundary.
+    def plan_delete(self, files, *extra):
+        return self.cli("delete", "--workspace-files", files, *extra)
+
+    # Inputs: reviewed plan, workspace-file mode, and extra flags. Outputs: exit status and report.
+    # Purpose: execute exactly the reviewed deletion. Dependencies: the CLI boundary.
+    def execute_delete(self, planned, files, *extra):
+        return self.cli(
+            "delete", "--workspace-files", files, *extra, "--plan-id", planned["plan_id"], "--execute"
+        )
+
+    # Inputs: none. Outputs: live and recorded data for a healthy delete target.
+    # Purpose: ensure the fixture's CRD and Secret have the same ownership as installed resources.
+    def record_delete_objects(self):
+        self.record_objects()
+        objects = json.loads(self.state.read_text())["objects"]
+        labels = load_config(self.source)["derived"]["labels"]
+        crd = "customresourcedefinitions.apiextensions.k8s.io"
+        topic = "kafkatopics.kafka.strimzi.io"
+        objects[f"{crd}//{topic}"]["labels"] = labels
+        objects["secrets/atlas-app/pg-client"]["labels"] = labels
+        self.update_state(objects=objects)
+        write_json(self.workspace / "state" / "recorded-objects.json", [
+            {"source": "prerequisites", "resource": crd, "namespace": None, "name": topic, "uid": None}
+        ])
+
+    # Inputs: none. Outputs: none. Purpose: remove the profile outside this workflow.
+    # Dependencies: fake Minikube home layout and state.
+    def remove_profile(self):
+        profile = self.root / "minikube-home" / ".minikube" / "profiles" / "atlas-dev"
+        (profile / "config.json").unlink()
+        profile.rmdir()
+        state = json.loads(self.state.read_text())
+        for key in ("valid", "contexts", "clusters", "users"):
+            state[key] = [item for item in state[key] if item != "atlas-dev"]
+        self.state.write_text(json.dumps(state), encoding="utf-8")
+
+    # Inputs: a verified profile. Outputs: deletion with kept files and a deleted report.
+    # Purpose: keep mode closes cluster actions and allows recreation only through overwrite.
+    # Dependencies: fake tools.
+    def test_delete_keep_marks_the_report_and_blocks_cluster_actions(self):
+        self.create()
+        self.record_delete_objects()
+        status, planned = self.plan_delete("keep")
+        self.assertEqual((status, planned["status"]), (0, "planned"), planned)
+        self.assertEqual(planned["action"], "delete")
+        self.assertEqual(planned["delete_command"][-2:], ["delete", "--profile=atlas-dev"])
+        self.assertIn("namespaces atlas", planned["data_loss"]["managed_objects"])
+        self.assertIn("lost", planned["effects"])
+        self.assertEqual(self.count("delete"), 0)
+        status, report = self.execute_delete(planned, "keep")
+        self.assertEqual((status, report["status"]), (0, "deleted"), report)
+        self.assertEqual((report["deletion"], self.count("delete")), ("completed", 1))
+        for call in self.calls():
+            if call["argv"][0] in {"delete", "ssh"}:
+                self.assertEqual(call["home"], str(self.root / "minikube-home" / ".minikube"))
+        cluster_report = read_json(self.workspace / "reports" / "cluster.json")
+        self.assertEqual((cluster_report["status"], cluster_report["delete_plan_id"]), ("deleted", planned["plan_id"]))
+        self.assertTrue((self.workspace / "state" / "00-bootstrap.tfstate").exists())
+        self.assertTrue((self.workspace / "cluster-binding.json").exists())
+        self.assertEqual(read_json(self.workspace / "reports" / "cluster-delete.json")["status"], "deleted")
+        status, refused = self.cli("inspect")
+        self.assertEqual(status, 2)
+        self.assertIn("not created yet", refused["error"])
+        status, refused = self.cli("cluster")
+        self.assertEqual(status, 2)
+        self.assertIn("--overwrite", refused["error"])
+        status, replay = self.execute_delete(planned, "keep")
+        self.assertEqual(status, 2)
+        self.assertIn("consumed", replay["error"])
+        status, blocked = self.plan_delete("keep")
+        self.assertEqual(status, 2, blocked)
+        self.assertIn("already deleted", blocked["blockers"][0])
+        status, recreate = self.cli("cluster", "--overwrite")
+        self.assertEqual((status, recreate["overwrite"]["action"]), (0, "recreate-missing"), recreate)
+        self.write_state(uid="cluster-b", server="https://cluster-b.invalid")
+        with patch.object(runtime, "_api_peers", return_value=set()):
+            status, created = self.cli(
+                "cluster", "--overwrite", "--plan-id", recreate["plan_id"], "--execute"
+            )
+        self.assertEqual((status, created["status"]), (0, "created"), created)
+        archived = read_json(Path(created["archive"]) / "reports" / "cluster.json")
+        self.assertEqual(archived["status"], "deleted")
+
+    # Inputs: a profile recreated elsewhere after a kept deletion. Outputs: blocked delete and overwrite.
+    # Purpose: never touch a profile this workspace did not create. Dependencies: fake tools.
+    def test_kept_deletion_never_claims_a_new_profile_with_the_name(self):
+        self.create()
+        _, planned = self.plan_delete("keep")
+        self.assertEqual(self.execute_delete(planned, "keep")[0], 0)
+        profile = self.root / "minikube-home" / ".minikube" / "profiles" / "atlas-dev"
+        profile.mkdir(parents=True)
+        (profile / "config.json").write_text(json.dumps({"KubernetesConfig": {"KubernetesVersion": "v1.34.0"}}))
+        self.update_state(valid=["atlas-dev"], contexts=["atlas-dev"], uid="cluster-z")
+        for arguments in (("delete", "--workspace-files", "purge"), ("cluster", "--overwrite")):
+            with self.subTest(arguments=arguments):
+                status, blocked = self.cli(*arguments)
+                self.assertEqual(status, 2, blocked)
+                self.assertIn("created elsewhere", blocked["blockers"][0])
+        self.assertEqual(self.count("delete"), 1)
+
+    # Inputs: a verified profile. Outputs: deletion, archived files, and a fresh workspace.
+    # Purpose: archive mode preserves history and allows a new create plan. Dependencies: fake tools.
+    def test_delete_archive_moves_files_and_allows_a_new_cluster(self):
+        self.create()
+        self.record_delete_objects()
+        _, planned = self.plan_delete("archive")
+        status, report = self.execute_delete(planned, "archive")
+        self.assertEqual((status, report["status"]), (0, "deleted"), report)
+        archive = Path(report["archive"])
+        self.assertEqual((archive.parent, archive.stat().st_mode & 0o777), (self.workspace / "archive", 0o700))
+        self.assertTrue((archive / "state" / "00-bootstrap.tfstate").is_file())
+        self.assertTrue((archive / "plans" / "cluster-delete" / f"consumed-{planned['plan_id']}.json").is_file())
+        self.assertFalse((self.workspace / "state" / "00-bootstrap.tfstate").exists())
+        self.assertFalse((self.workspace / "cluster-binding.json").exists())
+        self.assertEqual(read_json(self.workspace / "reports" / "cluster-deleted.json")["archive"], str(archive))
+        status, refused = self.execute_delete(planned, "archive")
+        self.assertEqual(status, 2)
+        self.assertIn("applies only", refused["error"])
+        status, fresh = self.cli("cluster")
+        self.assertEqual((status, fresh["status"]), (0, "planned"), fresh)
+
+    # Inputs: workspaces with and without archives or unknown files. Outputs: purge results.
+    # Purpose: remove only skill-written files and keep archives. Dependencies: fake tools.
+    def test_delete_purge_removes_only_skill_files(self):
+        self.create()
+        self.record_delete_objects()
+        (self.workspace / "notes.txt").write_text("user data", encoding="utf-8")
+        status, blocked = self.plan_delete("purge")
+        self.assertEqual(status, 2, blocked)
+        self.assertIn("notes.txt", blocked["blockers"][0])
+        (self.workspace / "notes.txt").unlink()
+        history = self.workspace / "archive" / "earlier"
+        history.mkdir(parents=True, mode=0o700)
+        (self.workspace / "archive").chmod(0o700)
+        _, planned = self.plan_delete("purge")
+        status, report = self.execute_delete(planned, "purge")
+        self.assertEqual((status, report["status"]), (0, "deleted"), report)
+        self.assertIn("credentials", report["removed"])
+        self.assertEqual(sorted(item.name for item in self.workspace.iterdir()), [".operation.lock", "archive"])
+        self.assertTrue(history.is_dir())
+        self.assertEqual(self.count("delete"), 1)
+
+        self.setUp()
+        self.create()
+        _, planned = self.plan_delete("purge")
+        status, report = self.execute_delete(planned, "purge")
+        self.assertEqual((status, report["status"]), (0, "deleted"), report)
+        self.assertFalse(self.workspace.exists())
+        self.assertTrue(self.kubeconfig.exists())
+
+    # Inputs: stopped, repointed, and replaced profiles. Outputs: blocked plans and no deletion.
+    # Purpose: delete only a profile whose identity matches the creation report. Dependencies: fake SSH.
+    def test_delete_refuses_unverified_or_foreign_profiles(self):
+        cases = {
+            "stopped": ({"stopped": True}, "running local profile"),
+            "repointed": ({"uid": "foreign", "local_uid": "cluster-a"}, "does not reach"),
+            "replaced": ({"uid": "cluster-c"}, "not the cluster this workspace created"),
+        }
+        for name, (fields, message) in cases.items():
+            with self.subTest(case=name):
+                self.setUp()
+                self.create()
+                self.update_state(**fields)
+                status, blocked = self.plan_delete("keep")
+                self.assertEqual((status, blocked["status"]), (2, "blocked"), blocked)
+                self.assertIn(message, blocked["blockers"][0])
+                self.assertFalse(blocked["requires_execute"])
+                status, refused = self.execute_delete(blocked, "keep")
+                self.assertEqual(status, 2)
+                self.assertIn("blocked", refused["error"])
+                self.assertEqual(self.count("delete"), 0)
+                self.assertEqual(read_json(self.workspace / "reports" / "cluster.json")["status"], "created")
+
+    # Inputs: namespaces and claims outside managed state. Outputs: blocked plan until accepted.
+    # Purpose: state unmanaged data loss and require explicit acceptance. Dependencies: fake list reads.
+    def test_unmanaged_data_requires_explicit_acceptance(self):
+        self.create()
+        self.record_delete_objects()
+        objects = json.loads(self.state.read_text())["objects"]
+        objects.update({
+            "namespaces//shop": {"uid": "ns-shop"},
+            "persistentvolumeclaims/shop/orders": {"uid": "pvc-shop"},
+            "persistentvolumeclaims/atlas/data-postgres-0": {"uid": "pvc-pg"},
+        })
+        self.update_state(objects=objects)
+        status, blocked = self.plan_delete("archive")
+        self.assertEqual(status, 2, blocked)
+        self.assertIn("--include-unmanaged", blocked["blockers"][0])
+        self.assertEqual(
+            blocked["data_loss"]["unmanaged"],
+            {
+                "namespaces": ["shop"],
+                "persistent_volume_claims": ["atlas/data-postgres-0", "shop/orders"],
+                "persistent_volumes": [],
+                "objects": [],
+            },
+        )
+        self.assertIn("atlas/data-postgres-0", blocked["data_loss"]["persistent_volume_claims"])
+        status, planned = self.plan_delete("archive", "--include-unmanaged")
+        self.assertEqual((status, planned["status"]), (0, "planned"), planned)
+        status, refused = self.execute_delete(planned, "archive")
+        self.assertEqual(status, 2)
+        self.assertIn("repeat them exactly", refused["error"])
+        status, refused = self.execute_delete(planned, "keep", "--include-unmanaged")
+        self.assertEqual(status, 2)
+        self.assertIn("repeat them exactly", refused["error"])
+        objects["persistentvolumeclaims/shop/invoices"] = {"uid": "pvc-new"}
+        self.update_state(objects=objects)
+        status, refused = self.execute_delete(planned, "archive", "--include-unmanaged")
+        self.assertEqual(status, 2)
+        self.assertIn("changed since review", refused["error"])
+        self.assertEqual(self.count("delete"), 0)
+        _, planned = self.plan_delete("archive", "--include-unmanaged")
+        status, report = self.execute_delete(planned, "archive", "--include-unmanaged")
+        self.assertEqual((status, report["status"]), (0, "deleted"), report)
+
+    # Inputs: a failed delete and residual kubeconfig records. Outputs: unchanged workspace files.
+    # Purpose: change workspace files only after a confirmed, clean deletion. Dependencies: fake tools.
+    def test_failed_or_incomplete_profile_delete_keeps_workspace_files(self):
+        for flag, message in (("fail_delete", "delete failed"), ("keep_context", "records remain")):
+            with self.subTest(flag=flag):
+                self.setUp()
+                self.create()
+                self.record_delete_objects()
+                self.update_state(**{flag: True})
+                _, planned = self.plan_delete("archive")
+                status, refused = self.execute_delete(planned, "archive")
+                self.assertEqual(status, 2, refused)
+                self.assertIn(message, refused["error"])
+                self.assertIn("unchanged", refused["error"])
+                self.assertEqual(list((self.workspace / "archive").iterdir()), [])
+                self.assertTrue((self.workspace / "state" / "00-bootstrap.tfstate").exists())
+                self.assertEqual(read_json(self.workspace / "reports" / "cluster.json")["status"], "created")
+                result = read_json(self.workspace / "reports" / "cluster-delete.json")
+                self.assertEqual((result["status"], result["plan_id"]), ("failed", planned["plan_id"]))
+
+    # Inputs: a profile removed outside this workflow, with and without leftover records.
+    # Outputs: workspace-only handling without minikube delete. Dependencies: fake tools.
+    def test_already_absent_profile_changes_only_workspace_files(self):
+        self.create()
+        self.remove_profile()
+        self.update_state(contexts=["atlas-dev"])
+        status, blocked = self.plan_delete("keep")
+        self.assertEqual(status, 2, blocked)
+        self.assertIn("kubeconfig context atlas-dev", blocked["blockers"][0])
+        self.update_state(contexts=[])
+        status, planned = self.plan_delete("keep")
+        self.assertEqual((status, planned["action"], planned["delete_command"]), (0, "already-absent", None))
+        status, report = self.execute_delete(planned, "keep")
+        self.assertEqual((status, report["deletion"]), (0, "not-needed"), report)
+        status, planned = self.plan_delete("purge")
+        self.assertEqual((status, planned["action"]), (0, "already-absent"), planned)
+        self.assertEqual(self.execute_delete(planned, "purge")[0], 0)
+        self.assertFalse(self.workspace.exists())
+        self.assertEqual(self.count("delete"), 0)
+
+    # Inputs: workspaces without a creation report or minikube home. Outputs: refusals before any effect.
+    # Purpose: limit deletion to profiles this workspace created. Dependencies: CLI boundary.
+    def test_delete_requires_a_created_profile_with_a_recorded_home(self):
+        self.write_config()
+        status, refused = self.plan_delete("keep")
+        self.assertEqual(status, 2)
+        self.assertIn("applies only", refused["error"])
+        self.assertEqual(self.calls(), [])
+        self.create()
+        report_path = self.workspace / "reports" / "cluster.json"
+        report = read_json(report_path)
+        del report["minikube_home"]
+        write_json(report_path, report)
+        status, blocked = self.plan_delete("keep")
+        self.assertEqual(status, 2, blocked)
+        self.assertIn("no recorded Minikube home", blocked["blockers"][0])
+        self.assertEqual(self.count("delete"), 0)
+
+    # Inputs: a nested backup before or after review. Outputs: blocked plan or stale approval.
+    # Purpose: keep unknown workspace data out of purge. Dependencies: fake Minikube and private files.
+    def test_delete_purge_refuses_unknown_nested_artifacts(self):
+        self.create()
+        backup = self.workspace / "reports" / "manual-backup.txt"
+        backup.write_text("manual backup")
+        status, blocked = self.plan_delete("purge")
+        self.assertEqual(status, 2, blocked)
+        self.assertIn("reports/manual-backup.txt", blocked["blockers"][0])
+        backup.unlink()
+        status, planned = self.plan_delete("purge")
+        self.assertEqual(status, 0, planned)
+        backup.write_text("added after review")
+        status, stale = self.execute_delete(planned, "purge")
+        self.assertEqual(status, 2, stale)
+        self.assertIn("changed since review", stale["error"])
+        self.assertEqual(backup.read_text(), "added after review")
+        backup.unlink()
+        status, planned = self.plan_delete("purge")
+        self.assertEqual(status, 0, planned)
+        write_json(self.workspace / "reports" / "cluster.json", {
+            **read_json(self.workspace / "reports" / "cluster.json"),
+            "post_check": "changed report",
+        })
+        status, stale = self.execute_delete(planned, "purge")
+        self.assertEqual(status, 2, stale)
+        self.assertIn("changed since review", stale["error"])
+        self.assertEqual(self.count("delete"), 0)
+
+    # Inputs: manual claim, retained PV, default ConfigMap, Secret and CR. Outputs: data requiring consent.
+    # Purpose: inventory data across namespaces and API resources without returning payloads.
+    def test_delete_lists_unmanaged_data_in_managed_and_default_namespaces(self):
+        self.create()
+        self.record_delete_objects()
+        objects = json.loads(self.state.read_text())["objects"]
+        objects.update({
+            "persistentvolumeclaims/atlas/user-claim": {"uid": "uid-claim"},
+            "persistentvolumes//retained": {
+                "uid": "uid-pv",
+                "spec": {"persistentVolumeReclaimPolicy": "Retain"},
+                "status": {"phase": "Released"},
+            },
+            "configmaps/default/notes": {"uid": "uid-config"},
+            "secrets/kube-system/custom": {"uid": "uid-secret"},
+            "widgets.example.com/default/example": {"uid": "uid-widget"},
+        })
+        self.update_state(objects=objects)
+        status, blocked = self.plan_delete("keep")
+        self.assertEqual(status, 2, blocked)
+        self.assertIn("--include-unmanaged", blocked["blockers"][0])
+        unmanaged = blocked["data_loss"]["unmanaged"]
+        self.assertEqual(unmanaged["persistent_volume_claims"], ["atlas/user-claim"])
+        self.assertEqual(unmanaged["persistent_volumes"], ["retained"])
+        self.assertEqual(
+            {entry["uid"] for entry in unmanaged["objects"]},
+            {"uid-config", "uid-secret", "uid-widget"},
+        )
+        status, approved = self.plan_delete("keep", "--include-unmanaged")
+        self.assertEqual(status, 0, approved)
+        objects["persistentvolumeclaims/atlas/user-claim"]["uid"] = "uid-replacement"
+        self.update_state(objects=objects)
+        status, stale = self.execute_delete(approved, "keep", "--include-unmanaged")
+        self.assertEqual(status, 2, stale)
+        self.assertIn("changed since review", stale["error"])
+        self.assertEqual(self.count("delete"), 0)
+
+    # Inputs: a recorded controller, verified descendant claim and matching bound PV.
+    # Outputs: managed storage and rejection of a stale controller UID. Dependencies: fake API.
+    def test_delete_verifies_controller_and_pv_binding(self):
+        self.create()
+        self.record_delete_objects()
+        records_path = self.workspace / "state" / "recorded-objects.json"
+        records = read_json(records_path)
+        records.append({
+            "source": "prerequisites", "resource": "statefulsets.apps", "namespace": "atlas",
+            "name": "database", "uid": "uid-controller",
+        })
+        write_json(records_path, records)
+        objects = json.loads(self.state.read_text())["objects"]
+        objects.update({
+            "statefulsets.apps/atlas/database": {"uid": "uid-controller"},
+            "persistentvolumeclaims/atlas/db": {
+                "uid": "uid-claim", "spec": {"volumeName": "db-pv"},
+                "ownerReferences": [{
+                    "name": "database", "kind": "StatefulSet", "uid": "uid-controller",
+                    "controller": True,
+                }],
+            },
+            "persistentvolumes//db-pv": {
+                "uid": "uid-pv", "status": {"phase": "Bound"},
+                "spec": {"claimRef": {"namespace": "atlas", "name": "db", "uid": "uid-claim"}},
+            },
+        })
+        self.update_state(objects=objects)
+        status, planned = self.plan_delete("keep")
+        self.assertEqual(status, 0, planned)
+        self.assertIn("persistentvolumeclaims atlas/db", planned["data_loss"]["managed_objects"])
+        self.assertIn("persistentvolumes db-pv", planned["data_loss"]["managed_objects"])
+        objects["persistentvolumeclaims/atlas/db"]["ownerReferences"][0]["uid"] = "stale"
+        self.update_state(objects=objects)
+        status, blocked = self.plan_delete("keep")
+        self.assertEqual(status, 2, blocked)
+        self.assertEqual(blocked["data_loss"]["unmanaged"]["persistent_volume_claims"], ["atlas/db"])
+        self.assertEqual(blocked["data_loss"]["unmanaged"]["persistent_volumes"], ["db-pv"])
+
+    # Inputs: failed discovery or denied list access. Outputs: blocked deletion even with consent.
+    # Purpose: avoid treating an unreadable inventory as empty. Dependencies: fake API.
+    def test_delete_blocks_incomplete_inventory(self):
+        self.create()
+        for failure in ("incomplete_discovery", "secret_api_denied"):
+            with self.subTest(failure=failure):
+                self.update_state(**{failure: True})
+                status, blocked = self.plan_delete("keep", "--include-unmanaged")
+                self.assertEqual(status, 2, blocked)
+                self.assertIn("complete", blocked["blockers"][0])
+                self.update_state(**{failure: False})
+        self.assertEqual(self.count("delete"), 0)
+
+    # Inputs: a zero exit code and vanished Minikube records with a running VM.
+    # Outputs: uncertain removal and preserved workspace, including on retry. Dependencies: fake driver.
+    def test_delete_keeps_workspace_when_vm_survives(self):
+        self.create()
+        self.record_delete_objects()
+        self.update_state(retain_vm=True)
+        status, planned = self.plan_delete("purge")
+        self.assertEqual(status, 0, planned)
+        status, result = self.execute_delete(planned, "purge")
+        self.assertEqual(status, 2, result)
+        self.assertIn("VM removal could not be confirmed", result["error"])
+        report = read_json(self.workspace / "reports" / "cluster-delete.json")
+        self.assertEqual((report["status"], report["deletion"]), ("uncertain", "uncertain"))
+        self.assertTrue((self.workspace / "state" / "00-bootstrap.tfstate").exists())
+        status, refused = self.plan_delete("purge")
+        self.assertEqual(status, 2, refused)
+        self.assertIn("unconfirmed VM removal", " ".join(refused["blockers"]))
+        self.assertEqual(self.count("delete"), 1)
+
+    # Inputs: another context that uses the target's cluster or user. Outputs: blocked delete.
+    # Purpose: preserve shared kubeconfig references. Dependencies: fake kubeconfig.
+    def test_delete_refuses_shared_kubeconfig_entries(self):
+        self.create()
+        status, planned = self.plan_delete("keep")
+        self.assertEqual(status, 0, planned)
+        for key in ("cluster", "user"):
+            with self.subTest(key=key):
+                other = {"cluster": "other-cluster", "user": "other-user", key: "atlas-dev"}
+                self.update_state(contexts=["atlas-dev", "other"], context_refs={"other": other})
+                status, blocked = self.plan_delete("keep", "--include-unmanaged")
+                self.assertEqual(status, 2, blocked)
+                self.assertIn("Other kubeconfig contexts use profile entries: other", blocked["blockers"])
+        status, stale = self.execute_delete(planned, "keep")
+        self.assertEqual(status, 2, stale)
+        self.assertIn("changed since review", stale["error"])
+        self.assertEqual(self.count("delete"), 0)
+
+
+class DeleteSafetyTests(unittest.TestCase):
+    # Inputs: synthetic profile and PID files. Outputs: both actual VM IDs and removal checks.
+    # Purpose: verify native probes are independent of the profile records. Dependencies: private files.
+    def test_krunkit_machine_evidence_tracks_each_profile_node(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            profile = home / "profiles" / "atlas"
+            profile.mkdir(parents=True, mode=0o700)
+            write_json(profile / "config.json", {
+                "Driver": "krunkit", "Nodes": [{"Name": ""}, {"Name": "m02"}]
+            })
+            for machine, pid in (("atlas", 12345), ("atlas-m02", 12346)):
+                folder = home / "machines" / machine
+                folder.mkdir(parents=True)
+                (folder / "krunkit.pid").write_text(str(pid))
+            with patch.object(delete_safety, "_krunkit_process", return_value=True) as native:
+                evidence = delete_safety.machine_evidence(home, "atlas")
+            self.assertEqual(evidence, {"driver": "krunkit", "pids": [12345, 12346]})
+            self.assertEqual([call.args[0] for call in native.call_args_list], [12345, 12346])
+            with patch.object(delete_safety, "_process_exists", side_effect=lambda pid: pid == 12346):
+                self.assertFalse(delete_safety.machines_removed(evidence))
+            with patch.object(delete_safety, "_process_exists", return_value=False):
+                self.assertTrue(delete_safety.machines_removed(evidence))
+            self.assertFalse(delete_safety.machines_removed({"driver": "vfkit", "pids": None}))
 
 
 class SecretMetadataTests(unittest.TestCase):
