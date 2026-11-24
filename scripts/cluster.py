@@ -31,6 +31,12 @@ MACHINE_SOCKETS = {"krunkit": ("krunkit.sock", "vmnet-helper.sock")}
 SOCKET_PATH_MAX = 103 if sys.platform == "darwin" else 107
 # libkrun 1.19 formats both a u32 process ID and a u32 socket counter in this filename.
 KRUN_TEMP_SOCKET = "krun-net-4294967295-4294967295.sock"
+# Per-machine logs that locate a failed start. vmnet-helper runs before the VM boots, so its first
+# ERROR line is the earliest network failure; without an interface the VM never gets an SSH address.
+MACHINE_LOGS = {"krunkit": ("vmnet-helper.log", "serial.log")}
+# Bounds for log excerpts copied into the private creation report.
+LOG_READ_BYTES = 65536
+LOG_LINE_CHARS = 300
 
 
 # Inputs: none. Outputs: absolute minikube path and its reported version.
@@ -668,6 +674,49 @@ def _execute_overwrite(config, workspace, review, materialize):
         ) from None
 
 
+# Inputs: log path. Outputs: the first ERROR line, shortened, or None. Purpose: name the earliest
+# helper failure without copying whole logs. Dependencies: bounded local file read.
+def _first_error(path):
+    try:
+        with path.open("rb") as handle:
+            text = handle.read(LOG_READ_BYTES).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    line = next((line for line in text.splitlines() if line.startswith("ERROR")), None)
+    return line[:LOG_LINE_CHARS] if line else None
+
+
+# Inputs: configuration, reviewed snapshot, and captured minikube output (None after a timeout or
+# interrupt). Outputs: failure stage, first error, exit reason, and log paths. Purpose: tell the
+# reviewer where the start stopped. Dependencies: Minikube home layout and MACHINE_LOGS.
+def _start_failure(config, snapshot, output=None):
+    home = Path(snapshot["minikube_home"])
+    logs = [home / "logs" / "lastStart.txt"]
+    first_error = stage = None
+    for node in config["derived"]["cluster"]["nodes"]:
+        machine = home / "machines" / node
+        logs += [machine / name for name in MACHINE_LOGS.get(config["cluster"]["create"]["driver"], ())]
+        if first_error is None and (error := _first_error(machine / "vmnet-helper.log")):
+            stage, first_error = "network", f"{node}: {error}"
+    # Minikube prints a stable reason code such as GUEST_PROVISION when it gives up.
+    reason = re.search(r"Exiting due to ([A-Z][A-Z0-9_]+)", output or "")
+    reason = reason[1] if reason else None
+    return {
+        "stage": stage or ("minikube" if reason else "unknown"),
+        "first_error": first_error,
+        "minikube_reason": reason,
+        "logs": [str(path) for path in logs if path.is_file()],
+    }
+
+
+# Inputs: failure record from _start_failure. Outputs: one sentence for the CLI error.
+# Purpose: surface the failed stage and log paths without reading the report. Dependencies: none.
+def _failure_hint(failure):
+    detail = failure["first_error"] or failure["minikube_reason"] or "no recognized error"
+    logs = ", ".join(failure["logs"]) or "none found"
+    return f"Failed stage: {failure['stage']} ({detail}). Logs: {logs}."
+
+
 # Inputs: configuration, workspace, reviewed record, and optional overwrite progress. Outputs: creation report.
 # Purpose: run the exact reviewed command once and preserve any partial result. Dependencies: minikube, kubectl.
 def _execute(config, workspace, review, *, previous=None):
@@ -688,19 +737,31 @@ def _execute(config, workspace, review, *, previous=None):
     write_json(report_path, record)
     try:
         result = run(snapshot["command"], timeout=START_TIMEOUT_SECONDS)
-    except RuntimeError:
-        record["status"] = "uncertain"
+    except (RuntimeError, KeyboardInterrupt) as error:
+        # A timeout or Ctrl-C leaves the VM state unknown: subprocess.run kills only minikube, while
+        # krunkit and vmnet-helper may survive. Record that and keep every partial resource.
+        interrupted = isinstance(error, KeyboardInterrupt)
+        record.update(status="uncertain", failure=_start_failure(config, snapshot))
+        if interrupted:
+            record["interrupted"] = True
         write_json(consumed, record)
         write_json(report_path, record)
+        if interrupted:
+            raise
         raise RuntimeError(
-            "minikube start did not finish. Inspect the profile before any further step."
+            "minikube start did not finish. Inspect the profile before any further step. "
+            + _failure_hint(record["failure"])
         ) from None
     if result.returncode:
-        record["status"] = "failed"
+        record.update(
+            status="failed", failure=_start_failure(config, snapshot, result.stdout + result.stderr)
+        )
         write_json(consumed, record)
         write_json(report_path, record)
         raise RuntimeError(
-            "minikube start failed; the partial profile was preserved. Review `minikube logs` for this profile before deciding on recovery."
+            "minikube start failed; the partial profile was preserved. "
+            + _failure_hint(record["failure"])
+            + " Review these logs and `minikube logs` for this profile before deciding on recovery."
         )
     try:
         identity = runtime._identity(config)

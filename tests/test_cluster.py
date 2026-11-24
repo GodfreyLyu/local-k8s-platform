@@ -46,9 +46,18 @@ elif arguments[:2] == ["profile", "list"]:
         "invalid": [{"Name": name} for name in state["invalid"]],
     }))
 elif arguments[:1] == ["start"]:
-    if state.get("fail_start"):
-        sys.exit(1)
     name = next(item.split("=", 1)[1] for item in arguments if item.startswith("--profile="))
+    if state.get("vmnet_failure"):
+        machine = Path(os.environ["MINIKUBE_HOME"]) / "machines" / name
+        machine.mkdir(parents=True)
+        (machine / "vmnet-helper.log").write_text(
+            "INFO  [main] running as uid: 501 gid: 20\\nERROR [main] vmnet_start_interface: VMNET_FAILURE\\n"
+        )
+        (Path(os.environ["MINIKUBE_HOME"]) / "logs").mkdir()
+        (Path(os.environ["MINIKUBE_HOME"]) / "logs" / "lastStart.txt").write_text("start log\\n")
+    if state.get("fail_start"):
+        print("X Exiting due to GUEST_PROVISION: error provisioning guest", file=sys.stderr)
+        sys.exit(1)
     version = next(item.split("=", 1)[1] for item in arguments if item.startswith("--kubernetes-version="))
     profile = Path(os.environ["MINIKUBE_HOME"]) / "profiles" / name
     profile.mkdir(parents=True)
@@ -787,6 +796,59 @@ class ClusterTests(unittest.TestCase):
         self.assertIn("preserved", failed["error"])
         self.assertEqual(read_json(self.workspace / "reports" / "cluster.json")["status"], "failed")
         self.assertFalse(any(call["argv"][:1] == ["delete"] for call in self.calls()))
+        status, consumed = self.cli("cluster", "--plan-id", planned["plan_id"], "--execute")
+        self.assertIn("consumed", consumed["error"])
+        self.assertEqual(len([c for c in self.calls() if c["argv"][:1] == ["start"]]), 1)
+
+    # Inputs: a start whose vmnet-helper logged VMNET_FAILURE. Outputs: failed record naming the network
+    # stage, the helper error, the minikube reason, and existing logs. Dependencies: fake tools.
+    def test_failed_start_reports_the_earliest_error_and_logs(self):
+        self.write_config()
+        self.write_state(fail_start=True, vmnet_failure=True)
+        _, planned = self.cli("cluster")
+        status, failed = self.cli("cluster", "--plan-id", planned["plan_id"], "--execute")
+        self.assertEqual(status, 2, failed)
+        failure = read_json(self.workspace / "reports" / "cluster.json")["failure"]
+        home = Path(planned["minikube_home"])
+        machine = home / "machines" / planned["profile"]
+        self.assertEqual(failure["stage"], "network")
+        self.assertIn("VMNET_FAILURE", failure["first_error"])
+        self.assertEqual(failure["minikube_reason"], "GUEST_PROVISION")
+        self.assertEqual(
+            failure["logs"],
+            [str(home / "logs" / "lastStart.txt"), str(machine / "vmnet-helper.log")],
+        )
+        self.assertIn("Failed stage: network", failed["error"])
+        self.assertIn(str(machine / "vmnet-helper.log"), failed["error"])
+        self.assertTrue(machine.is_dir())
+        self.assertFalse(any(call["argv"][:1] == ["delete"] for call in self.calls()))
+
+    # Inputs: Ctrl-C while minikube start runs. Outputs: interrupted CLI result and an uncertain,
+    # consumed, preserved creation. Purpose: never leave the report at attempting. Dependencies: fake tools.
+    def test_interrupted_start_is_recorded_as_unconfirmed(self):
+        self.write_config()
+        self.write_state(vmnet_failure=True)
+        _, planned = self.cli("cluster")
+        real_run = cluster_module.run
+
+        def interrupt_start(argv, **options):
+            if "start" in argv:
+                real_run(argv, **options)
+                raise KeyboardInterrupt
+            return real_run(argv, **options)
+
+        with patch.object(cluster_module, "run", side_effect=interrupt_start):
+            status, interrupted = self.cli("cluster", "--plan-id", planned["plan_id"], "--execute")
+        self.assertEqual((status, interrupted["status"]), (130, "interrupted"), interrupted)
+        for path in (
+            self.workspace / "reports" / "cluster.json",
+            self.workspace / "plans" / "cluster" / f"consumed-{planned['plan_id']}.json",
+        ):
+            record = read_json(path)
+            self.assertEqual((record["status"], record["interrupted"]), ("uncertain", True))
+            self.assertEqual(record["failure"]["stage"], "network")
+        self.assertFalse(any(call["argv"][:1] == ["delete"] for call in self.calls()))
+        self.assertEqual(self.cli("inspect")[0], 2)
         status, consumed = self.cli("cluster", "--plan-id", planned["plan_id"], "--execute")
         self.assertIn("consumed", consumed["error"])
         self.assertEqual(len([c for c in self.calls() if c["argv"][:1] == ["start"]]), 1)
