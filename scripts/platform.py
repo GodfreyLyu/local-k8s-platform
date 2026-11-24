@@ -152,7 +152,12 @@ def arguments(argv=None):
     cluster.add_argument("--plan-id")
     cluster.add_argument("--execute", action="store_true")
     cluster.add_argument("--overwrite", action="store_true")
-    plan =actions.add_parser("plan")
+    delete = actions.add_parser("delete")
+    delete.add_argument("--workspace-files", required=True, choices=("keep", "archive", "purge"))
+    delete.add_argument("--include-unmanaged", action="store_true")
+    delete.add_argument("--plan-id")
+    delete.add_argument("--execute", action="store_true")
+    plan = actions.add_parser("plan")
     plan.add_argument("--stage", required=True)
     plan.add_argument("--plugin-dir", type=Path)
     apply = actions.add_parser("apply")
@@ -175,7 +180,7 @@ def arguments(argv=None):
     args = parser.parse_args(argv)
     if args.action == "credentials" and args.component == "kafka" and args.prepare:
         parser.error("Kafka source credentials are prepared by Strimzi, not this tool")
-    if args.action in {"prerequisites", "cluster"}:
+    if args.action in {"prerequisites", "cluster", "delete"}:
         if args.execute and not args.plan_id:
             parser.error(f"{args.action} --execute requires --plan-id")
         if args.plan_id and not re.fullmatch(r"[0-9a-f]{64}", args.plan_id):
@@ -216,9 +221,9 @@ def main(argv=None):
                 raise ValueError("The requested prerequisite component is disabled")
         if args.action == "gpu-smoke" and not config["gpu"]["enabled"]:
             raise ValueError("The GPU smoke test requires gpu.enabled")
-        if args.action == "cluster" and config["cluster"]["mode"] != "create":
+        if args.action in {"cluster", "delete"} and config["cluster"]["mode"] != "create":
             raise ValueError(
-                "The cluster action requires cluster.mode=create and an explicit cluster.name"
+                f"The {args.action} action requires cluster.mode=create and an explicit cluster.name"
             )
         with workspace_lock(workspace):
             configured = configure(config, workspace)
@@ -241,6 +246,18 @@ def main(argv=None):
                     args.plan_id,
                     args.execute,
                     overwrite=args.overwrite,
+                    materialize=configure,
+                )
+            elif args.action == "delete":
+                from cluster import delete
+
+                report = delete(
+                    config,
+                    workspace,
+                    args.workspace_files,
+                    args.plan_id,
+                    args.execute,
+                    include_unmanaged=args.include_unmanaged,
                     materialize=configure,
                 )
             elif args.action == "credentials":

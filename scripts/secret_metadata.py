@@ -13,6 +13,7 @@ from urllib.parse import quote
 from runtime import _kube
 
 ACCEPT = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"
+LIST_ACCEPT = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"
 
 
 # Inputs: normalized configuration. Outputs: a private Unix socket for the life of the context.
@@ -25,7 +26,7 @@ def proxy(config):
         command = _kube(config) + [
             "proxy",
             f"--unix-socket={path}",
-            "--accept-paths=^/api/v1/namespaces/[^/]+/secrets/[^/]+$",
+            "--accept-paths=^/api/v1/(secrets|namespaces/[^/]+/secrets/[^/]+)$",
             "--reject-methods=^(POST|PUT|PATCH|DELETE|CONNECT|OPTIONS|TRACE)$",
         ]
         with subprocess.Popen(
@@ -100,3 +101,21 @@ def get(path, namespace, name):
     ):
         raise RuntimeError("The response does not identify the requested Secret.")
     return metadata
+
+
+# Inputs: private proxy socket. Outputs: metadata for all Secrets across the cluster.
+# Purpose: inventory Secret identities without requesting their payloads. Dependencies: Kubernetes API.
+def list_all(path):
+    status, body = _request(path, "/api/v1/secrets", LIST_ACCEPT)
+    if (
+        status != 200
+        or not isinstance(body, dict)
+        or body.get("kind") != "PartialObjectMetadataList"
+        or body.get("apiVersion") != "meta.k8s.io/v1"
+        or (body.get("metadata") or {}).get("continue")
+        or not isinstance(body.get("items"), list)
+        or any(not isinstance(item, dict) or item.get("kind") == "Secret" or "data" in item
+               for item in body["items"])
+    ):
+        raise RuntimeError("Cannot establish a complete Secret metadata inventory.")
+    return body["items"]

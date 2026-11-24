@@ -14,6 +14,7 @@ Use English for maintained documentation and code comments. Respond in the user'
 
 - For configuration, defaults, or component choices, read [configuration.md](references/configuration.md).
 - To create a new Minikube cluster, read [Create a Minikube cluster](references/operations.md#create-a-minikube-cluster).
+- To delete a cluster this workspace created, read [Delete a created cluster](references/operations.md#delete-a-created-cluster).
 - For small-model local training and existing Minikube CSI storage, read [local-training.md](references/local-training.md).
 - To install the GPU device plugin or run the GPU smoke test, read [gpu.md](references/gpu.md).
 - Before inspecting a cluster, deploying resources, or writing credentials, read the relevant procedure in [operations.md](references/operations.md).
@@ -21,7 +22,7 @@ Use English for maintained documentation and code comments. Respond in the user'
 - For implementation changes or scope decisions, read [design.md](references/design.md).
 - For offline Terraform checks or provider startup errors, read [validation.md](references/validation.md) and use `scripts/validate.py`.
 
-Support a single PostgreSQL StatefulSet, a single Strimzi KRaft node, and an optional GPU device plugin that advertises the krunkit render node as `devic.es/dri`. Enable any combination of these; a GPU-only environment disables monitoring and storage. Local storage and monitoring integration are optional. Cluster creation never starts an existing profile. It recreates or deletes a profile only through an explicitly requested, separately authorized `cluster --overwrite` plan for a profile this workspace created. Operator replacement, HTTPS ingress, CNPG, PITR, and application releases are outside this version's scope. Explain unsupported requests rather than trying to enable them through configuration.
+Support a single PostgreSQL StatefulSet, a single Strimzi KRaft node, and an optional GPU device plugin that advertises the krunkit render node as `devic.es/dri`. Enable any combination of these; a GPU-only environment disables monitoring and storage. Local storage and monitoring integration are optional. Cluster creation never starts an existing profile. It recreates a profile only through an explicitly requested, separately authorized `cluster --overwrite` plan, and deletes one only through such a `cluster --overwrite` or `delete` plan, in both cases for a profile this workspace created. Operator replacement, HTTPS ingress, CNPG, PITR, and application releases are outside this version's scope. Explain unsupported requests rather than trying to enable them through configuration.
 
 ## Form an explicit configuration
 
@@ -46,7 +47,7 @@ With `cluster.mode=create`, the explicit `cluster.name` becomes the Minikube pro
 python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev cluster
 ```
 
-The plan reads the Minikube version, profile list, machine records, and kubeconfig entry names. Present the profile name, kubeconfig, driver, nodes, CPUs, memory, disk, Kubernetes version, CNI, addons, and the exact command. A conflicting profile, machine record, or kubeconfig entry blocks creation. Obtain authorization for that exact plan, then run `cluster --plan-id REVIEWED_PLAN_ID --execute`. This authorization is separate from prerequisites, Terraform changes, and Secret writes.
+The plan reads the Minikube version, profile list, machine records, and kubeconfig entry names. Present the profile name, kubeconfig, driver, nodes, CPUs, memory, disk, Kubernetes version, CNI, addons, and the exact command. A conflicting profile, machine record, or kubeconfig entry blocks creation. A krunkit start also requires its machine and client socket paths to fit the Unix socket limit. Review `MINIKUBE_HOME` and, for libkrun 1.19 or later, `TMPDIR`. Obtain authorization for that exact plan, then run `cluster --plan-id REVIEWED_PLAN_ID --execute`. This authorization is separate from prerequisites, Terraform changes, and Secret writes.
 
 The result suggests `network.api_server_cidrs` for the new cluster. Review them and add them to the configuration before Kafka prerequisites or planning. A failed or interrupted start or an unverified identity keeps the profile for inspection. Report the outcome and stop.
 
@@ -65,6 +66,20 @@ The plan compares the profile with the workspace's records and reports one actio
 - `unchanged`: everything matches. There is nothing to execute.
 
 A stopped or unreachable profile blocks. For a running profile, the API queried from its control plane and the chosen context must return the same cluster UID. Present the reviewed Minikube home, action, differences, delete command, and effects. A deleted profile loses its data, and prerequisites, stages, and credentials need new plans. Obtain authorization for that plan, then run `cluster --overwrite --plan-id REVIEWED_PLAN_ID --execute`. Execution rechecks the evidence, reserves the archive, and confirms deletion and clean host records before moving the previous workspace files and starting the replacement.
+
+### Delete a created cluster
+
+Use this only when the user asks to delete the cluster. It applies only to a profile this workspace created. Ask how to handle the workspace files when the user has not said:
+
+- `keep`: leave them in place and mark the creation report `deleted`. Cluster actions stop. `cluster --overwrite` can later archive them and recreate the profile.
+- `archive`: move them to `archive/` and leave an empty workspace for a new `cluster` plan.
+- `purge`: remove the files this skill wrote, including credentials. `archive/` and unknown files are never removed, and unknown files block the plan.
+
+```sh
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev delete --workspace-files archive
+```
+
+The plan reports `delete` for a running profile whose identity matches the creation report, or `already-absent` when the profile no longer exists and cleanup evidence allows it. A stopped, unreadable, or mismatched profile blocks, along with leftover machine or kubeconfig records and shared kubeconfig references. Unmanaged live objects require `--include-unmanaged`. Review the data-loss inventory, including PVCs, PVs and object UIDs. Purge also requires a verified nested inventory. Present the action, delete command, `data_loss`, and effects. Obtain authorization for that plan, then repeat the same options with `--plan-id REVIEWED_PLAN_ID --execute`. Preserve the workspace when native VM removal is uncertain.
 
 ## Prepare prerequisites
 
