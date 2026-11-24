@@ -293,11 +293,7 @@ def main(argv=None):
         print(json.dumps({"status": "blocked", "error": str(error)}), file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        # Actions record their own uncertain outcome before re-raising; report it instead of a traceback.
-        message = (
-            "Interrupted. Any started external operation is unconfirmed; "
-            "check the workspace reports before retrying."
-        )
+        message = "Interrupted. Check the workspace reports for the outcome before retrying."
         print(json.dumps({"status": "interrupted", "error": message}), file=sys.stderr)
         return 130
 

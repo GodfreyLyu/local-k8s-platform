@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -47,14 +48,17 @@ elif arguments[:2] == ["profile", "list"]:
     }))
 elif arguments[:1] == ["start"]:
     name = next(item.split("=", 1)[1] for item in arguments if item.startswith("--profile="))
-    if state.get("vmnet_failure"):
+    if state.get("vmnet_failure") or state.get("krunkit_failure"):
         machine = Path(os.environ["MINIKUBE_HOME"]) / "machines" / name
         machine.mkdir(parents=True)
+    if state.get("vmnet_failure"):
         (machine / "vmnet-helper.log").write_text(
             "INFO  [main] running as uid: 501 gid: 20\\nERROR [main] vmnet_start_interface: VMNET_FAILURE\\n"
         )
         (Path(os.environ["MINIKUBE_HOME"]) / "logs").mkdir()
         (Path(os.environ["MINIKUBE_HOME"]) / "logs" / "lastStart.txt").write_text("start log\\n")
+    if state.get("krunkit_failure"):
+        (machine / "krunkit.log").write_text("krunkit exited before boot\\n")
     if state.get("fail_start"):
         print("X Exiting due to GUEST_PROVISION: error provisioning guest", file=sys.stderr)
         sys.exit(1)
@@ -823,6 +827,51 @@ class ClusterTests(unittest.TestCase):
         self.assertTrue(machine.is_dir())
         self.assertFalse(any(call["argv"][:1] == ["delete"] for call in self.calls()))
 
+    # Inputs: a krunkit exit before guest boot. Outputs: durable failure and the driver's own log path.
+    # Purpose: preserve the outcome before consulting local logs. Dependencies: fake tools.
+    def test_krunkit_failure_is_saved_before_reading_driver_logs(self):
+        self.write_config()
+        self.write_state(fail_start=True, krunkit_failure=True)
+        _, planned = self.cli("cluster")
+        paths = (
+            self.workspace / "reports" / "cluster.json",
+            self.workspace / "plans" / "cluster" / f"consumed-{planned['plan_id']}.json",
+        )
+        observed_statuses = []
+        start_failure = cluster_module._start_failure
+
+        # Inputs: failure diagnostic arguments. Outputs: original diagnostic and observed record states.
+        # Purpose: check the durable outcome at log collection time. Dependencies: private records.
+        def observe_records(*args):
+            observed_statuses.extend(read_json(path)["status"] for path in paths)
+            return start_failure(*args)
+
+        with patch.object(cluster_module, "_start_failure", side_effect=observe_records):
+            status, failed = self.cli("cluster", "--plan-id", planned["plan_id"], "--execute")
+        self.assertEqual(status, 2, failed)
+        log = Path(planned["minikube_home"]) / "machines" / planned["profile"] / "krunkit.log"
+        for path in paths:
+            self.assertEqual(read_json(path)["failure"]["logs"], [str(log)])
+        self.assertEqual(observed_statuses, ["failed", "failed"])
+        self.assertIn(str(log), failed["error"])
+
+    # Inputs: a named pipe with no writer. Outputs: no error excerpt within the test timeout.
+    # Purpose: verify a malformed log cannot hang failure handling. Dependencies: private files, POSIX.
+    def test_failure_log_reader_does_not_block_on_named_pipe(self):
+        log = self.root / "vmnet-helper.log"
+        os.mkfifo(log, mode=0o600)
+        result = subprocess.run(
+            [
+                sys.executable, "-B", "-c",
+                "import sys\nfrom pathlib import Path\n"
+                "sys.path.insert(0, sys.argv[1])\nfrom cluster import _first_error\n"
+                "assert _first_error(Path(sys.argv[2])) is None",
+                str(SCRIPTS), str(log),
+            ],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     # Inputs: Ctrl-C while minikube start runs. Outputs: interrupted CLI result and an uncertain,
     # consumed, preserved creation. Purpose: never leave the report at attempting. Dependencies: fake tools.
     def test_interrupted_start_is_recorded_as_unconfirmed(self):
@@ -852,6 +901,55 @@ class ClusterTests(unittest.TestCase):
         status, consumed = self.cli("cluster", "--plan-id", planned["plan_id"], "--execute")
         self.assertIn("consumed", consumed["error"])
         self.assertEqual(len([c for c in self.calls() if c["argv"][:1] == ["start"]]), 1)
+
+    # Inputs: Ctrl-C during identity verification. Outputs: uncertain reports and blocked cluster use.
+    # Purpose: preserve the successful start without accepting an unverified identity. Dependencies: fake tools.
+    def test_interrupt_during_identity_leaves_creation_uncertain(self):
+        self.write_config()
+        _, planned = self.cli("cluster")
+        with patch.object(runtime, "_identity", side_effect=KeyboardInterrupt):
+            status, interrupted = self.cli("cluster", "--plan-id", planned["plan_id"], "--execute")
+        self.assertEqual((status, interrupted["status"]), (130, "interrupted"), interrupted)
+        for path in (
+            self.workspace / "reports" / "cluster.json",
+            self.workspace / "plans" / "cluster" / f"consumed-{planned['plan_id']}.json",
+        ):
+            record = read_json(path)
+            self.assertEqual(record["status"], "uncertain")
+            self.assertTrue(record["interrupted"])
+        self.assertEqual(self.cli("inspect")[0], 2)
+        self.assertEqual((self.count("start"), self.count("delete")), (1, 0))
+
+    # Inputs: Ctrl-C during optional API CIDR discovery. Outputs: saved creation and interruption evidence.
+    # Purpose: preserve the verified cluster and binding. Dependencies: fake tools and private records.
+    def test_interrupt_during_api_cidr_discovery_keeps_confirmed_creation(self):
+        self.write_config()
+        _, planned = self.cli("cluster")
+        report_path = self.workspace / "reports" / "cluster.json"
+        paths = (
+            report_path,
+            self.workspace / "plans" / "cluster" / f"consumed-{planned['plan_id']}.json",
+        )
+        statuses_at_probe = []
+
+        # Inputs: resolved config. Outputs: interrupted discovery and observed status of both records.
+        # Purpose: check that creation is durable before the optional probe. Dependencies: private records.
+        def interrupt_discovery(config):
+            statuses_at_probe.extend(read_json(path)["status"] for path in paths)
+            raise KeyboardInterrupt
+
+        with patch.object(runtime, "_api_peers", side_effect=interrupt_discovery):
+            status, interrupted = self.cli("cluster", "--plan-id", planned["plan_id"], "--execute")
+        self.assertEqual((status, interrupted["status"]), (130, "interrupted"), interrupted)
+        self.assertEqual(statuses_at_probe, ["created", "created"])
+        for path in paths:
+            record = read_json(path)
+            self.assertEqual(record["status"], "created")
+            self.assertTrue(record["interrupted"])
+            self.assertTrue(record["binding_established"])
+            self.assertNotIn("suggested_api_server_cidrs", record)
+        self.assertEqual(self.cli("cluster")[1]["status"], "created")
+        self.assertEqual((self.count("start"), self.count("delete")), (1, 0))
 
     # Inputs: a successful start with an unreadable identity. Outputs: uncertain status and a consumed plan.
     # Purpose: block platform operations when the target could not be bound. Dependencies: fake tools.
