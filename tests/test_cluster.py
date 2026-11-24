@@ -134,6 +134,17 @@ else:
 """
 
 
+FAKE_OTOOL = """# Purpose: report a libkrun load command for the fake krunkit executable.
+import os
+import sys
+
+if len(sys.argv) != 3 or sys.argv[1] != "-L" or not sys.argv[2].endswith("/krunkit"):
+    sys.exit(64)
+print(sys.argv[2] + ":")
+print("\\t" + os.environ["FAKE_LIBKRUN"] + " (compatibility version 1.0.0, current version 1.19.0)")
+"""
+
+
 class ClusterTests(unittest.TestCase):
     # Inputs: none. Outputs: private fake tools, state, and environment. Purpose: isolate every test.
     # Dependencies: tempfile and the current Python interpreter for fake executables.
@@ -143,10 +154,17 @@ class ClusterTests(unittest.TestCase):
         self.root = Path(self.temporary.name).resolve()
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
-        for name, source in (("minikube", FAKE_MINIKUBE), ("kubectl", FAKE_KUBECTL)):
+        for name, source in (
+            ("minikube", FAKE_MINIKUBE),
+            ("kubectl", FAKE_KUBECTL),
+            ("otool", FAKE_OTOOL),
+            ("krunkit", "# Purpose: represent the driver in PATH without starting it.\n"),
+        ):
             tool = bin_dir / name
             tool.write_text(f"#!{sys.executable}\n{source}", encoding="utf-8")
             tool.chmod(0o700)
+        self.libkrun = self.root / "libkrun.1.dylib"
+        self.link_libkrun("1.19.6")
         self.state = self.root / "state.json"
         self.log = self.root / "log.jsonl"
         self.write_state()
@@ -158,7 +176,9 @@ class ClusterTests(unittest.TestCase):
                 "PATH": f"{bin_dir}:/usr/bin:/bin",
                 "FAKE_STATE": str(self.state),
                 "FAKE_LOG": str(self.log),
+                "FAKE_LIBKRUN": str(self.libkrun),
                 "MINIKUBE_HOME": str(self.root / "minikube-home"),
+                "TMPDIR": "/tmp",
             },
         )
         environment.start()
@@ -169,8 +189,20 @@ class ClusterTests(unittest.TestCase):
         request.start()
         self.addCleanup(proxy.stop)
         self.addCleanup(request.stop)
+        # Temporary roots can exceed the real socket limit; the dedicated tests set exact limits.
+        limit = patch.object(cluster_module, "SOCKET_PATH_MAX", 4096)
+        limit.start()
+        self.addCleanup(limit.stop)
         self.workspace = self.root / "workspace"
         self.source = self.root / "environment.json"
+
+    # Inputs: installed libkrun release. Outputs: a new target for the same dylib load command.
+    # Purpose: distinguish the installed library from its build-time version. Dependencies: private files.
+    def link_libkrun(self, version):
+        library = self.root / f"libkrun.{version}.dylib"
+        library.touch()
+        self.libkrun.unlink(missing_ok=True)
+        self.libkrun.symlink_to(library.name)
 
     # Inputs: proxy socket path, API route and requested media type. Outputs: a fake metadata response.
     # Purpose: exercise content negotiation and error handling without binding a socket.
@@ -397,6 +429,7 @@ class ClusterTests(unittest.TestCase):
         self.assertEqual(command[:2], ["/usr/bin/env", f"KUBECONFIG={self.kubeconfig}"])
         for flag in (
             "start",
+            "TMPDIR=/tmp",
             "--profile=atlas-dev",
             "--driver=krunkit",
             "--nodes=3",
@@ -468,6 +501,173 @@ class ClusterTests(unittest.TestCase):
         status, report = self.cli("cluster")
         self.assertEqual(report["status"], "blocked")
         self.assertFalse(any(call["argv"][:1] == ["start"] for call in self.calls()))
+
+    # Inputs: socket limits around the longest krunkit machine socket. Outputs: blocked, then planned.
+    # Purpose: stop a start whose vmnet-helper socket cannot bind. Dependencies: fake tools.
+    def test_long_minikube_home_blocks_krunkit_before_start(self):
+        nodes = load_config(self.write_config())["derived"]["cluster"]["nodes"]
+        # The first longest node name wins a tie, and vmnet-helper.sock is the longer socket name.
+        node = max(nodes, key=len)
+        longest = self.root / "minikube-home" / ".minikube" / "machines" / node / "vmnet-helper.sock"
+        size = len(os.fsencode(longest))
+        with patch.object(cluster_module, "SOCKET_PATH_MAX", size - 1):
+            status, blocked = self.cli("cluster")
+            self.assertEqual((status, blocked["status"]), (2, "blocked"))
+            self.assertFalse(blocked["requires_execute"])
+            message = " ".join(blocked["blockers"])
+            self.assertIn(str(longest), message)
+            self.assertIn(f"{size} bytes, above the {size - 1}-byte", message)
+            evidence = read_json(Path(blocked["review"]))["snapshot"]["machine_socket"]
+            self.assertEqual(evidence, {"path": str(longest), "bytes": size, "limit": size - 1})
+            status, refused = self.cli("cluster", "--plan-id", blocked["plan_id"], "--execute")
+            self.assertEqual(status, 2)
+        with patch.object(cluster_module, "SOCKET_PATH_MAX", size):
+            status, planned = self.cli("cluster")
+            self.assertEqual((status, planned["status"]), (0, "planned"), planned)
+        self.assertEqual(self.count("start"), 0)
+
+    # Inputs: a driver without known machine sockets and a tiny limit. Outputs: an unblocked plan.
+    # Purpose: limit the check to drivers whose socket names are verified. Dependencies: fake tools.
+    def test_socket_limit_ignores_drivers_without_machine_sockets(self):
+        self.write_config(cluster={"create": {"driver": "docker"}})
+        with patch.object(cluster_module, "SOCKET_PATH_MAX", 1):
+            status, planned = self.cli("cluster")
+        self.assertEqual((status, planned["status"]), (0, "planned"), planned)
+        self.assertIsNone(read_json(Path(planned["review"]))["snapshot"]["machine_socket"])
+
+    # Inputs: a created profile with drift and a home that is too long. Outputs: blocked plan, no delete.
+    # Purpose: refuse to delete a profile when its replacement cannot start. Dependencies: fake tools.
+    def test_long_minikube_home_blocks_overwrite_before_delete(self):
+        self.create()
+        self.record_objects()
+        self.update_state(objects={})
+        with patch.object(cluster_module, "SOCKET_PATH_MAX", 10):
+            status, planned = self.cli("cluster", "--overwrite")
+            self.assertEqual((status, planned["status"]), (2, "blocked"), planned)
+            self.assertIn("Minikube home is too long", planned["blockers"][0])
+            status, refused = self.cli(
+                "cluster", "--overwrite", "--plan-id", planned["plan_id"], "--execute"
+            )
+            self.assertEqual(status, 2)
+        self.assertEqual((self.count("start"), self.count("delete")), (1, 0))
+        self.assertFalse((self.workspace / "archive").exists())
+
+    # Inputs: a drifted profile and a legacy linked libkrun. Outputs: a blocked plan and no delete.
+    # Purpose: count the legacy client socket suffix separately from Minikube's two sockets.
+    def test_legacy_krunkit_client_socket_blocks_overwrite(self):
+        self.create()
+        self.record_objects()
+        self.update_state(objects={})
+        self.link_libkrun("1.18.0")
+        config = load_config(self.source)
+        home = Path(os.environ["MINIKUBE_HOME"]) / ".minikube"
+        machine = cluster_module._longest_socket(config, home)
+        with patch.object(cluster_module, "SOCKET_PATH_MAX", machine["bytes"]):
+            status, blocked = self.cli("cluster", "--overwrite")
+            self.assertEqual((status, blocked["status"]), (2, "blocked"), blocked)
+            snapshot = read_json(Path(blocked["review"]))["snapshot"]
+            self.assertEqual(snapshot["krunkit"]["libkrun"], str(self.libkrun.resolve()))
+            socket = snapshot["client_sockets"]["MINIKUBE_HOME"]
+            self.assertEqual(socket["path"], machine["path"] + "-krun.sock")
+            self.assertEqual(socket["bytes"], machine["bytes"] + len("-krun.sock"))
+            self.assertIn(socket["path"], " ".join(blocked["blockers"]))
+            status, _ = self.cli("cluster", "--overwrite", "--plan-id", blocked["plan_id"], "--execute")
+            self.assertEqual(status, 2)
+        self.assertEqual((self.count("start"), self.count("delete")), (1, 0))
+        self.assertFalse((self.workspace / "archive").exists())
+
+    # Inputs: a modern linked library and a changed TMPDIR. Outputs: a stale plan and a blocked new one.
+    # Purpose: recheck the client socket before deletion and pass the reviewed temp path to start.
+    def test_modern_krunkit_tmpdir_is_reviewed_before_delete(self):
+        self.create()
+        self.record_objects()
+        self.update_state(objects={})
+        config = load_config(self.source)
+        home = Path(os.environ["MINIKUBE_HOME"]) / ".minikube"
+        limit = cluster_module._longest_socket(config, home)["bytes"]
+        with patch.object(cluster_module, "SOCKET_PATH_MAX", limit):
+            status, plan = self.cli("cluster", "--overwrite")
+            self.assertEqual((status, plan["status"]), (0, "planned"), plan)
+            self.assertIn("TMPDIR=/tmp", plan["command"])
+            self.assertNotIn("TMPDIR=/tmp", plan["overwrite"]["delete_command"])
+            evidence = read_json(Path(plan["review"]))["snapshot"]
+            self.assertEqual(set(evidence["client_sockets"]), {"TMPDIR"})
+
+            with patch.dict(os.environ, {"TMPDIR": str(self.root / ("x" * 150))}):
+                status, refused = self.cli(
+                    "cluster", "--overwrite", "--plan-id", plan["plan_id"], "--execute"
+                )
+                self.assertEqual(status, 2, refused)
+                self.assertIn("changed since review", refused["error"])
+                status, blocked = self.cli("cluster", "--overwrite")
+                self.assertEqual((status, blocked["status"]), (2, "blocked"), blocked)
+                self.assertIn("TMPDIR is too long", " ".join(blocked["blockers"]))
+
+            self.link_libkrun("1.18.0")
+            status, refused = self.cli(
+                "cluster", "--overwrite", "--plan-id", plan["plan_id"], "--execute"
+            )
+            self.assertEqual(status, 2, refused)
+            self.assertIn("changed since review", refused["error"])
+        self.assertEqual((self.count("start"), self.count("delete")), (1, 0))
+        self.assertFalse((self.workspace / "archive").exists())
+
+    # Inputs: aliases with different lengths for one running profile. Outputs: unchanged or blocked.
+    # Purpose: check startup sockets only after reconciliation proves a replacement is needed.
+    def test_long_alias_does_not_block_an_unchanged_profile(self):
+        target = self.root / "real-minikube-home"
+        target.mkdir()
+        short = self.root / "a" / ".minikube"
+        short.parent.mkdir()
+        short.symlink_to(target, target_is_directory=True)
+        long = self.root / "long" / ".minikube"
+        long.parent.mkdir()
+        long.symlink_to(target, target_is_directory=True)
+        config = load_config(self.write_config())
+        limit = cluster_module._longest_socket(config, short)["bytes"]
+        with patch.object(cluster_module, "SOCKET_PATH_MAX", limit):
+            with patch.dict(os.environ, {"MINIKUBE_HOME": str(short)}):
+                self.create()
+            self.record_objects()
+            with patch.dict(os.environ, {"MINIKUBE_HOME": str(long)}):
+                status, result = self.cli("cluster", "--overwrite")
+                self.assertEqual((status, result["status"]), (0, "unchanged"), result)
+                self.assertEqual(result["overwrite"]["reconcile"]["differences"], [])
+                self.update_state(objects={})
+                status, blocked = self.cli("cluster", "--overwrite")
+                self.assertEqual((status, blocked["status"]), (2, "blocked"), blocked)
+                self.assertIn("Minikube home is too long", " ".join(blocked["blockers"]))
+        self.assertEqual((self.count("start"), self.count("delete")), (1, 0))
+
+    # Inputs: a valid TMPDIR at review and a changed environment after deletion starts.
+    # Outputs: proof that the replacement inherits the reviewed directory. Dependencies: fake tools.
+    def test_replacement_start_keeps_reviewed_tmpdir(self):
+        self.create()
+        self.record_objects()
+        self.update_state(objects={})
+        status, plan = self.cli("cluster", "--overwrite")
+        self.assertEqual((status, plan["status"]), (0, "planned"), plan)
+        run = cluster_module.run
+
+        # Inputs: exact child argv and runner options. Outputs: fake run result.
+        # Purpose: change the ambient temp directory after comparison but before replacement.
+        def change_tmpdir(command, **options):
+            if command == plan["overwrite"]["delete_command"]:
+                os.environ["TMPDIR"] = str(self.root / ("x" * 150))
+            if "start" in command:
+                self.assertIn("TMPDIR=/tmp", command)
+            return run(command, **options)
+
+        with (
+            patch.dict(os.environ),
+            patch.object(cluster_module, "run", side_effect=change_tmpdir),
+            patch.object(runtime, "_api_peers", return_value=set()),
+        ):
+            status, report = self.cli(
+                "cluster", "--overwrite", "--plan-id", plan["plan_id"], "--execute"
+            )
+        self.assertEqual((status, report["status"]), (0, "created"), report)
+        self.assertEqual((self.count("start"), self.count("delete")), (2, 1))
 
     # Inputs: a same-name cluster or user referenced by another context. Outputs: blocked plans.
     # Purpose: protect every kubeconfig name Minikube writes. Dependencies: fake kubeconfig reads.

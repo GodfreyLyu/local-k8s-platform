@@ -20,6 +20,14 @@ DELETE_TIMEOUT_SECONDS = 600
 # Workspace entries that survive an archive: the held lock and earlier archives.
 ARCHIVE_KEEP = {".operation.lock", "archive"}
 CRD_RESOURCES = {*runtime.MANIFEST_KINDS.values(), "prometheuses.monitoring.coreos.com"}
+# Unix sockets that a driver creates in each machine directory. krunkit binds its REST API and
+# vmnet-helper network sockets there; other drivers are not checked because their names are unverified.
+MACHINE_SOCKETS = {"krunkit": ("krunkit.sock", "vmnet-helper.sock")}
+# Longest bindable Unix socket path in bytes: sun_path is 104 bytes on macOS and 108 on Linux,
+# including the terminating NUL. A longer path makes vmnet-helper exit before the VM gets an address.
+SOCKET_PATH_MAX = 103 if sys.platform == "darwin" else 107
+# libkrun 1.19 formats both a u32 process ID and a u32 socket counter in this filename.
+KRUN_TEMP_SOCKET = "krun-net-4294967295-4294967295.sock"
 
 
 # Inputs: none. Outputs: absolute minikube path and its reported version.
@@ -51,13 +59,16 @@ def _minikube_home():
     return home if home.name == ".minikube" else home / ".minikube"
 
 
-# Inputs: configuration, Minikube binary, and absolute home argument. Outputs: command prefix.
+# Inputs: configuration, Minikube binary, home, and optional TMPDIR. Outputs: command prefix.
 # Purpose: select the same paths for inspection and execution. Dependencies: Minikube environment.
-def _minikube_command(config, minikube, home):
+def _minikube_command(config, minikube, home, *, tmpdir=None):
     kubeconfig = config["cluster"]["kubeconfig"]
     if os.pathsep in kubeconfig:
         raise ValueError("Minikube requires one kubeconfig path without a path-list separator.")
-    return ["/usr/bin/env", f"KUBECONFIG={kubeconfig}", f"MINIKUBE_HOME={home}", minikube]
+    command = ["/usr/bin/env", f"KUBECONFIG={kubeconfig}", f"MINIKUBE_HOME={home}"]
+    if tmpdir is not None:
+        command.append(f"TMPDIR={tmpdir}")
+    return command + [minikube]
 
 
 # Inputs: record path. Outputs: whether a directory entry exists, including a dangling symlink.
@@ -147,6 +158,108 @@ def _command(config, command):
         "--wait=all",
     ]
     return command
+
+
+# Inputs: configuration and the home path Minikube receives. Outputs: longest socket path, its byte length,
+# and the limit, or None. Purpose: find the machine socket that must fit the OS limit. Dependencies: MACHINE_SOCKETS.
+def _longest_socket(config, home):
+    sockets = MACHINE_SOCKETS.get(config["cluster"]["create"]["driver"])
+    if not sockets:
+        return None
+    # Minikube appends ".minikube" unless the argument already has that basename.
+    data = home if home.name == ".minikube" else home / ".minikube"
+    paths = [
+        data / "machines" / node / socket
+        for node in config["derived"]["cluster"]["nodes"]
+        for socket in sockets
+    ]
+    longest = max(paths, key=lambda path: len(os.fsencode(path)))
+    return _socket_evidence(longest)
+
+
+# Inputs: socket path. Outputs: byte length and host limit for plan review. Dependencies: OS encoding.
+# Purpose: apply the limit to the path actually passed to the socket API.
+def _socket_evidence(path):
+    return {"path": str(path), "bytes": len(os.fsencode(path)), "limit": SOCKET_PATH_MAX}
+
+
+# Inputs: socket evidence and owning environment variable. Outputs: blocker text, or None.
+# Purpose: report a path that cannot bind and identify the setting used to shorten it.
+def _socket_blocker(socket, variable):
+    if not socket or socket["bytes"] <= socket["limit"]:
+        return None
+    location = "Minikube home" if variable == "MINIKUBE_HOME" else "TMPDIR"
+    return (
+        f"{location} is too long for driver krunkit. The "
+        f"socket path {socket['path']} is {socket['bytes']} bytes, above the {socket['limit']}-byte "
+        f"Unix socket limit. Set {variable} to a shorter private directory and prepare a new plan."
+    )
+
+
+# Inputs: resolved krunkit executable. Outputs: the resolved linked libkrun path, if identifiable.
+# Purpose: inspect the installed library rather than the krunkit build-time dylib version.
+def _linked_libkrun(krunkit):
+    otool = shutil.which("otool")
+    if not otool or any(name.startswith("DYLD_") for name in os.environ):
+        return None
+    try:
+        result = run([otool, "-L", str(krunkit)], timeout=10)
+        linked = set()
+        for line in result.stdout.splitlines():
+            path = line.strip().partition(" (compatibility version ")[0]
+            if not re.fullmatch(r"libkrun(?:\.[0-9.]+)?\.dylib", Path(path).name):
+                continue
+            if path.startswith(("@loader_path/", "@executable_path/")):
+                path = krunkit.parent / path.split("/", 1)[1]
+            if not Path(path).is_absolute():
+                return None
+            linked.add(Path(path).resolve(strict=True))
+    except (RuntimeError, OSError):
+        return None
+    return linked.pop() if not result.returncode and len(linked) == 1 else None
+
+
+# Inputs: configuration and the target snapshot. Outputs: the snapshot with startup evidence.
+# Purpose: check krunkit sockets and pin the temp directory before any create or replacement.
+def _check_startup(config, snapshot):
+    machine = _longest_socket(config, Path(snapshot["home_argument"]))
+    snapshot["machine_socket"] = machine
+    if machine is None:
+        return snapshot
+    blockers = snapshot["blockers"]
+    if blocker := _socket_blocker(machine, "MINIKUBE_HOME"):
+        blockers.append(blocker)
+    executable = shutil.which("krunkit")
+    if not executable:
+        blockers.append("Install krunkit before planning a start with the krunkit driver.")
+        return snapshot
+    krunkit = Path(executable).resolve()
+    library = _linked_libkrun(krunkit)
+    version = re.fullmatch(r"libkrun\.1\.([0-9]+)\.[0-9]+\.dylib", library.name) if library else None
+    minor = int(version[1]) if version else None
+    snapshot["krunkit"] = {"path": str(krunkit), "libkrun": str(library) if library else None}
+    sockets = {}
+    # With unresolved linkage, both known client socket layouts must fit.
+    if minor is None or minor < 19:
+        sockets["MINIKUBE_HOME"] = _socket_evidence(
+            Path(machine["path"]).with_name("vmnet-helper.sock-krun.sock")
+        )
+    if minor is None or minor >= 19:
+        tmpdir = Path(os.path.abspath(os.environ.get("TMPDIR") or "/tmp"))
+        sockets["TMPDIR"] = _socket_evidence(tmpdir / KRUN_TEMP_SOCKET)
+        if sockets["TMPDIR"]["bytes"] <= SOCKET_PATH_MAX and (
+            not tmpdir.is_dir() or not os.access(tmpdir, os.W_OK | os.X_OK)
+        ):
+            blockers.append("TMPDIR must be an existing writable directory for the krunkit socket.")
+        command = _minikube_command(
+            config, snapshot["minikube"]["path"], snapshot["home_argument"], tmpdir=tmpdir
+        )
+        snapshot["command"] = _command(config, command)
+    snapshot["client_sockets"] = sockets
+    for variable, socket in sockets.items():
+        if blocker := _socket_blocker(socket, variable):
+            blockers.append(blocker)
+    return snapshot
 
 
 # Inputs: configuration and optional reviewed home argument. Outputs: host and target evidence.
@@ -343,7 +456,7 @@ def _overwrite_snapshot(config, workspace):
     if not snapshot["profile_exists"]:
         # Leftover machine or kubeconfig records stay blockers; they are not ours to clean.
         snapshot["action"] = "recreate-missing"
-        return snapshot
+        return _check_startup(config, snapshot)
     try:
         reconcile = _reconcile(config, workspace, snapshot, creation)
     except (RuntimeError, ValueError, KeyError, TypeError, OSError) as error:
@@ -360,6 +473,10 @@ def _overwrite_snapshot(config, workspace):
     snapshot["reconcile"] = reconcile
     if reconcile["consistent"]:
         snapshot.update(action="none", blockers=[])
+        return snapshot
+    snapshot.update(action="none", blockers=[])
+    _check_startup(config, snapshot)
+    if snapshot["blockers"]:
         return snapshot
     # The delete removes this profile's own machine and kubeconfig records; execution rechecks them.
     snapshot.update(
@@ -599,7 +716,9 @@ def cluster(config, workspace, plan_id=None, execute=False, overwrite=False, mat
 
     # Inputs: none. Outputs: current evidence for the selected plan kind. Dependencies: the snapshots above.
     def current():
-        return _overwrite_snapshot(config, workspace) if overwrite else _snapshot(config)
+        if overwrite:
+            return _overwrite_snapshot(config, workspace)
+        return _check_startup(config, _snapshot(config))
 
     if plan_id is None:
         review = {

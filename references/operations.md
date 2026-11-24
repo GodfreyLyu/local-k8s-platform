@@ -53,7 +53,9 @@ Use this only with `cluster.mode=create`. The configuration names the new profil
 
 After a successful start, the CLI records the API endpoint and the `kube-system` namespace UID in `cluster-binding.json` before marking `reports/cluster.json` as `created`. Later cluster operations require the target to match the creation identity and the workspace binding. A legacy creation report with a complete identity can establish a missing binding after the live identity matches it. Offline actions still work.
 
-An existing profile with this name blocks, whether it is running, stopped, or invalid. A machine record for any planned node or a matching context, cluster, or user entry in the selected kubeconfig also blocks. To use an existing profile, start it outside this workflow and switch to `cluster.mode=reuse`. Execution rechecks these conditions before starting Minikube.
+An existing profile with this name blocks, whether it is running, stopped, or invalid. A machine record for any planned node or a matching context, cluster, or user entry in the selected kubeconfig also blocks. To use an existing profile, start it outside this workflow and switch to `cluster.mode=reuse`.
+
+With the krunkit driver, each machine directory holds `krunkit.sock` and `vmnet-helper.sock`. The plan checks the longest machine socket and the client socket against the Unix socket limit of 103 bytes on macOS and 107 on Linux. Before libkrun 1.19 the client path adds `-krun.sock` to the helper socket. Starting with libkrun 1.19 the client path is under `TMPDIR`, which the reviewed start command sets explicitly. If the linked version cannot be identified, the plan checks both layouts. Socket lengths use the paths passed to the process, including any home alias that Minikube receives. Execution rechecks this evidence before any delete or start.
 
 A failed start records `failed`. A timeout or an identity verification or binding failure records `uncertain`. These outcomes preserve the profile and block later stages. Inspect the profile with `minikube status -p NAME` and `minikube logs -p NAME` before deciding on recovery. A consumed plan cannot run again.
 
@@ -61,7 +63,7 @@ A failed start records `failed`. A timeout or an identity verification or bindin
 
 Without `--overwrite`, `cluster` on a workspace with a `created` report returns that report. Overwrite also requires the resolved Minikube home recorded at creation. Legacy reports without a home still support ordinary platform operations. Both the deletion and the replacement command use the reviewed home.
 
-The overwrite plan compares the live cluster with this workspace. The result goes to `reports/cluster-reconcile.json`.
+The overwrite plan compares the live cluster with this workspace. The result goes to `reports/cluster-reconcile.json`. If the profile matches, the plan returns `unchanged`. Startup checks apply when the comparison calls for a replacement or the profile is missing.
 
 1. **Identity.** Minikube SSH reads the `kube-system` UID from the running local profile's control plane. The configured context must return that same UID. Only then can a difference from the stored creation identity count as drift. A verified identity difference skips object checks.
 2. **Terraform state.** Every managed resource in `state/*.tfstate` must exist. It must keep its recorded UID and carry this environment's ownership label. `kubernetes_manifest` entries use the UID from the stored object.

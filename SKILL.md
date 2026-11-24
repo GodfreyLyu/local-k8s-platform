@@ -46,7 +46,7 @@ With `cluster.mode=create`, the explicit `cluster.name` becomes the Minikube pro
 python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev cluster
 ```
 
-The plan reads the Minikube version, profile list, machine records, and kubeconfig entry names. Present the profile name, kubeconfig, driver, nodes, CPUs, memory, disk, Kubernetes version, CNI, addons, and the exact command. A conflicting profile, machine record, or kubeconfig entry blocks creation. Obtain authorization for that exact plan, then run `cluster --plan-id REVIEWED_PLAN_ID --execute`. This authorization is separate from prerequisites, Terraform changes, and Secret writes.
+The plan reads the Minikube version, profile list, machine records, and kubeconfig entry names. Present the profile name, kubeconfig, driver, nodes, CPUs, memory, disk, Kubernetes version, CNI, addons, and the exact command. A conflicting profile, machine record, or kubeconfig entry blocks creation. A krunkit start also requires its machine and client socket paths to fit the Unix socket limit. Review `MINIKUBE_HOME` and, for libkrun 1.19 or later, `TMPDIR`. Obtain authorization for that exact plan, then run `cluster --plan-id REVIEWED_PLAN_ID --execute`. This authorization is separate from prerequisites, Terraform changes, and Secret writes.
 
 The result suggests `network.api_server_cidrs` for the new cluster. Review them and add them to the configuration before Kafka prerequisites or planning. A failed or interrupted start or an unverified identity keeps the profile for inspection. Report the outcome and stop.
 
