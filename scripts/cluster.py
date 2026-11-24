@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 from contextlib import nullcontext, suppress
 from pathlib import Path
@@ -31,6 +32,12 @@ MACHINE_SOCKETS = {"krunkit": ("krunkit.sock", "vmnet-helper.sock")}
 SOCKET_PATH_MAX = 103 if sys.platform == "darwin" else 107
 # libkrun 1.19 formats both a u32 process ID and a u32 socket counter in this filename.
 KRUN_TEMP_SOCKET = "krun-net-4294967295-4294967295.sock"
+# Per-machine logs that locate a failed start. vmnet-helper runs before the VM boots, so its first
+# ERROR line is the earliest network failure; without an interface the VM never gets an SSH address.
+MACHINE_LOGS = {"krunkit": ("vmnet-helper.log", "krunkit.log", "serial.log")}
+# Bounds for log excerpts copied into the private creation report.
+LOG_READ_BYTES = 65536
+LOG_LINE_CHARS = 300
 
 
 # Inputs: none. Outputs: absolute minikube path and its reported version.
@@ -668,6 +675,60 @@ def _execute_overwrite(config, workspace, review, materialize):
         ) from None
 
 
+# Inputs: log path. Outputs: the first ERROR line, shortened, or None. Purpose: name the earliest
+# helper failure without copying whole logs. Dependencies: POSIX nonblocking open and regular files.
+def _first_error(path):
+    try:
+        # Validate the opened file, since the path could be replaced between a stat and an open.
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                return None
+            text = os.read(descriptor, LOG_READ_BYTES).decode("utf-8", errors="replace")
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return None
+    line = next((line for line in text.splitlines() if line.startswith("ERROR")), None)
+    return line[:LOG_LINE_CHARS] if line else None
+
+
+# Inputs: configuration, reviewed snapshot, and captured minikube output (None after a timeout or
+# interrupt). Outputs: failure stage, first error, exit reason, and log paths. Purpose: tell the
+# reviewer where the start stopped. Dependencies: Minikube home layout and MACHINE_LOGS.
+def _start_failure(config, snapshot, output=None):
+    home = Path(snapshot["minikube_home"])
+    logs = [home / "logs" / "lastStart.txt"]
+    first_error = stage = None
+    for node in config["derived"]["cluster"]["nodes"]:
+        machine = home / "machines" / node
+        logs += [machine / name for name in MACHINE_LOGS.get(config["cluster"]["create"]["driver"], ())]
+        if first_error is None and (error := _first_error(machine / "vmnet-helper.log")):
+            stage, first_error = "network", f"{node}: {error}"
+    # Minikube prints a stable reason code such as GUEST_PROVISION when it gives up.
+    reason = re.search(r"Exiting due to ([A-Z][A-Z0-9_]+)", output or "")
+    reason = reason[1] if reason else None
+    existing_logs = []
+    for path in logs:
+        with suppress(OSError):
+            if path.is_file():
+                existing_logs.append(str(path))
+    return {
+        "stage": stage or ("minikube" if reason else "unknown"),
+        "first_error": first_error,
+        "minikube_reason": reason,
+        "logs": existing_logs,
+    }
+
+
+# Inputs: failure record from _start_failure. Outputs: one sentence for the CLI error.
+# Purpose: surface the failed stage and log paths without reading the report. Dependencies: none.
+def _failure_hint(failure):
+    detail = failure["first_error"] or failure["minikube_reason"] or "no recognized error"
+    logs = ", ".join(failure["logs"]) or "none found"
+    return f"Failed stage: {failure['stage']} ({detail}). Logs: {logs}."
+
+
 # Inputs: configuration, workspace, reviewed record, and optional overwrite progress. Outputs: creation report.
 # Purpose: run the exact reviewed command once and preserve any partial result. Dependencies: minikube, kubectl.
 def _execute(config, workspace, review, *, previous=None):
@@ -684,43 +745,70 @@ def _execute(config, workspace, review, *, previous=None):
         "runtime_acceptance": "pending",
         **(previous or {}),
     }
-    write_json(consumed, record)
-    write_json(report_path, record)
-    try:
-        result = run(snapshot["command"], timeout=START_TIMEOUT_SECONDS)
-    except RuntimeError:
-        record["status"] = "uncertain"
+    # Inputs: current attempt record and its two paths. Outputs: both updated artifacts.
+    # Purpose: synchronize the consumed plan and creation report. Dependencies: private JSON writes.
+    def save():
         write_json(consumed, record)
         write_json(report_path, record)
-        raise RuntimeError(
-            "minikube start did not finish. Inspect the profile before any further step."
-        ) from None
-    if result.returncode:
-        record["status"] = "failed"
-        write_json(consumed, record)
-        write_json(report_path, record)
-        raise RuntimeError(
-            "minikube start failed; the partial profile was preserved. Review `minikube logs` for this profile before deciding on recovery."
-        )
+
+    result = None
     try:
-        identity = runtime._identity(config)
-        if not runtime._bind(config, workspace, identity, initial_creation=True):
-            raise RuntimeError("An existing workspace binding differs from the new cluster.")
-    except (RuntimeError, ValueError, KeyError, TypeError, OSError) as error:
-        record["status"] = "uncertain"
-        record["post_check"] = str(error)
-        write_json(consumed, record)
-        write_json(report_path, record)
-        raise RuntimeError(
-            "Minikube started but its identity could not be verified and saved; inspect the preserved profile and creation report."
-        ) from None
-    record.update(status="created", identity=identity, binding_established=True)
-    try:
-        record["suggested_api_server_cidrs"] = sorted(runtime._api_peers(config))
-    except (RuntimeError, ValueError, KeyError, TypeError, OSError) as error:
-        record["post_check"] = str(error)
-    write_json(consumed, record)
-    write_json(report_path, record)
+        save()
+        # A timeout can leave krunkit or vmnet-helper running after Minikube is killed.
+        with suppress(RuntimeError):
+            result = run(snapshot["command"], timeout=START_TIMEOUT_SECONDS)
+        if result is None or result.returncode:
+            record["status"] = "uncertain" if result is None else "failed"
+            save()
+            output = None if result is None else result.stdout + "\n" + result.stderr
+            record["failure"] = _start_failure(config, snapshot, output)
+            save()
+            hint = _failure_hint(record["failure"])
+            if result is None:
+                raise RuntimeError(
+                    f"minikube start did not finish. Inspect the profile before any further step. {hint}"
+                )
+            raise RuntimeError(
+                f"minikube start failed; the partial profile was preserved. {hint} "
+                "Review these logs and `minikube logs` for this profile before deciding on recovery."
+            )
+
+        try:
+            identity = runtime._identity(config)
+            if not runtime._bind(config, workspace, identity, initial_creation=True):
+                raise RuntimeError("An existing workspace binding differs from the new cluster.")
+        except (RuntimeError, ValueError, KeyError, TypeError, OSError) as error:
+            record.update(status="uncertain", post_check=str(error))
+            save()
+            raise RuntimeError(
+                "Minikube started but its identity could not be verified and saved; "
+                "inspect the preserved profile and creation report."
+            ) from None
+
+        # Once the binding exists, optional CIDR discovery cannot undo the confirmed creation.
+        record.update(status="created", identity=identity, binding_established=True)
+        save()
+        try:
+            record["suggested_api_server_cidrs"] = sorted(runtime._api_peers(config))
+        except (RuntimeError, ValueError, KeyError, TypeError, OSError) as error:
+            record["post_check"] = str(error)
+        save()
+    except KeyboardInterrupt:
+        collect_logs = False
+        if record["status"] == "attempting":
+            record["status"] = "uncertain"
+            if result is None or result.returncode:
+                collect_logs = True
+            else:
+                record["post_check"] = "Interrupted while verifying or saving the cluster identity."
+        elif record["status"] == "created" and "suggested_api_server_cidrs" not in record:
+            record.setdefault("post_check", "Suggested API server CIDRs are unavailable after interruption.")
+        record["interrupted"] = True
+        save()
+        if collect_logs:
+            record["failure"] = _start_failure(config, snapshot)
+            save()
+        raise
     return record
 
 

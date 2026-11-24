@@ -292,6 +292,10 @@ def main(argv=None):
     except (ValueError, RuntimeError, OSError, KeyError, json.JSONDecodeError) as error:
         print(json.dumps({"status": "blocked", "error": str(error)}), file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        message = "Interrupted. Check the workspace reports for the outcome before retrying."
+        print(json.dumps({"status": "interrupted", "error": message}), file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":
