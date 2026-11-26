@@ -16,6 +16,10 @@ Every `platform.py` action loads the configuration and locks the workspace. It r
 | `cluster` | Check profile, machine, and kubeconfig names. Save a review and plan ID. | None. |
 | `cluster --plan-id ID` | Preview a saved cluster plan. | None. |
 | `cluster --plan-id ID --execute` | Save the verified cluster binding, creation result, and suggested API addresses. | Run the reviewed `minikube start` once for the new profile. |
+| `cluster --overwrite` | Compare the created profile with the workspace records; save a review and plan ID. | Read-only Minikube and API checks. |
+| `cluster --overwrite --plan-id ID --execute` | Archive the previous workspace files and record the replacement. | `minikube delete` (only for the reviewed `overwrite` action), then `minikube start`. |
+| `delete --workspace-files MODE` | Save a review with the data-loss inventory and plan ID. | Read-only Minikube and API inventory. |
+| `delete ... --plan-id ID --execute` | Keep, archive, or purge the workspace files as reviewed. | `minikube delete` for the reviewed profile. |
 | `prerequisites` | Save a review and plan ID for selected dependencies. | Read inventory and create permissions. No writes. |
 | `prerequisites --plan-id ID` | Preview a saved dependency plan. | None. |
 | `prerequisites --plan-id ID --execute` | Install reviewed local packages and record partial results. | Create missing reviewed namespaces, CRDs, RBAC, and workloads. |
@@ -28,11 +32,14 @@ Every `platform.py` action loads the configuration and locks the workspace. It r
 | `credentials --execute` | Use the prepared bundle; record results. | Write fixed source Secrets and the application client Secret. |
 | `credentials --component kafka` | Show Kafka credential mappings. | None. |
 | `credentials --component kafka --execute` | Record handoff results. | Read selected Strimzi client fields and write application client Secrets. |
-| `verify` | Save baseline results and pending acceptance items. | Read-only checks for enabled components. |
+| `verify` | Save baseline results, functional acceptance results, and pending items. | Read-only checks for enabled components, including Prometheus queries through the API server pod proxy. |
+| `acceptance --component C` | Save an acceptance plan with its target, fixtures, effects, cleanup scope, and plan ID. | Read-only checks of identity, readiness, source Secrets, and leftover fixtures. |
+| `acceptance --component C --plan-id ID` | Show the saved plan. | None. |
+| `acceptance --component C --plan-id ID --execute` | Record `reports/acceptance-C.json`. | Create the reviewed fixtures, run one client Pod, then delete the fixtures this run created. |
 | `gpu-smoke` | Show the smoke-test Pod and its effects. | None. |
 | `gpu-smoke --execute` | Record `reports/gpu-smoke.json`. | Create one test Pod in the validation namespace, read its log, and delete it. |
 
-The CLI has no destroy, import, cluster deletion, restart, or cleanup command. `cluster` only creates a profile that does not exist yet. Configuration and preview commands do not authorize later writes. Building this project does not install the skill globally.
+The CLI has no destroy, import, restart, or general cleanup command. Without `--overwrite`, `cluster` only creates a profile that does not exist yet. `cluster --overwrite` and `delete` act only on a profile this workspace created, each through its own reviewed plan; see [Create a Minikube cluster](#create-a-minikube-cluster) and [Delete a created cluster](#delete-a-created-cluster). Acceptance and the GPU smoke test remove only the test objects they created. Configuration and preview commands do not authorize later writes. Building this project does not install the skill globally.
 
 To build a portable archive, choose an output path outside the maintained source directories:
 
@@ -241,21 +248,61 @@ Kafka has no `--prepare` operation. Strimzi issues its source credentials. Never
 
 ## Verification and acceptance
 
-`verify` selects checks from enabled components. PostgreSQL-only operation does not require Kafka CRDs. Plain PostgreSQL does not require CNPG, cert-manager, or Gateway API.
+`verify` selects checks from enabled components. PostgreSQL-only operation does not require Kafka CRDs. Plain PostgreSQL does not require CNPG, cert-manager, or Gateway API. It is read-only and reports three separate results:
 
-This release checks baseline readiness only. The table below also lists evidence needed for functional acceptance. Those functional tests are not automated in this release.
+- `baseline_result` and `checks`: controller status, ownership, Pod readiness, and PVC binding.
+- `acceptance_result` and `acceptance_checks`: functional evidence, each item `pass`, `fail`, or `pending` with its reason.
+- `pending_acceptance`: descriptions of the items still pending.
 
-| Result | Evidence |
+A failed functional check sets `status` to `fail`. Pending items alone keep the baseline status.
+
+### Baseline checks
+
+| Component | Checked objects |
 |---|---|
-| Baseline readiness | Controller status, Pod readiness, PVC binding, and selected monitoring object existence. Actual scrape health remains a separate check. |
-| PostgreSQL acceptance | Dedicated client connection with `verify-full`, expected permissions, wrong-CA/account rejection. |
-| Kafka acceptance | TLS authentication, reachable advertised addresses, isolated produce/consume, forbidden ACL rejection. |
-| Network-policy acceptance | Allowed traffic succeeds and denied traffic fails from scoped clients. |
-| Monitoring acceptance | Actual samples and an isolated alert delivered through the intended route. |
-| Recovery acceptance | Create a protected backup, restore it to isolated resources, and verify the test data. |
-| GPU acceptance | `gpu-smoke --execute` passes against the current plugin. Vulkan, inference, and utilization need separate workload tests. |
+| Stages | Each enabled stage's controller at its current generation, with the environment ownership label. |
+| PostgreSQL | The data PVC is `Bound`. |
+| Kafka | Every configured KafkaTopic (`Ready`, matching `topicName`), both KafkaUsers, the node pool, and each node's data PVC. |
+| Monitoring | One PodMonitor per enabled data service and the `PrometheusRule` with the exact alert set, each owned and carrying the `release` label. |
 
-Functional probes may create Pods, write data, or send alerts. Read-only verification does not authorize those actions. Use isolated fixtures and dedicated identities. Set time limits and review cleanup. Do not change business topics, credentials, replicas, or application data to demonstrate a test.
+Each object reports its own state: `ready`, `missing`, `not-ready`, `not-bound`, `not-owned`, `not-selected`, `mismatch`, `access-denied`, or `read-failed`. One failed read no longer hides the other results. With PostgreSQL and Kafka both enabled, each needs its own PodMonitor.
+
+### Functional acceptance
+
+| Item | Evidence | Source |
+|---|---|---|
+| `postgres_tls` | `verify-full` session; a never-trusted CA and plaintext are rejected. | `acceptance --component postgres` |
+| `postgres_permissions` | Application role has no administrative or monitoring role. A table write in a rolled-back transaction succeeds and leaves nothing behind. `CREATE ROLE`, `pg_read_file`, and `SET ROLE postgres` are denied. The admin role over the network and the application role on `postgres` are rejected. | `acceptance --component postgres` |
+| `kafka_mtls` | The fixture user reads metadata over mTLS; a client without a certificate is rejected. | `acceptance --component kafka` |
+| `kafka_produce_consume` | One message round-trips on a fixture topic with a fixture user and group. | `acceptance --component kafka` |
+| `kafka_acl_rejection` | The fixture user cannot read an application topic, the application producer cannot write to the fixture topic, and the application consumer cannot join another group. | `acceptance --component kafka` |
+| `prometheus_targets`, `prometheus_samples`, `prometheus_rules` | Active targets for each PodMonitor are up, `pg_up` is 1, Kafka under-replicated partitions are 0, and the platform rules are loaded and not firing. | `verify`, through the API server pod proxy |
+| `gpu_smoke` | `gpu-smoke --execute` passed against the current plugin. | `gpu-smoke` |
+| `alert_delivery` | An isolated alert reaches its intended receiver. | Pending; no runner. |
+| `network_policy_allowed`, `network_policy_denied` | Allowed traffic succeeds, and unlabeled or wrong-namespace clients are refused, including DNS. Acceptance Pods use the allowed path only, so they do not close these items. | Pending; no runner. |
+| `postgres_backup_restore`, `gpu_workload` | Protected backup and isolated restore; Vulkan and inference workloads. | Pending; no runner. |
+
+When a Prometheus read fails, for example because `pods/proxy` access is denied or a NetworkPolicy blocks the API server, the affected items stay `pending` with that reason. For a sharded instance, all three items stay `pending` until evidence can be collected across every shard.
+
+`verify` accepts an acceptance report only for the same cluster (`kube-system` UID) and the same tested versions: the PostgreSQL StatefulSet and client Secret, or the Kafka cluster, application KafkaUsers, client Secrets, and cluster CA. A rollout or credential change puts the items back on the pending list.
+
+### Run functional acceptance
+
+```sh
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev acceptance --component postgres
+```
+
+The plan checks the workspace binding, the applied and ready stages, the application client Secrets from `credentials --execute`, and leftover fixtures in this environment. It records a random run ID, the target identity, the tested versions, and the digest-pinned `client_image`. Present the image with the `fixtures`, `reads`, `writes`, `cleanup`, `untouched`, and `time_limits`. Obtain authorization for that plan, then run `acceptance --component postgres --plan-id REVIEWED_PLAN_ID --execute`. Kafka works the same way with `--component kafka`.
+
+Execution rechecks the identity, target versions, and client image before consuming the plan and writing fixtures. It checks each source Secret's UID and resource version again when reading its data. Fixtures live in the validation namespace and, for Kafka, a fixture KafkaTopic and KafkaUser in the Kafka namespace. Each carries the environment labels and `local-k8s-platform/acceptance-run=<run ID>`. The client Pod is non-root and restricted, carries the access label the NetworkPolicies expect, and mounts only the fixture Secret. Its log contains fixed result tokens, never command output or messages.
+
+Cleanup runs after success, failure, or interruption. It deletes fixtures newest first after checking the run and environment labels. Each DELETE carries the UID recorded at creation as a server-side precondition. Deleting the KafkaUser removes the Strimzi-issued Secret, and the run waits for that. Deleting the KafkaTopic removes the fixture topic and its message. The Kafka client Pod also confirms the fixture consumer group is absent after attempting deletion. Remaining fixtures or unconfirmed consumer-group cleanup make `cleanup` `incomplete`. Leftover Kubernetes fixtures block new plans in the owning environment and appear as unmanaged objects in a `delete` plan.
+
+The run copies application client credentials into the fixture Secret for its duration. It never prints them or writes them to reports. The wrong CA's private key exists only in a private local temporary directory during preparation.
+
+### Remaining limits
+
+Functional probes create Pods and Secrets, write fixture data, or would send alerts. Read-only verification does not authorize those actions. Do not change business topics, credentials, replicas, or application data to demonstrate a test.
 
 Build checks and offline tests cover the implementation. They do not establish deployment or runtime acceptance. Mark unexecuted checks as pending, including backups and restores. Single instances and local volumes remain single points of failure after tests pass.
 
@@ -263,4 +310,4 @@ Build checks and offline tests cover the implementation. They do not establish d
 
 Return the configuration, target identity, applied plan IDs, and endpoints. Include required Pod labels, identity names, application-local Secret references, and the acceptance report. Generated interface records keep the status `planned-not-connectivity-verified`. Record live readiness in a separate verification report. Applications still own their schemas, migrations, and releases.
 
-Preserve PVCs, data, state, and credentials after failures. This version has no automatic teardown. Review ownership and backups before volume moves, major upgrades, adoption, or destructive cleanup.
+Preserve PVCs, data, state, and credentials after failures. Platform stages have no teardown command; only a reviewed `delete` removes a created profile with everything in it. Review ownership and backups before volume moves, major upgrades, adoption, or destructive cleanup.

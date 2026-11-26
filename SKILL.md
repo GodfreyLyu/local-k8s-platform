@@ -129,6 +129,14 @@ This shows a preview. Add `--execute` only when that exact change is authorized.
 python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev verify
 ```
 
-`verify` runs read-only readiness checks. With GPU enabled, `gpu-smoke --execute` creates and then deletes one test Pod to check device injection; it needs its own authorization. This release has no other automated functional acceptance runner. Ready Pods and bound PVCs do not prove TLS, permissions, ACLs, network isolation, alerts, or recovery. Leave those results pending until authorized tests provide evidence.
+`verify` is read-only. It reports baseline readiness per object: each Kafka Topic, User, and PVC, and each enabled component's PodMonitor and alert rules. Functional results are reported separately. When Prometheus is readable through the API server pod proxy, it also checks actual targets, samples, and rules; otherwise those items stay pending with the reason. A failed functional check fails the command.
+
+Functional acceptance for PostgreSQL and Kafka runs through a reviewed plan:
+
+```sh
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev acceptance --component postgres
+```
+
+Present the plan's target, `client_image`, `fixtures`, `reads`, `writes`, `cleanup`, `untouched`, and `time_limits`. Obtain authorization for that plan, then run `acceptance --component postgres --plan-id REVIEWED_PLAN_ID --execute`. It creates labeled fixtures and one restricted client Pod. PostgreSQL checks cover `verify-full`, wrong-CA and login rejection, and application role limits. Kafka checks cover mTLS, fixture produce/consume, and ACL rejection. Cleanup uses the recorded UID as a deletion precondition and confirms the Kafka fixture consumer group is absent. Leftover Kubernetes fixtures block new runs in the owning environment. With GPU enabled, `gpu-smoke --execute` creates and then deletes one test Pod and needs its own authorization. NetworkPolicy allowed/denied traffic, alert delivery, backup and restore, and GPU workloads have no runner. Leave them pending until authorized tests provide evidence. See [Verification and acceptance](references/operations.md#verification-and-acceptance).
 
 Return the resolved configuration, created cluster profile if any, executed stages, plan IDs, and endpoints. Include required application labels, application-local Secret references, and remaining acceptance work. Keep credential values out of responses, logs, Terraform inputs, and state. Mark unexecuted checks as pending. Report full usability only after the relevant acceptance checks pass.

@@ -172,6 +172,10 @@ def arguments(argv=None):
     prerequisites.add_argument("--execute", action="store_true")
     smoke = actions.add_parser("gpu-smoke")
     smoke.add_argument("--execute", action="store_true")
+    functional = actions.add_parser("acceptance")
+    functional.add_argument("--component", required=True, choices=("postgres", "kafka"))
+    functional.add_argument("--plan-id")
+    functional.add_argument("--execute", action="store_true")
     credentials = actions.add_parser("credentials")
     credentials.add_argument("--component", choices=("postgres", "kafka"), default="postgres")
     mode = credentials.add_mutually_exclusive_group()
@@ -180,7 +184,7 @@ def arguments(argv=None):
     args = parser.parse_args(argv)
     if args.action == "credentials" and args.component == "kafka" and args.prepare:
         parser.error("Kafka source credentials are prepared by Strimzi, not this tool")
-    if args.action in {"prerequisites", "cluster", "delete"}:
+    if args.action in {"prerequisites", "cluster", "delete", "acceptance"}:
         if args.execute and not args.plan_id:
             parser.error(f"{args.action} --execute requires --plan-id")
         if args.plan_id and not re.fullmatch(r"[0-9a-f]{64}", args.plan_id):
@@ -195,6 +199,9 @@ def contacts_cluster(args):
         return True
     if args.action in {"credentials", "gpu-smoke"}:
         return args.execute
+    if args.action == "acceptance":
+        # Previewing a saved plan reads only the workspace; planning and execution read the cluster.
+        return args.plan_id is None or args.execute
     return args.action == "prerequisites" and args.component != "openssl"
 
 
@@ -219,6 +226,8 @@ def main(argv=None):
             ]
             if not config[component]["enabled"]:
                 raise ValueError("The requested prerequisite component is disabled")
+        if args.action == "acceptance" and not config[args.component]["enabled"]:
+            raise ValueError("The requested acceptance component is disabled")
         if args.action == "gpu-smoke" and not config["gpu"]["enabled"]:
             raise ValueError("The GPU smoke test requires gpu.enabled")
         if args.action in {"cluster", "delete"} and config["cluster"]["mode"] != "create":
@@ -265,6 +274,12 @@ def main(argv=None):
 
                 report = credentials(
                     config, workspace, args.component, prepare=args.prepare, execute=args.execute
+                )
+            elif args.action == "acceptance":
+                from acceptance import acceptance
+
+                report = acceptance(
+                    config, workspace, args.component, args.plan_id, args.execute
                 )
             elif args.action == "gpu-smoke":
                 from gpu import smoke

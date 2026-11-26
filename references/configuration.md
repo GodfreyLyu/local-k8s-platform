@@ -87,7 +87,7 @@ Enable PostgreSQL, Kafka, the GPU device plugin, or any combination. Monitoring 
 | Existing CSI | A new class using the current Minikube CSI Hostpath driver. No extra storage controller is installed. |
 | GPU | A privileged plugin DaemonSet in its own namespace on the selected nodes. New clusters require the `krunkit` driver. |
 
-This version does not start, recreate, resize, or delete clusters. It does not support HTTPS ingress, CNPG, replication, failover, object storage, WAL/PITR, operator upgrades, or application releases. Adding a field to the JSON cannot enable them.
+This version does not start, restart, or resize clusters. It recreates or deletes only a profile this workspace created, through a separately reviewed `cluster --overwrite` or `delete` plan. It does not support HTTPS ingress, CNPG, replication, failover, object storage, WAL/PITR, operator upgrades, or application releases. Adding a field to the JSON cannot enable them.
 
 ## Derived resources and stages
 

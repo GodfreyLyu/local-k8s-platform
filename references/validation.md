@@ -2,7 +2,7 @@
 
 # Validation
 
-This report includes build checks from 2026-11-14 for the small local profile, prerequisite automation, and existing-CSI storage, and live runs from 2026-11-22 on the `skill-test` Minikube profile. The results cover implementation, static validation, a selected-cluster read-only preflight, cluster creation, prerequisites, and deployment of every stage with passing readiness checks. Functional acceptance remains pending.
+This report includes build checks from 2026-11-14 for the small local profile, prerequisite automation, and existing-CSI storage, and live runs from 2026-11-22 and 2026-11-23 on the `skill-test` Minikube profile. The 2026-11-26 entries cover the verify checks and the functional acceptance runner, offline only. The results cover implementation, static validation, a selected-cluster read-only preflight, cluster creation, prerequisites, and deployment of every stage with passing readiness checks. Each row keeps its own date and scope; counts in older rows describe the build of that date. Live functional acceptance remains pending.
 
 ## Results
 
@@ -22,7 +22,7 @@ This report includes build checks from 2026-11-14 for the small local profile, p
 | Portable package | Reproducibility and runtime-file exclusions passed. All 64 source hashes were checked in a temporary archive. Its extracted CLI configured the CSI profile with an empty external-tool PATH. |
 | Terraform formatting | All six stage roots passed recursive format checking. |
 | Native provider check | Schema loading passed with Terraform `1.15.8` and Kubernetes provider `2.38.0`. |
-| Native configuration matrix | All 18 profiles and 63 stage instances passed, with zero errors and zero warnings. |
+| Native configuration matrix (2026-11-14) | All 18 profiles and 63 stage instances passed, with zero errors and zero warnings. The GPU profiles were added on 2026-11-23; see the GPU device plugin row for the 20-profile, 71-instance run. |
 | Typed input contracts | All six exact stage variable declarations accepted normalized input in provider-free, resource-free console fixtures. Twelve negative cases rejected a missing kubeconfig or an invalid context type. |
 | Selected-cluster preflight | The private small profile passed read-only inspection. The estimate placed PostgreSQL and its 1Gi volume on one worker, Kafka and its 1Gi volume on the other, and the Entity Operator on the control node. No resources were created. |
 | Cluster creation (2026-11-22) | 11 isolated tests passed with private fake minikube and kubectl tools. They covered create-mode input checks, the exact reviewed `minikube start` arguments, blocking existing valid/stopped/invalid profiles and contexts, plan invalidation, consumed plans, failed starts without deletion, the pre-creation gate, and legacy workspace bindings. A read-only plan against the local minikube v1.39.0 produced the expected command and blocked the existing `minikube` profile. No cluster was created. |
@@ -35,7 +35,8 @@ This report includes build checks from 2026-11-14 for the small local profile, p
 | Live Kafka and monitoring (2026-11-22) | `31-kafka` applied; Strimzi reconciled Kafka, both topics, and both users to Ready in 340 seconds, and the Kafka client handoff published two application Secrets. The `40-monitoring` preflight then counted the Strimzi entity operator (same image) as a second cluster Operator; operator detection now skips Deployments labeled `strimzi.io/cluster` or owned by a `kafka.strimzi.io` resource. After the fix, `40-monitoring` applied and `verify` passed every readiness check. Prometheus reported both PodMonitor targets up (`pg_up` = 1, Kafka series present) and evaluated all three rules as inactive. |
 | GPU device plugin (2026-11-23) | 11 isolated tests in `tests/test_gpu.py` passed with fake kubectl and minikube. They covered GPU-only and combined configurations, input rejection, node-pinned capacity forecasts, foreign-plugin and stale-registration blocking, the render-device probe, rollout and slot registration, DaemonSet plan review, the restricted smoke Pod, smoke cleanup on success, failure and unschedulable cases, leftover-Pod blocking, and smoke evidence bound to the plugin generation. The full offline suite passed 145 tests on Python 3.13. The native matrix with a local provider mirror passed all 20 profiles and 71 stage instances, with zero errors and zero warnings, including both GPU profiles. The plugin image digest and platforms (linux/amd64, linux/arm64, linux/arm) were read from Docker Hub. No cluster was contacted during these offline checks. |
 | GPU live acceptance (2026-11-23) | On the existing three-node krunkit `skill-test` profile (arm64, Kubernetes v1.37.0), `inspect` found `/dev/dri/renderD128` on all three nodes and no other plugin. The reviewed `20-gpu` plan created only the namespace, NetworkPolicy and DaemonSet. All three plugin Pods became Ready under the NetworkPolicy, and every node advertised `devic.es/dri` capacity and allocatable 1. `verify` passed `20-gpu` and all existing stages. `gpu-smoke --execute` passed on `skill-test-m02` and deleted its Pod. A second `verify` accepted the smoke evidence. Apply returned before the new DaemonSet was Ready, so `verify` is the readiness gate. Vulkan and inference remain pending. |
-| Live acceptance | Readiness and scraping pass on `skill-test`. Functional acceptance (TLS, permissions, ACLs, backup and restore, alert delivery, NetworkPolicy traffic) is pending. |
+| Verify and functional acceptance (2026-11-26, offline) | 24 focused tests passed using fake kubectl and Kafka tools. They cover per-object verification after denied reads and timeouts, alert-only rule comparisons, pending sharded Prometheus evidence, Kafka metadata and offset-commit flags, consumer-group absence after deletion, UID-conditional cleanup under replacement, environment-scoped leftovers, source Secret rotation, and client image binding. The full suite passed 216 tests on Python 3.10.11. A loopback fake API confirmed that kubectl sends the UID precondition and returns nonzero on conflict. Checks against live client images and services remain pending. |
+| Live acceptance | Readiness and scraping passed on `skill-test` (2026-11-22). Functional acceptance with the new runner is pending a reviewed live run. Backup and restore, alert delivery, and NetworkPolicy traffic have no runner and remain pending. |
 
 ## Prerequisite checks
 
@@ -60,7 +61,9 @@ two volumes. The selected cluster's existing Operators and CSI driver were reuse
 in the preflight. This estimate does not reserve the proposed placement. Startup,
 connections, memory pressure, and training workloads still need runtime evidence.
 
-## Native Terraform run
+## Native Terraform run (2026-11-14)
+
+This section describes the 18-profile run before the GPU stage existed. The 2026-11-23 run with a local provider mirror passed 20 profiles and 71 stage instances; see the results table.
 
 The report returned `status=pass`, `provider_probe=pass`, and `cases_passed=cases_planned=63`.
 

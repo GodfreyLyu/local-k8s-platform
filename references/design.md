@@ -19,6 +19,7 @@ This skill configures a local development platform on an existing or newly creat
 | Runtime checks | Check cluster identity, ownership, prerequisites, and readiness. | Inventory, plan review, and acceptance status. |
 | Capacity helper | Estimate joint Pod memory and volume placement from current evidence. | Suggested allocations and remaining node capacity. |
 | GPU smoke helper | Create one restricted test Pod that requests the GPU resource, read its result, and delete it. | Smoke report bound to the cluster and plugin rollout. |
+| Acceptance helper | Plan, then run one restricted client Pod against labeled PostgreSQL or Kafka fixtures, and delete only the fixtures its run created. | Plan ID, acceptance report bound to the cluster and the tested versions. |
 
 The agent invokes the packaged CLI through its execution tool. Python starts child commands without a shell wrapper. This skill needs no custom server, MCP connection, background daemon, or scheduler.
 
@@ -119,9 +120,11 @@ After a failure, stop writes and report what completed. Inspect the current stat
 
 Offline tests cover configuration, workspace creation, state isolation, plan integrity, command effects, credentials, and checks for the selected components. They use fake external tools where needed. Terraform formatting and provider validation check the packaged assets.
 
-The native validation run passed 63 stage instances across 18 profiles, including existing-CSI storage. This checks static Terraform and provider schemas, not deployed services. See [build validation](validation.md) for the evidence and remaining limits.
+The latest native validation run (2026-11-23) passed 71 stage instances across 20 profiles, including existing-CSI storage and both GPU profiles. This checks static Terraform and provider schemas, not deployed services. See [build validation](validation.md) for the evidence and remaining limits.
 
-`verify` reads baseline readiness and storage status. Functional acceptance needs separate checks for authentication, permissions, allowed and denied traffic, metrics, alert delivery, and restore results. This release has no automated SQL, Kafka, network, or backup acceptance runner.
+`verify` reads baseline readiness per object and stays read-only. It also reads actual Prometheus targets, samples, and rules when the API server pod proxy allows it. Functional results stay separate from baseline results.
+
+The acceptance helper is a separate, reviewed write path, like the GPU smoke test. Fixtures carry a random run label and live in the validation namespace, plus a fixture topic and user for Kafka. Cleanup trusts only that label together with the UID recorded at creation, so it never deletes an object it did not create. Application credentials are copied into a fixture Secret for the run instead of placing test Pods in the application namespace. Results count only for the same cluster and tested versions. NetworkPolicy traffic, alert delivery, and restore have no runner. The acceptance Pods exercise only allowed paths, so the NetworkPolicy items stay separate.
 
 ## Extension points
 

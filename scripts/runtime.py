@@ -7,6 +7,7 @@ import json
 import re
 import shutil
 import time
+import urllib.parse
 from pathlib import Path
 
 from capacity import assess
@@ -41,6 +42,26 @@ MANIFEST_KINDS = {
     "PodMonitor": "podmonitors.monitoring.coreos.com",
     "PrometheusRule": "prometheusrules.monitoring.coreos.com",
 }
+# Alert names rendered by 40-monitoring for each enabled component.
+POSTGRES_ALERTS = {"LocalPlatformPostgresUnavailable", "LocalPlatformPostgresCollectorIncomplete"}
+KAFKA_ALERTS = {"LocalPlatformKafkaUnavailable"}
+# Stable functional acceptance items reported by verify, independent of baseline checks.
+ACCEPTANCE_ITEMS = {
+    "gpu_smoke": "GPU Pod device injection: run gpu-smoke --execute against the current plugin",
+    "gpu_workload": "Vulkan, model inference and GPU utilization inside the krunkit virtio GPU",
+    "postgres_tls": "PostgreSQL verify-full connection and wrong-CA rejection using an isolated validation identity",
+    "postgres_permissions": "PostgreSQL non-superuser permission checks",
+    "postgres_backup_restore": "Host backup and isolated restore with data comparison",
+    "kafka_mtls": "Kafka mutual TLS and metadata reachability",
+    "kafka_produce_consume": "Kafka produce/consume on an isolated fixture topic",
+    "kafka_acl_rejection": "Kafka forbidden-topic and consumer-group ACL rejection",
+    "prometheus_targets": "Actual Prometheus target health for each enabled PodMonitor",
+    "prometheus_samples": "Actual database/Kafka series in Prometheus",
+    "prometheus_rules": "Prometheus loaded the platform alert rules and none are firing",
+    "alert_delivery": "Isolated alert route and receiver delivery",
+    "network_policy_allowed": "Authorized cross-Pod NetworkPolicy traffic, including DNS",
+    "network_policy_denied": "Unauthorized cross-Pod traffic rejected by NetworkPolicy",
+}
 
 
 # Inputs: JSON-compatible value. Outputs: stable SHA256 string.
@@ -65,6 +86,23 @@ def _kube(config: dict) -> list[str]:
     ]
 
 
+class ReadError(RuntimeError):
+    """A failed read, classified as `access-denied` or `read-failed`, without the API response text."""
+
+    # Inputs: safe message and reason token. Outputs: exception. Purpose: let checks tell a
+    # permission denial from an unavailable API without printing kubectl output. Dependencies: none.
+    def __init__(self, message: str, reason: str):
+        super().__init__(message)
+        self.reason = reason
+
+
+# Inputs: completed kubectl process. Outputs: `access-denied` or `read-failed`.
+# Purpose: classify a failed read from its status text only. Dependencies: kubectl error wording.
+def _read_failure(result) -> str:
+    text = (result.stderr or "").lower()
+    return "access-denied" if "forbidden" in text or "unauthorized" in text else "read-failed"
+
+
 # Inputs: configuration and GET arguments. Outputs: decoded JSON or None for an absent named object.
 # Purpose: Read cluster objects without printing their contents. Dependencies: kubectl, io_utils.run.
 def _get(
@@ -74,6 +112,7 @@ def _get(
     namespace: str | None = None,
     *,
     all_namespaces: bool = False,
+    selector: str | None = None,
 ) -> dict | None:
     command = _kube(config) + ["get", resource]
     if name is not None:
@@ -82,10 +121,49 @@ def _get(
         command += ["--namespace", namespace]
     if all_namespaces:
         command += ["--all-namespaces"]
-    result = run(command + ["-o", "json"], timeout=20)
+    if selector is not None:
+        command += ["--selector", selector]
+    message = f"Cannot read {resource}; check API access and permissions."
+    try:
+        result = run(command + ["-o", "json"], timeout=20)
+    except (RuntimeError, ValueError) as error:
+        raise ReadError(message, "read-failed") from error
     if result.returncode:
-        raise RuntimeError(f"Cannot read {resource}; check API access and permissions.")
-    return json.loads(result.stdout) if result.stdout.strip() else None
+        raise ReadError(message, _read_failure(result))
+    if not result.stdout.strip():
+        return None
+    try:
+        item = json.loads(result.stdout)
+    except ValueError as error:
+        raise ReadError(message, "read-failed") from error
+    if not isinstance(item, dict):
+        raise ReadError(message, "read-failed")
+    return item
+
+
+# Inputs: configuration and one named object reference. Outputs: (state, object or None).
+# Purpose: separate missing objects from denied or failed reads per check. Dependencies: _get.
+def _observe(config: dict, resource: str, name: str, namespace: str | None = None):
+    try:
+        item = _get(config, resource, name, namespace)
+    except ReadError as error:
+        return error.reason, None
+    return ("present" if item else "missing"), item
+
+
+# Inputs: observed state, object, environment ID, and whether a Ready condition is required.
+# Outputs: one of missing/access-denied/read-failed/not-owned/not-ready/ready.
+# Purpose: share the per-object vocabulary of verify checks. Dependencies: ownership label convention.
+def _object_state(state: str, item: dict | None, environment_id: str, ready: bool = True) -> str:
+    if state != "present":
+        return state
+    metadata = item.get("metadata", {})
+    if metadata.get("labels", {}).get(ENVIRONMENT_LABEL) != environment_id:
+        return "not-owned"
+    current = item.get("status", {}).get("observedGeneration", 0) >= metadata.get("generation", 1)
+    if ready and not (current and _condition(item)):
+        return "not-ready"
+    return "ready"
 
 
 # Inputs: normalized configuration. Outputs: cluster identity without authentication material.
@@ -726,16 +804,16 @@ def _stage_ready(config: dict, stage: str) -> tuple[bool, str]:
         ready = ready and item.get("status", {}).get("observedGeneration", 0) >= item.get(
             "metadata", {}
         ).get("generation", 1)
-        return ready, "PostgreSQL StatefulSet needs one Ready replica at its current generation."
+        ready = ready and item["metadata"].get("labels", {}).get(
+            ENVIRONMENT_LABEL
+        ) == config["environment_id"]
+        return ready, "Owned PostgreSQL StatefulSet needs one Ready replica at its current generation."
     if stage == "31-kafka":
         item = _get(
             config, "kafkas.kafka.strimzi.io", derived["kafka_name"], config["kafka"]["namespace"]
         )
-        return bool(item) and _condition(item) and item.get("status", {}).get(
-            "observedGeneration", 0
-        ) >= item.get("metadata", {}).get(
-            "generation", 1
-        ), "Kafka must report Ready at its current generation."
+        state = _object_state("present" if item else "missing", item, config["environment_id"])
+        return state == "ready", "Owned Kafka must report Ready at its current generation."
     return True, "No further controller dependency is required."
 
 
@@ -1253,15 +1331,241 @@ def _gpu_smoke_current(config: dict, workspace: Path, identity: dict) -> dict | 
     return {"captured_at": report.get("captured_at"), "node": report.get("node")}
 
 
-# Inputs: normalized configuration and workspace. Outputs: enabled-component baseline with explicit pending functional acceptance.
-# Purpose: Report actual readiness without treating Ready Pods as protocol, policy or recovery proof. Dependencies: kubectl GET.
+# Inputs: resolved configuration. Outputs: {name: (kind, object name, expected alerts or None)}.
+# Purpose: derive the exact monitoring objects 40-monitoring renders for enabled components.
+# Dependencies: naming in assets/infra/stacks/40-monitoring/main.tf.
+def _expected_monitoring(config: dict) -> dict:
+    env = config["environment_id"]
+    expected, alerts = {}, set()
+    if config["postgres"]["enabled"]:
+        expected["podmonitor_postgres"] = ("podmonitors.monitoring.coreos.com", f"{env}-postgres")
+        alerts |= POSTGRES_ALERTS
+    if config["kafka"]["enabled"]:
+        expected["podmonitor_kafka"] = ("podmonitors.monitoring.coreos.com", f"{env}-kafka")
+        alerts |= KAFKA_ALERTS
+    expected["prometheusrule"] = ("prometheusrules.monitoring.coreos.com", f"{env}-data", alerts)
+    return expected
+
+
+# Inputs: resolved configuration. Outputs: (name, passed, detail) per expected monitoring object.
+# Purpose: require each enabled component's PodMonitor and the exact alert rule set, owned and
+# selectable by Prometheus. Dependencies: kubectl GET.
+def _monitoring_checks(config: dict) -> list[tuple]:
+    namespace = config["monitoring"]["namespace"]
+    checks = []
+    for check, (resource, name, *rest) in _expected_monitoring(config).items():
+        state, item = _observe(config, resource, name, namespace)
+        state = _object_state(state, item, config["environment_id"], ready=False)
+        detail = {"object": f"{namespace}/{name}", "state": state}
+        if state == "ready":
+            labels = item["metadata"].get("labels", {})
+            if labels.get("release") != config["monitoring"]["release"]:
+                state = detail["state"] = "not-selected"
+            elif rest:
+                found = {
+                    rule["alert"]
+                    for group in item.get("spec", {}).get("groups", [])
+                    for rule in group.get("rules", [])
+                    if "alert" in rule
+                }
+                detail["alerts"] = sorted(found)
+                if found != rest[0]:
+                    state = detail["state"] = "mismatch"
+                    detail["expected_alerts"] = sorted(rest[0])
+        checks.append((check, state == "ready", detail))
+    return checks
+
+
+# Inputs: resolved configuration. Outputs: (name, passed, detail) per Kafka sub-resource.
+# Purpose: check every configured Topic, both Users, the node pool and its PVCs separately, and
+# tell missing, not-ready, and unreadable objects apart. Dependencies: kubectl GET, Strimzi naming.
+def _kafka_checks(config: dict) -> list[tuple]:
+    env, namespace = config["environment_id"], config["kafka"]["namespace"]
+    name = config["derived"]["kafka_name"]
+    checks = []
+    for topic in config["kafka"]["topics"]:
+        # Mirrors the 31-kafka resource name: environment ID plus the topic's SHA-256 prefix.
+        resource_name = f"{env}-{hashlib.sha256(topic.encode()).hexdigest()[:12]}"
+        state, item = _observe(config, "kafkatopics.kafka.strimzi.io", resource_name, namespace)
+        state = _object_state(state, item, env)
+        if state == "ready" and item.get("spec", {}).get("topicName") != topic:
+            state = "mismatch"
+        checks.append((f"kafka_topic:{topic}", state == "ready", {"object": resource_name, "state": state}))
+    for role in ("producer", "consumer"):
+        state, item = _observe(config, "kafkausers.kafka.strimzi.io", f"{name}-{role}", namespace)
+        state = _object_state(state, item, env)
+        checks.append((f"kafka_user:{role}", state == "ready", {"object": f"{name}-{role}", "state": state}))
+    pool = f"{name}-combined"
+    state, item = _observe(config, "kafkanodepools.kafka.strimzi.io", pool, namespace)
+    state = _object_state(state, item, env, ready=False)
+    nodes = (item or {}).get("status", {}).get("nodeIds") or []
+    current = (item or {}).get("status", {}).get("observedGeneration", 0) >= (item or {}).get(
+        "metadata", {}
+    ).get("generation", 1)
+    if state == "ready" and (not current or len(nodes) != item.get("spec", {}).get("replicas")):
+        state = "not-ready"
+    checks.append(("kafka_node_pool", state == "ready", {"object": pool, "state": state}))
+    if state != "ready":
+        checks.append(("kafka_pvc", False, {"state": "unknown", "reason": "node pool is not ready"}))
+        return checks
+    for node in nodes:
+        # Strimzi names JBOD volume 0 of Pod <cluster>-<pool>-<id> as data-0-<pod>.
+        claim = f"data-0-{name}-{pool}-{node}"
+        state, item = _observe(config, "persistentvolumeclaims", claim, namespace)
+        if state == "present":
+            labels = item["metadata"].get("labels", {})
+            state = (
+                "not-owned"
+                if labels.get("strimzi.io/cluster") != name
+                else "ready"
+                if item.get("status", {}).get("phase") == "Bound"
+                else "not-bound"
+            )
+        checks.append((f"kafka_pvc:{claim}", state == "ready", {"object": claim, "state": state}))
+    return checks
+
+
+# Inputs: configuration and a Prometheus HTTP API path with query string. Outputs: (data, reason).
+# Purpose: query Prometheus read-only through the API server pod proxy. Dependencies: kubectl get --raw.
+def _prometheus_api(config: dict, base: str, path: str) -> tuple[object, str | None]:
+    try:
+        result = run(_kube(config) + ["get", "--raw", base + path], timeout=20)
+    except RuntimeError:
+        return None, "Prometheus API request timed out or kubectl could not start."
+    if result.returncode:
+        if _read_failure(result) == "access-denied":
+            return None, "Access denied: reading Prometheus needs get on pods/proxy in its namespace."
+        return None, "Prometheus API is unreachable through the API server pod proxy."
+    try:
+        document = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None, "Prometheus API returned an unreadable response."
+    if document.get("status") != "success":
+        return None, "Prometheus API returned an error status."
+    return document.get("data"), None
+
+
+# Inputs: resolved configuration. Outputs: acceptance entries for targets, samples and rules.
+# Purpose: compare actual scrape and rule state with the enabled components, or keep each item
+# pending with the reason Prometheus could not be read. Dependencies: prerequisites._prometheus, kubectl.
+def _prometheus_checks(config: dict) -> list[dict]:
+    from prerequisites import _prometheus
+
+    names = ("prometheus_targets", "prometheus_samples", "prometheus_rules")
+    try:
+        instance = _prometheus(config)
+        reason = None if instance else "No compatible Prometheus instance was found."
+    except ReadError as error:
+        instance, reason = None, f"Prometheus instance could not be read ({error.reason})."
+    except RuntimeError as error:
+        instance, reason = None, str(error)
+    if instance is None:
+        return [_acceptance(name, "pending", reason) for name in names]
+    shards = instance.get("spec", {}).get("shards") or 1
+    if shards > 1:
+        reason = f"Prometheus has {shards} shards; verification requires evidence across all shards."
+        return [_acceptance(name, "pending", reason) for name in names]
+    namespace = instance["metadata"]["namespace"]
+    pod = f"prometheus-{instance['metadata']['name']}-0"
+    base = f"/api/v1/namespaces/{namespace}/pods/http:{pod}:9090/proxy/api/v1/"
+    targets, reason = _prometheus_api(config, base, "targets?state=active")
+    if reason:
+        entries = [_acceptance("prometheus_targets", "pending", reason)]
+    else:
+        monitoring = config["monitoring"]["namespace"]
+        expected = [
+            name for kind, name, *_ in _expected_monitoring(config).values()
+            if kind.startswith("podmonitors")
+        ]
+        pools = {}
+        for target in targets.get("activeTargets", []):
+            pools.setdefault(target.get("scrapePool", ""), []).append(target.get("health"))
+        detail = {}
+        for name in expected:
+            health = [
+                value for pool, values in pools.items()
+                if pool.startswith(f"podMonitor/{monitoring}/{name}/")
+                for value in values
+            ]
+            detail[name] = {"active": len(health), "up": health.count("up")}
+        up = all(item["active"] and item["up"] == item["active"] for item in detail.values())
+        entries = [_acceptance("prometheus_targets", "pass" if up else "fail", detail)]
+    derived = config["derived"]
+    queries = {}
+    if config["postgres"]["enabled"]:
+        queries["pg_up"] = (
+            f'pg_up{{namespace="{derived["namespace"]}",pod=~"{derived["postgres_name"]}-[0-9]+"}}',
+            "1",
+        )
+    if config["kafka"]["enabled"]:
+        queries["kafka_under_replicated_partitions"] = (
+            f'kafka_under_replicated_partitions{{namespace="{config["kafka"]["namespace"]}",'
+            f'pod=~"{derived["kafka_name"]}-.+"}}',
+            "0",
+        )
+    samples, failed = {}, None
+    for metric, (query, wanted) in queries.items():
+        data, reason = _prometheus_api(
+            config, base, "query?" + urllib.parse.urlencode({"query": query})
+        )
+        if reason:
+            failed = reason
+            break
+        values = [item.get("value", [None, None])[1] for item in data.get("result", [])]
+        samples[metric] = {"series": len(values), "expected": wanted, "matching": values.count(wanted)}
+    if failed:
+        entries.append(_acceptance("prometheus_samples", "pending", failed))
+    else:
+        ok = all(item["series"] and item["matching"] == item["series"] for item in samples.values())
+        entries.append(_acceptance("prometheus_samples", "pass" if ok else "fail", samples))
+    data, reason = _prometheus_api(config, base, "rules?type=alert")
+    if reason:
+        entries.append(_acceptance("prometheus_rules", "pending", reason))
+        return entries
+    group = f"{config['environment_id']}.data"
+    rules = {
+        rule.get("name"): rule.get("state")
+        for item in data.get("groups", [])
+        if item.get("name") == group
+        for rule in item.get("rules", [])
+    }
+    wanted = _expected_monitoring(config)["prometheusrule"][2]
+    firing = sorted(name for name, state in rules.items() if state == "firing")
+    ok = set(rules) == wanted and not firing
+    entries.append(
+        _acceptance(
+            "prometheus_rules", "pass" if ok else "fail", {"loaded": rules, "firing": firing}
+        )
+    )
+    return entries
+
+
+# Inputs: check name, status (pass/fail/pending), and safe detail. Outputs: acceptance entry.
+# Purpose: keep functional results separate from baseline checks. Dependencies: ACCEPTANCE_ITEMS.
+def _acceptance(name: str, status: str, detail: object) -> dict:
+    return {
+        "name": name,
+        "description": ACCEPTANCE_ITEMS[name],
+        "status": status,
+        "detail": detail,
+    }
+
+
+# Inputs: normalized configuration and workspace. Outputs: baseline results, functional acceptance
+# results and pending items, each reported separately. Purpose: report actual readiness without
+# treating Ready Pods as protocol, policy or recovery proof. Dependencies: kubectl GET (read-only),
+# acceptance evidence reports.
 def verify(config: dict, workspace: Path) -> dict:
+    import acceptance
+
     report = {
         "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "checks": [],
+        "acceptance_checks": [],
         "acceptance_result": "incomplete",
         "pending_acceptance": [],
     }
+    functional = report["acceptance_checks"]
     try:
         identity = _identity(config)
         bound = _bind(config, workspace, identity)
@@ -1276,82 +1580,89 @@ def verify(config: dict, workspace: Path) -> dict:
             write_json(workspace / "reports" / "verification.json", report)
             return report
         for stage in config["derived"]["stages"]:
-            ready, detail = _stage_ready(config, stage)
-            # Kubelet registers the plugin resource shortly after the DaemonSet becomes Ready.
-            for _ in range(GPU_REGISTRATION_RETRIES if stage == "20-gpu" else 0):
-                if ready:
-                    break
-                time.sleep(2)
+            try:
                 ready, detail = _stage_ready(config, stage)
+                # Kubelet registers the plugin resource shortly after the DaemonSet becomes Ready.
+                for _ in range(GPU_REGISTRATION_RETRIES if stage == "20-gpu" else 0):
+                    if ready:
+                        break
+                    time.sleep(2)
+                    ready, detail = _stage_ready(config, stage)
+            except ReadError as error:
+                ready, detail = False, {"state": error.reason, "reason": str(error)}
             _check(report, stage, ready, detail)
         if config["gpu"]["enabled"]:
-            smoke = _gpu_smoke_current(config, workspace, identity)
-            if smoke:
-                _check(report, "gpu_smoke", True, smoke)
+            try:
+                smoke = _gpu_smoke_current(config, workspace, identity)
+            except ReadError as error:
+                _check(report, "gpu_smoke", False, {"state": error.reason, "reason": str(error)})
+                functional.append(_acceptance("gpu_smoke", "pending", str(error)))
             else:
-                report["pending_acceptance"].append(
-                    "GPU Pod device injection: run gpu-smoke --execute against the current plugin"
+                if smoke:
+                    _check(report, "gpu_smoke", True, smoke)
+                functional.append(
+                    _acceptance("gpu_smoke", "pass", smoke)
+                    if smoke
+                    else _acceptance(
+                        "gpu_smoke", "pending", "Run gpu-smoke --execute against the current plugin."
+                    )
                 )
-            report["pending_acceptance"].append(
-                "Vulkan, model inference and GPU utilization inside the krunkit virtio GPU"
+            functional.append(
+                _acceptance("gpu_workload", "pending", "Needs a separate workload test.")
             )
         if config["postgres"]["enabled"]:
-            pvc = _get(
+            state, pvc = _observe(
                 config,
                 "persistentvolumeclaims",
                 f"{config['derived']['postgres_name']}-data",
                 config["derived"]["namespace"],
             )
+            if state == "present":
+                state = "ready" if pvc.get("status", {}).get("phase") == "Bound" else "not-bound"
             _check(
                 report,
                 "postgres_pvc",
-                bool(pvc) and pvc.get("status", {}).get("phase") == "Bound",
-                "PostgreSQL PVC must be Bound; this does not establish recovery.",
+                state == "ready",
+                {"state": state, "note": "A Bound PVC does not establish recovery."},
             )
-            report["pending_acceptance"] += [
-                "PostgreSQL verify-full connection and wrong-CA rejection using an isolated validation identity",
-                "PostgreSQL non-superuser permission checks",
-                "Host backup and isolated restore with data comparison",
-            ]
+            functional += acceptance.evidence(config, workspace, identity, "postgres")
+            functional.append(
+                _acceptance("postgres_backup_restore", "pending", "No automated runner.")
+            )
         if config["kafka"]["enabled"]:
-            report["pending_acceptance"] += [
-                "Kafka TLS, metadata reachability and isolated produce/consume",
-                "Kafka forbidden-topic and consumer-group ACL rejection",
-            ]
+            for name, passed, detail in _kafka_checks(config):
+                _check(report, name, passed, detail)
+            functional += acceptance.evidence(config, workspace, identity, "kafka")
         if config["monitoring"]["enabled"]:
-            monitors = _get(
-                config,
-                "podmonitors.monitoring.coreos.com",
-                namespace=config["monitoring"]["namespace"],
+            for name, passed, detail in _monitoring_checks(config):
+                _check(report, name, passed, detail)
+            functional += _prometheus_checks(config)
+            functional.append(
+                _acceptance("alert_delivery", "pending", "Needs an isolated route and receiver.")
             )
-            selected = [
-                item
-                for item in monitors["items"]
-                if item["metadata"].get("labels", {}).get(ENVIRONMENT_LABEL)
-                == config["environment_id"]
-            ]
-            _check(
-                report,
-                "podmonitors",
-                bool(selected),
-                "Owned PodMonitors must exist; scrape samples are checked separately.",
-            )
-            report["pending_acceptance"] += [
-                "Actual Prometheus target health and database/Kafka series",
-                "Isolated alert route and receiver delivery",
-            ]
-        report["pending_acceptance"].append(
-            "Authorized and unauthorized cross-Pod NetworkPolicy traffic, including DNS"
-        )
+        for name in ("network_policy_allowed", "network_policy_denied"):
+            functional.append(_acceptance(name, "pending", "No automated runner."))
     except (RuntimeError, ValueError, KeyError, TypeError, OSError):
         _check(
             report, "verification_access", False, "Verification data is unavailable or incomplete."
         )
+    report["pending_acceptance"] = [
+        item["description"] for item in functional if item["status"] == "pending"
+    ]
     report["baseline_result"] = (
         "pass"
         if report["checks"] and all(item["status"] == "pass" for item in report["checks"])
         else "blocked"
     )
-    report["status"] = report["baseline_result"]
+    statuses = {item["status"] for item in functional}
+    report["acceptance_result"] = (
+        "fail" if "fail" in statuses else "pass" if statuses == {"pass"} else "incomplete"
+    )
+    # A failed functional check fails the command; pending items alone keep the baseline status.
+    report["status"] = (
+        "fail"
+        if report["baseline_result"] == "pass" and report["acceptance_result"] == "fail"
+        else report["baseline_result"]
+    )
     write_json(workspace / "reports" / "verification.json", report)
     return report
