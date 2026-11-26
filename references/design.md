@@ -20,6 +20,7 @@ This skill configures a local development platform on an existing or newly creat
 | Capacity helper | Estimate joint Pod memory and volume placement from current evidence. | Suggested allocations and remaining node capacity. |
 | GPU smoke helper | Create one restricted test Pod that requests the GPU resource, read its result, and delete it. | Smoke report bound to the cluster and plugin rollout. |
 | Acceptance helper | Plan, then run one restricted client Pod against labeled PostgreSQL or Kafka fixtures, and delete only the fixtures its run created. | Plan ID, acceptance report bound to the cluster and the tested versions. |
+| Recovery helper | Plan and take a logical PostgreSQL dump through `kubectl exec`, then compare an isolated restore in local Docker. | Private backup directory with a checksummed manifest; backup and restore reports. |
 
 The agent invokes the packaged CLI through its execution tool. Python starts child commands without a shell wrapper. This skill needs no custom server, MCP connection, background daemon, or scheduler.
 
@@ -124,7 +125,9 @@ The latest native validation run (2026-11-23) passed 71 stage instances across 2
 
 `verify` reads baseline readiness per object and stays read-only. It also reads actual Prometheus targets, samples, and rules when the API server pod proxy allows it. Functional results stay separate from baseline results.
 
-The acceptance helper is a separate, reviewed write path, like the GPU smoke test. Fixtures carry a random run label and live in the validation namespace, plus a fixture topic and user for Kafka. Cleanup trusts only that label together with the UID recorded at creation, so it never deletes an object it did not create. Application credentials are copied into a fixture Secret for the run instead of placing test Pods in the application namespace. Results count only for the same cluster and tested versions. NetworkPolicy traffic, alert delivery, and restore have no runner. The acceptance Pods exercise only allowed paths, so the NetworkPolicy items stay separate.
+Backups use the in-Pod Unix socket with peer authentication, so no password leaves the cluster or appears in arguments. A plain-format dump is verifiable without PostgreSQL tools on the host: the completion trailer proves pg_dump finished, and `COPY` sections give exact row counts. Restore compares those counts instead of counts taken from the live source, which may change during the dump. Restore replays the verified private snapshot inside a network-isolated local Docker container. Cleanup uses the container ID returned at creation. Verification ties evidence to the source PVC and PV UIDs and requires a matching fixture. Credential renewal stays manual because each step changes live authentication; the expiry check gives the inputs and the documented order gives the recovery points.
+
+The acceptance helper is a separate, reviewed write path, like the GPU smoke test. Fixtures carry a random run label and live in the validation namespace, plus a fixture topic and user for Kafka. Cleanup trusts only that label together with the UID recorded at creation, so it never deletes an object it did not create. Application credentials are copied into a fixture Secret for the run instead of placing test Pods in the application namespace. Results count only for the same cluster and tested versions. NetworkPolicy traffic and alert delivery have no runner. The acceptance Pods exercise only allowed paths, so the NetworkPolicy items stay separate.
 
 ## Extension points
 

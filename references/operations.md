@@ -32,6 +32,11 @@ Every `platform.py` action loads the configuration and locks the workspace. It r
 | `credentials --execute` | Use the prepared bundle; record results. | Write fixed source Secrets and the application client Secret. |
 | `credentials --component kafka` | Show Kafka credential mappings. | None. |
 | `credentials --component kafka --execute` | Record handoff results. | Read selected Strimzi client fields and write application client Secrets. |
+| `credentials --expiry` | Record `reports/credentials-expiry.json`. | Read-only: public certificate fields and application Pods. |
+| `backup --backup-dir DIR [--with-fixture]` | Save a backup plan and plan ID. | Read-only checks and the database size. |
+| `backup ... --plan-id ID --execute` | Write `dump.sql` and `manifest.json` under `DIR`; record `reports/backup.json`. | `pg_dump` through `kubectl exec`; with `--with-fixture`, insert and then remove one fixture row. |
+| `restore --backup PATH [--target-database NAME] [--keep-target]` | Verify the backup offline; save a restore plan and plan ID. | Read-only backup, PostgreSQL identity, and local Docker engine checks. |
+| `restore ... --plan-id ID --execute` | Record `reports/restore.json`. | Create a local isolated Docker container, load and compare the dump, then remove the container unless `--keep-target`. |
 | `verify` | Save baseline results, functional acceptance results, and pending items. | Read-only checks for enabled components, including Prometheus queries through the API server pod proxy. |
 | `acceptance --component C` | Save an acceptance plan with its target, fixtures, effects, cleanup scope, and plan ID. | Read-only checks of identity, readiness, source Secrets, and leftover fixtures. |
 | `acceptance --component C --plan-id ID` | Show the saved plan. | None. |
@@ -226,7 +231,7 @@ python3 -B scripts/platform.py --config environment.json --workspace /private/pa
 
 Preparation reuses a valid existing bundle. Stop if ownership is unknown, files are incomplete, certificates have expired, or identities have changed. Inspect the affected files and objects. The helper does not silently reset passwords. Some Secret writes may succeed before another fails. They are not a transaction across namespaces. Check the recorded result before retrying.
 
-Changing a Kubernetes Secret alone does not change a database role password. Certificate renewal, password rotation, client reloads, and rollout are separate changes. This helper does not automate rotation.
+Changing a Kubernetes Secret alone does not change a database role password. Certificate renewal, password rotation, client reloads, and rollout are separate changes. The helper does not automate rotation, and `credentials --execute` keeps refusing to overwrite a Secret whose contents differ. See [Credential expiry and renewal](#credential-expiry-and-renewal) for the manual order.
 
 ## Kafka client handoff
 
@@ -245,6 +250,110 @@ python3 -B scripts/platform.py --config environment.json --workspace /private/pa
 ```
 
 Kafka has no `--prepare` operation. Strimzi issues its source credentials. Never copy cluster CA private keys or broker identities to applications. Reject destinations with unknown ownership. The handoff may succeed only in part. Copies do not rotate automatically, and clients need to reload credentials after future changes.
+
+## PostgreSQL backup and restore
+
+Backups are logical `pg_dump` files of the application database. They run inside the PostgreSQL Pod as the `postgres` OS user over the Unix socket, so peer authentication needs no password. The output streams through `kubectl exec` into a private host directory.
+
+`--backup-dir` must lie outside the Minikube home (`MINIKUBE_HOME`, `~/.minikube`, and the home recorded at cluster creation), the workspace, and the installed skill. A `delete` or `cluster --overwrite` therefore never removes a backup, and `purge` never sees one. Each backup gets a new directory `<environment>-<UTC time>-<run>/`, mode `0700`:
+
+| File | Contents |
+|---|---|
+| `dump.sql` | Plain SQL dump with `--no-owner --no-privileges`, mode `0600`. |
+| `manifest.json` | Source cluster UID, API server, namespace, database, Pod, StatefulSet, PVC and PV UIDs, server version, byte size, SHA-256, exact rows per table from the dump's `COPY` sections, the fixture row, and a digest of the manifest itself. |
+
+```sh
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev backup --backup-dir /private/path/backups --with-fixture
+```
+
+Present the plan's source, output directory, reads, and writes. After authorization, repeat the command with `--plan-id REVIEWED_PLAN_ID --execute`. `--with-fixture` creates a run-specific schema and table in one transaction and inserts one random row in the application database. Cleanup locks the table, checks the schema and table OIDs and the sole fixture row, and drops both objects in one transaction with `RESTRICT`. Without the flag, the backup writes nothing to the database.
+
+A restorable dump requires pg_dump to exit 0, the completion trailer to be present, and any requested fixture row to appear in the dump. Incomplete dumps are kept as `dump.sql.partial` without a manifest. If fixture cleanup fails after a verified dump, the backup report records the failure and the verified backup remains available.
+
+```sh
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev restore --backup /private/path/backups/atlas-20261126T101500Z-1a2b3c
+```
+
+Restore requires a running local Docker engine reachable through a Unix socket and enough disk space for the snapshot and the isolated container. Planning verifies the manifest, dump size, SHA-256, trailer and table row counts, then records the source, engine, image digest and new container name. The target database defaults to `<database>_restore_<run>`. Use `--target-database NAME` to choose another name inside the isolated server. After authorization, execute with the reviewed plan ID. Execution makes a private snapshot and verifies it against that plan before creating the container.
+
+The container runs PostgreSQL and psql as a non-root OS user. It has no external network, host data mounts, cluster credentials, or published ports. PostgreSQL accepts only container-local Unix socket connections. Restore loads the snapshot and checks row counts and the fixture token. Cleanup removes the container by its recorded full ID. With `--keep-target`, the report gives the ID of the retained container. Failed cleanup makes the drill exit nonzero even if the data checks passed.
+
+`verify` requires a matching fixture and completed cleanup or reviewed retention. The backup and the drill must both match the current cluster and PostgreSQL PVC and PV UIDs. A fixture-free restore can succeed and leaves the recovery check pending.
+
+Limits:
+
+- An isolated restore drill proves the dump loads into the pinned image and that its recorded row counts and fixture match. Losing the volume or the cluster requires restoring into a new environment: create and deploy it, then load the dump manually after review. That path has not been automated.
+- Logical dumps are point-in-time copies. There is no WAL archiving or PITR. Roles and passwords are not part of the dump; they come from the credential bundle.
+- Backups are not encrypted at rest. Protect the backup directory as you protect the credentials, and copy it off the host for real durability.
+
+## Credential expiry and renewal
+
+```sh
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev credentials --expiry
+```
+
+This read-only check covers every enabled component. It reads only public certificate fields through jsonpath, never private keys or passwords. For each certificate it reports the subject, `not_after`, remaining days, and a status: `ok`, `warning` (under 30 days), `critical` (under 7 days), or `expired`. Certificates checked:
+
+| Group | Source and copies |
+|---|---|
+| `postgres-ca` | Local `ca.crt`, `<postgres_name>-tls:ca.crt`, `<app namespace>/<postgres_name>-client:ca.crt`. |
+| `postgres-server` | Local `server.crt` and `<postgres_name>-tls:tls.crt` (365-day validity from `credentials --prepare`). |
+| `kafka-cluster-ca`, `kafka-clients-ca` | Strimzi CA Secrets and the `ca.crt` in each application client Secret. |
+| `kafka-producer`, `kafka-consumer` | Strimzi user Secret and its application copy. |
+
+Copies in one group must have the same fingerprint. A difference is listed under `mismatched_copies` and fails the check. It usually means Strimzi renewed a certificate but the application copy was never updated. For application-namespace Secrets, `client_pods` lists Pods that mount the Secret or reference it from an environment variable. Unreadable or missing fields are listed under `unavailable` and make the status at least `warning`.
+
+The renewal steps below are manual and need their own authorization. Each says where to resume after a failure.
+
+**PostgreSQL password rotation.** PostgreSQL holds one password per role, so clients fail authentication between steps 3 and 5.
+
+1. Take a backup. This is the recovery point for data.
+2. Generate the new value privately and update `bundle.json`. Keep the previous file until step 6.
+3. Change the role password in the database with `ALTER ROLE` from stdin through `kubectl exec`, never as a command argument.
+4. Replace `<postgres_name>-app` (or `-admin`, `-metrics`) and, for the application role, `<postgres_name>-client`. `credentials --execute` refuses to overwrite them, so replace them by a reviewed delete and recreate.
+5. Restart the clients listed by `credentials --expiry`.
+6. Restart PostgreSQL once to confirm startup. Its startup checks log in with every mounted password and refuse to start on a mismatch.
+
+Recovery point: if step 4 fails, the database has the new password and the Secrets have the old one. PostgreSQL then refuses to restart. Either finish step 4, or set the old password back with `ALTER ROLE` from the previous bundle.
+
+**PostgreSQL server certificate renewal (same CA).** Clients trust the CA, not the server certificate, so they need no change.
+
+1. Issue a new server certificate from the local CA with the same `server.ext`, and keep the previous pair.
+2. Replace `tls.crt` and `tls.key` in `<postgres_name>-tls`.
+3. Restart the PostgreSQL Pod. TLS files are copied at startup, and the startup check connects with `verify-full`.
+
+Recovery point: a bad certificate keeps the new Pod unready, and the previous Pod's data is unaffected. Restore the previous pair into the Secret and restart.
+
+**PostgreSQL CA renewal.**
+
+1. Add the new CA next to the old one in every client trust file: the `ca.crt` in `<postgres_name>-tls` and in `<postgres_name>-client`.
+2. Restart the clients.
+3. Issue a server certificate from the new CA, then renew it as above.
+4. Remove the old CA after all clients have reloaded.
+
+Recovery point: until step 3, the old certificate still works for every client.
+
+**Kafka client Secret update.** Strimzi renews user certificates and CAs before they expire and updates its own Secrets. The application copies do not follow.
+
+1. When `credentials --expiry` reports a `kafka-*` mismatch, replace `<kafka_name>-producer-client` and `-consumer-client` by a reviewed delete and `credentials --component kafka --execute`. The publisher refuses to overwrite different contents.
+2. Restart the clients listed in `client_pods`.
+
+Recovery point: the Strimzi Secret is the source of truth, so a broken copy is fixed by copying again. During a CA renewal Strimzi trusts both CAs for a while. Finish both steps within that window.
+
+**Client reload.** Secret volumes update in running Pods after a kubelet sync, but most clients read certificates and passwords only at startup. Environment variables never update. Plan a rollout restart for every listed Pod.
+
+## Kafka data recovery boundary
+
+Kafka runs as one broker on one local volume, with no replication, MirrorMaker, or backup. Topics, users, ACLs, and NetworkPolicies are declarative: `31-kafka` recreates them. Messages, consumer offsets, and the Strimzi CAs live only in the cluster.
+
+| Data | Recovery |
+|---|---|
+| Events that an upstream system still holds, such as rows in PostgreSQL or files at their source | Replay from upstream after recreating Kafka. Consumers must be idempotent. |
+| Messages whose only copy is in Kafka, such as dead letters or results not stored elsewhere | Not recoverable. Persist them outside Kafka, for example in PostgreSQL, if they matter. |
+| Consumer group offsets | Lost with the volume. Consumers restart from their configured reset policy, so plan for replays or gaps. |
+| Strimzi cluster and clients CAs | Regenerated when Kafka is recreated. Hand off new client Secrets and restart clients. |
+
+The default retention (`kafka.retention_hours=6`, `kafka.retention_mib=64`) also bounds what a running broker keeps. Treat Kafka as transport, not as a system of record. This release backs up PostgreSQL only.
 
 ## Verification and acceptance
 
@@ -280,7 +389,8 @@ Each object reports its own state: `ready`, `missing`, `not-ready`, `not-bound`,
 | `gpu_smoke` | `gpu-smoke --execute` passed against the current plugin. | `gpu-smoke` |
 | `alert_delivery` | An isolated alert reaches its intended receiver. | Pending; no runner. |
 | `network_policy_allowed`, `network_policy_denied` | Allowed traffic succeeds, and unlabeled or wrong-namespace clients are refused, including DNS. Acceptance Pods use the allowed path only, so they do not close these items. | Pending; no runner. |
-| `postgres_backup_restore`, `gpu_workload` | Protected backup and isolated restore; Vulkan and inference workloads. | Pending; no runner. |
+| `postgres_backup_restore` | An isolated restore matched row counts and the fixture for a backup from the current cluster and data volume. | `backup` and `restore` |
+| `gpu_workload` | Vulkan and inference workloads. | Pending; no runner. |
 
 When a Prometheus read fails, for example because `pods/proxy` access is denied or a NetworkPolicy blocks the API server, the affected items stay `pending` with that reason. For a sharded instance, all three items stay `pending` until evidence can be collected across every shard.
 

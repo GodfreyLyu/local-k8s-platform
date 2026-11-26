@@ -177,14 +177,34 @@ def arguments(argv=None):
     functional.add_argument("--plan-id")
     functional.add_argument("--execute", action="store_true")
     credentials = actions.add_parser("credentials")
-    credentials.add_argument("--component", choices=("postgres", "kafka"), default="postgres")
+    credentials.add_argument("--component", choices=("postgres", "kafka"))
     mode = credentials.add_mutually_exclusive_group()
     mode.add_argument("--prepare", action="store_true")
     mode.add_argument("--execute", action="store_true")
+    mode.add_argument("--expiry", action="store_true")
+    backup = actions.add_parser("backup")
+    backup.add_argument("--backup-dir", required=True, type=Path)
+    backup.add_argument("--with-fixture", action="store_true")
+    backup.add_argument("--plan-id")
+    backup.add_argument("--execute", action="store_true")
+    restore = actions.add_parser("restore")
+    restore.add_argument("--backup", required=True, type=Path)
+    restore.add_argument("--target-database")
+    restore.add_argument("--keep-target", action="store_true")
+    restore.add_argument("--plan-id")
+    restore.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
+    if args.action == "credentials":
+        if args.expiry and args.component:
+            parser.error("credentials --expiry checks every enabled component; omit --component")
+        # Expiry covers every enabled component; other credential modes default to PostgreSQL.
+        args.component = args.component or ("all" if args.expiry else "postgres")
+    if args.action == "restore" and args.target_database is not None:
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,62}", args.target_database):
+            parser.error("restore --target-database must be a lowercase SQL identifier")
     if args.action == "credentials" and args.component == "kafka" and args.prepare:
         parser.error("Kafka source credentials are prepared by Strimzi, not this tool")
-    if args.action in {"prerequisites", "cluster", "delete", "acceptance"}:
+    if args.action in {"prerequisites", "cluster", "delete", "acceptance", "backup", "restore"}:
         if args.execute and not args.plan_id:
             parser.error(f"{args.action} --execute requires --plan-id")
         if args.plan_id and not re.fullmatch(r"[0-9a-f]{64}", args.plan_id):
@@ -197,9 +217,11 @@ def arguments(argv=None):
 def contacts_cluster(args):
     if args.action in {"inspect", "verify", "plan", "apply"}:
         return True
-    if args.action in {"credentials", "gpu-smoke"}:
+    if args.action == "credentials":
+        return args.execute or args.expiry
+    if args.action == "gpu-smoke":
         return args.execute
-    if args.action == "acceptance":
+    if args.action in {"acceptance", "backup", "restore"}:
         # Previewing a saved plan reads only the workspace; planning and execution read the cluster.
         return args.plan_id is None or args.execute
     return args.action == "prerequisites" and args.component != "openssl"
@@ -218,8 +240,10 @@ def main(argv=None):
             raise ValueError("Workspace must be outside the installed skill and cannot contain it")
         if args.action in {"plan", "apply"} and args.stage not in config["derived"]["stages"]:
             raise ValueError("Stage is not enabled by this configuration")
-        if args.action == "credentials" and not config[args.component]["enabled"]:
+        if args.action == "credentials" and args.component != "all" and not config[args.component]["enabled"]:
             raise ValueError("The requested credential component is disabled")
+        if args.action in {"backup", "restore"} and not config["postgres"]["enabled"]:
+            raise ValueError(f"The {args.action} action requires postgres.enabled")
         if args.action == "prerequisites" and args.component != "all":
             component = {"strimzi": "kafka", "monitoring": "monitoring", "openssl": "postgres"}[
                 args.component
@@ -234,6 +258,14 @@ def main(argv=None):
             raise ValueError(
                 f"The {args.action} action requires cluster.mode=create and an explicit cluster.name"
             )
+        if args.action == "backup":
+            from recovery import backup_root as resolve_backup_root
+
+            backup_root = resolve_backup_root(args.backup_dir, workspace, ROOT)
+        if args.action == "restore":
+            if args.backup.is_symlink():
+                raise ValueError("The backup path cannot be a symbolic link")
+            restore_source = args.backup.expanduser().resolve()
         with workspace_lock(workspace):
             configured = configure(config, workspace)
             if contacts_cluster(args) and config["cluster"]["mode"] == "create":
@@ -269,12 +301,28 @@ def main(argv=None):
                     include_unmanaged=args.include_unmanaged,
                     materialize=configure,
                 )
+            elif args.action == "credentials" and args.expiry:
+                from credentials import expiry
+
+                report = expiry(config, workspace)
             elif args.action == "credentials":
                 from credentials import credentials
 
                 report = credentials(
                     config, workspace, args.component, prepare=args.prepare, execute=args.execute
                 )
+            elif args.action in {"backup", "restore"}:
+                import recovery
+
+                if args.action == "backup":
+                    report = recovery.backup(
+                        config, workspace, backup_root, args.with_fixture, args.plan_id, args.execute
+                    )
+                else:
+                    report = recovery.restore(
+                        config, workspace, restore_source, args.target_database,
+                        args.keep_target, args.plan_id, args.execute,
+                    )
             elif args.action == "acceptance":
                 from acceptance import acceptance
 

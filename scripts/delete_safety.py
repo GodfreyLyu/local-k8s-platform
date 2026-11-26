@@ -32,7 +32,7 @@ CONTROLLERS = {
 CLAIM_CONTROLLERS = {"StatefulSet", "Pod", "Kafka", "KafkaNodePool", "StrimziPodSet"}
 REPORTS = {
     "cluster", "cluster-delete", "cluster-deleted", "cluster-reconcile", "cluster-recreated",
-    "acceptance-postgres", "acceptance-kafka",
+    "acceptance-postgres", "acceptance-kafka", "backup", "restore", "credentials-expiry",
     "credentials-postgres", "credentials-kafka", "gpu-smoke", "interfaces", "inventory",
     "verification",
 }
@@ -41,7 +41,7 @@ PLAN_FILES = {
     "init-log.json", "plan-log.json", "apply-log.json", "review.json", "plan.tfplan",
     "failed.json", "consumed.json",
 }
-PLAN_GROUPS = {"acceptance", "cluster", "cluster-delete", "prerequisites"}
+PLAN_GROUPS = {"acceptance", "backup", "cluster", "cluster-delete", "prerequisites", "restore"}
 STAGE_ROOT = runtime.ROOT / "assets" / "infra" / "stacks"
 
 

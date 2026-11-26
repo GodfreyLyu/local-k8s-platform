@@ -94,7 +94,11 @@ def read_json(path):
 # Inputs: file path. Outputs: hexadecimal digest. Purpose: bind artifact contents to reviews.
 # Dependencies: a readable regular file and SHA-256.
 def sha256(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 # Inputs: argv, optional cwd/stdin, timeout. Outputs: CompletedProcess, including nonzero codes.
@@ -127,6 +131,43 @@ def run(argv, *, cwd=None, input_text=None, timeout=60):
         raise RuntimeError("Command timed out; partial output was suppressed") from None
     except OSError:
         raise RuntimeError("Command could not start; check the required executable") from None
+
+
+# Inputs: argv, optional stdin file, optional new stdout file, timeout. Outputs: (return code,
+# stderr text). Purpose: move large or binary payloads (database dumps) through files instead of
+# memory; a new stdout file is created exclusively with mode 0600. Dependencies: installed executables.
+def stream(argv, *, stdin_path=None, stdout_path=None, timeout=600):
+    # File errors (an existing output, a missing input) surface as their own OSError before start.
+    source = open(stdin_path, "rb") if stdin_path is not None else subprocess.DEVNULL
+    target = subprocess.DEVNULL
+    try:
+        if stdout_path is not None:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            target = os.fdopen(os.open(stdout_path, flags, 0o600), "wb")
+    except OSError:
+        if source is not subprocess.DEVNULL:
+            source.close()
+        raise
+    try:
+        result = subprocess.run(
+            [str(item) for item in argv],
+            stdin=source,
+            stdout=target,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            env=dict(os.environ),
+            check=False,
+            umask=0o077,
+        )
+        return result.returncode, result.stderr.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Command timed out; partial output was kept for inspection") from None
+    except OSError:
+        raise RuntimeError("Command could not start; check the required executable") from None
+    finally:
+        for handle in (source, target):
+            if handle is not subprocess.DEVNULL:
+                handle.close()
 
 
 # Inputs: private workspace. Outputs: context manager. Purpose: serialize one environment operation.

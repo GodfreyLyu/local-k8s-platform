@@ -10,7 +10,7 @@ The aim is to reuse the same workflow across development projects. Each environm
 
 Defaults target small local workloads. PostgreSQL requests 256Mi of memory and Kafka requests 512Mi. Each uses a 1Gi PVC. The example reuses an existing Minikube CSI driver. Training jobs, model weights, datasets, and checkpoints have separate resource budgets. See the [small local training guide](references/local-training.md).
 
-Live runs on 2026-11-22 and 2026-11-23 created a three-node krunkit Minikube profile and deployed every stage, including the GPU plugin. Readiness checks, Prometheus scraping, and the GPU smoke test passed. Those runs predate the functional acceptance runner. Its PostgreSQL and Kafka checks have passed offline tests only and still need a live run. NetworkPolicy traffic, backup and restore, and alert delivery have no runner yet. See [Validation](references/validation.md).
+Live runs on 2026-11-22 and 2026-11-23 created a three-node krunkit Minikube profile and deployed every stage, including the GPU plugin. Readiness checks, Prometheus scraping, and the GPU smoke test passed. Those runs predate the functional acceptance runner. Its PostgreSQL and Kafka checks have passed offline tests only and still need a live run. PostgreSQL backup and restore drills are implemented but have also passed offline tests only. NetworkPolicy traffic and alert delivery have no runner yet. See [Validation](references/validation.md).
 
 ## What it does
 
@@ -25,7 +25,8 @@ Live runs on 2026-11-22 and 2026-11-23 created a three-node krunkit Minikube pro
 | Storage | Reuse a checked class, create a class using the existing CSI driver, or install a separate Local Path provisioner. |
 | Monitoring | Add PodMonitors and alert rules to an existing Prometheus installation. |
 | GPU | Advertise the krunkit render device as `devic.es/dri` through a device plugin on selected nodes, and run an authorized smoke-test Pod. See [GPU device plugin](references/gpu.md). |
-| Credentials | Prepare local PostgreSQL credentials and copy selected client credentials into the application namespace. |
+| Credentials | Prepare local PostgreSQL credentials, copy selected client credentials into the application namespace, and report certificate expiry and stale copies (read-only). |
+| PostgreSQL recovery | Through reviewed plans, take a checksummed logical backup to a private host directory and restore a verified snapshot in a network-isolated local Docker container and compare row counts and a fixture row. |
 | Changes | Save a plan, review its changes, and apply that exact plan. |
 | Verification | Run read-only readiness checks per object, read actual Prometheus targets when reachable, and report functional checks separately from pending ones. |
 | Functional acceptance | Through a reviewed plan, test PostgreSQL `verify-full`, wrong-CA rejection, and role limits, and Kafka mTLS, fixture produce/consume, and ACL rejection. It uses labeled fixtures it removes afterward. |
@@ -38,7 +39,8 @@ Only one managed platform environment is supported per cluster. Keep one workspa
 - Build application images, deploy applications, run schema migrations, or manage message formats.
 - Provide PostgreSQL replication, Kafka replication, automatic failover, or production high availability.
 - Set up HTTPS ingress, CNPG, object storage, WAL archiving, or point-in-time recovery.
-- Automatically renew certificates, rotate credentials, run backups, or test restores.
+- Automatically renew certificates, rotate credentials, or schedule backups. Renewal follows a documented manual order; backups and restore drills run on request.
+- Back up Kafka messages or offsets. See the [Kafka data recovery boundary](references/operations.md#kafka-data-recovery-boundary).
 - Test NetworkPolicy traffic, alert delivery, or backup and restore automatically. The acceptance runner covers PostgreSQL and Kafka client behavior only.
 - Import existing resources, destroy environments, or automatically delete application data or retained volumes.
 
@@ -62,7 +64,7 @@ flowchart TD
 
 `scripts/config.py` checks user input and fills in defaults. Other modules use that resolved configuration. Later checks cover files and live resources, which may change during a run.
 
-`scripts/cluster.py` plans and creates a new Minikube profile, and handles reviewed overwrites and deletions of a profile it created. `scripts/runtime.py` handles inspection, plan review, apply, and verification. `scripts/acceptance.py` runs reviewed functional acceptance with fixtures it removes afterward. `scripts/gpu.py` runs the GPU smoke test. `scripts/prerequisites.py` prepares reviewed dependency installs. `scripts/credentials.py` handles local certificates and fixed Secret writes.
+`scripts/cluster.py` plans and creates a new Minikube profile, and handles reviewed overwrites and deletions of a profile it created. `scripts/runtime.py` handles inspection, plan review, apply, and verification. `scripts/acceptance.py` runs reviewed functional acceptance with fixtures it removes afterward. `scripts/recovery.py` handles PostgreSQL backups and restore drills. `scripts/gpu.py` runs the GPU smoke test. `scripts/prerequisites.py` prepares reviewed dependency installs. `scripts/credentials.py` handles local certificates and fixed Secret writes.
 
 `scripts/capacity.py` estimates placement for individual Pods and volumes. It checks measured free memory, assigned Pod requests, disk headroom, and selected storage nodes. The estimate reports remaining capacity. Actual Kubernetes scheduling and runtime behavior still need verification.
 
@@ -177,7 +179,7 @@ Pull requests targeting `main` run the `CI` workflow. Its `Tests` job runs the o
 
 Required checks and review rules are GitHub repository settings. They are not defined by this workflow. The workflow alone does not block merges.
 
-On 2026-11-26 the current build passed **216 offline tests** on Python `3.10.11`. Prerequisite, cluster, and acceptance tests use fake Kubernetes, Minikube, and package tools. The most recent native Terraform run (2026-11-23) passed **20 configuration profiles and 71 stage instances**, with no errors or warnings, on Terraform `1.15.8` and Kubernetes provider `2.38.0`.
+On 2026-11-26 the current build passed **232 offline tests** on Python `3.10.11`. Prerequisite, cluster, acceptance, and recovery tests use fake Kubernetes, Minikube, Docker, and package tools. The most recent native Terraform run (2026-11-23) passed **20 configuration profiles and 71 stage instances**, with no errors or warnings, on Terraform `1.15.8` and Kubernetes provider `2.38.0`.
 
 Live deployment of every stage passed readiness checks on a three-node krunkit profile on 2026-11-22 and 2026-11-23. Live functional acceptance is pending. The [validation report](references/validation.md) records each check with its date and scope.
 

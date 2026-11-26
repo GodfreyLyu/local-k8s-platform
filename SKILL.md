@@ -123,6 +123,17 @@ This shows a preview. Add `--execute` only when that exact change is authorized.
 
 `credentials` previews PostgreSQL Secret references. `credentials --prepare` creates local material. `credentials --execute` writes source and application Secrets. Use `credentials --component kafka --execute` after Strimzi has prepared the selected users. Read the credential procedure first. Rotation and application rollout are separate operations.
 
+`credentials --expiry` is read-only. It reports each certificate's expiry and remaining days, copies that no longer match their source, and the application Pods that use each Secret. Renewal and rotation are manual. Follow the order and recovery points in [Credential expiry and renewal](references/operations.md#credential-expiry-and-renewal), and get separate authorization for each Secret or database change.
+
+## Back up and restore PostgreSQL
+
+```sh
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev backup --backup-dir /private/path/backups --with-fixture
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev restore --backup /private/path/backups/BACKUP_DIRECTORY
+```
+
+Both commands plan first; add `--plan-id REVIEWED_PLAN_ID --execute` after authorization. The backup directory must be outside the Minikube home, the workspace, and the skill. A backup has a checksummed manifest; failed or incomplete dumps get none and cannot be restored. Restore requires a local Docker engine on a Unix socket. It replays a verified private snapshot into a network-isolated container, checks row counts and the fixture, then removes the container by ID unless `--keep-target` is given. Present source, target, and writes from the plan. Kafka messages and offsets have no backup; explain the [Kafka data recovery boundary](references/operations.md#kafka-data-recovery-boundary) when recovery comes up.
+
 ## Verify and hand off
 
 ```sh
@@ -137,6 +148,6 @@ Functional acceptance for PostgreSQL and Kafka runs through a reviewed plan:
 python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev acceptance --component postgres
 ```
 
-Present the plan's target, `client_image`, `fixtures`, `reads`, `writes`, `cleanup`, `untouched`, and `time_limits`. Obtain authorization for that plan, then run `acceptance --component postgres --plan-id REVIEWED_PLAN_ID --execute`. It creates labeled fixtures and one restricted client Pod. PostgreSQL checks cover `verify-full`, wrong-CA and login rejection, and application role limits. Kafka checks cover mTLS, fixture produce/consume, and ACL rejection. Cleanup uses the recorded UID as a deletion precondition and confirms the Kafka fixture consumer group is absent. Leftover Kubernetes fixtures block new runs in the owning environment. With GPU enabled, `gpu-smoke --execute` creates and then deletes one test Pod and needs its own authorization. NetworkPolicy allowed/denied traffic, alert delivery, backup and restore, and GPU workloads have no runner. Leave them pending until authorized tests provide evidence. See [Verification and acceptance](references/operations.md#verification-and-acceptance).
+Present the plan's target, `client_image`, `fixtures`, `reads`, `writes`, `cleanup`, `untouched`, and `time_limits`. Obtain authorization for that plan, then run `acceptance --component postgres --plan-id REVIEWED_PLAN_ID --execute`. It creates labeled fixtures and one restricted client Pod. PostgreSQL checks cover `verify-full`, wrong-CA and login rejection, and application role limits. Kafka checks cover mTLS, fixture produce/consume, and ACL rejection. Cleanup uses the recorded UID as a deletion precondition and confirms the Kafka fixture consumer group is absent. Leftover Kubernetes fixtures block new runs in the owning environment. With GPU enabled, `gpu-smoke --execute` creates and then deletes one test Pod and needs its own authorization. NetworkPolicy allowed/denied traffic, alert delivery, and GPU workloads have no runner; backup and restore counts after an isolated drill confirms a fixture from the current data volume. Leave them pending until authorized tests provide evidence. See [Verification and acceptance](references/operations.md#verification-and-acceptance).
 
 Return the resolved configuration, created cluster profile if any, executed stages, plan IDs, and endpoints. Include required application labels, application-local Secret references, and remaining acceptance work. Keep credential values out of responses, logs, Terraform inputs, and state. Mark unexecuted checks as pending. Report full usability only after the relevant acceptance checks pass.

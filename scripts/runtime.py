@@ -1626,9 +1626,9 @@ def verify(config: dict, workspace: Path) -> dict:
                 {"state": state, "note": "A Bound PVC does not establish recovery."},
             )
             functional += acceptance.evidence(config, workspace, identity, "postgres")
-            functional.append(
-                _acceptance("postgres_backup_restore", "pending", "No automated runner.")
-            )
+            import recovery
+
+            functional.append(recovery.evidence(config, workspace, identity))
         if config["kafka"]["enabled"]:
             for name, passed, detail in _kafka_checks(config):
                 _check(report, name, passed, detail)
