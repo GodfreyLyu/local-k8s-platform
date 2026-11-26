@@ -179,7 +179,7 @@ Pull requests targeting `main` run the `CI` workflow. Its `Tests` job runs the o
 
 Required checks and review rules are GitHub repository settings. They are not defined by this workflow. The workflow alone does not block merges.
 
-On 2026-11-26 the current build passed **232 offline tests** on Python `3.10.11`. Prerequisite, cluster, acceptance, and recovery tests use fake Kubernetes, Minikube, Docker, and package tools. The most recent native Terraform run (2026-11-23) passed **20 configuration profiles and 71 stage instances**, with no errors or warnings, on Terraform `1.15.8` and Kubernetes provider `2.38.0`.
+On 2026-11-26 the current build passed **241 offline tests** on Python `3.10.11`. Prerequisite, cluster, acceptance, and recovery tests use fake Kubernetes, Minikube, Docker, and package tools. The most recent native Terraform run (2026-11-23) passed **20 configuration profiles and 71 stage instances**, with no errors or warnings, on Terraform `1.15.8` and Kubernetes provider `2.38.0`.
 
 Live deployment of every stage passed readiness checks on a three-node krunkit profile on 2026-11-22 and 2026-11-23. Live functional acceptance is pending. The [validation report](references/validation.md) records each check with its date and scope.
 

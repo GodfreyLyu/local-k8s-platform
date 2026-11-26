@@ -119,7 +119,7 @@ Follow the session's authorization and the plan review procedure in `operations.
 python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev apply --stage 00-bootstrap --plan-id REVIEWED_PLAN_ID
 ```
 
-This shows a preview. Add `--execute` only when that exact change is authorized. Stop on stale-plan, ownership, capacity, or target failures. If a write fails, report partial results and inspect them before retrying.
+This shows a preview. Present each change's `fields`, the key before and after values. Add `--execute` only when that exact change is authorized. Stop on stale-plan, ownership, capacity, or target failures. An update whose live configuration changed after review invalidates the plan; report the kept reason and create a new plan. If a write fails, or Terraform times out or is interrupted, `reports/applied-<stage>.json` names this plan with `uncertain` or `failed`, its exit code, and the diagnostics path. Report partial results and inspect actual state before a new plan.
 
 `credentials` previews PostgreSQL Secret references. `credentials --prepare` creates local material. `credentials --execute` writes source and application Secrets. Use `credentials --component kafka --execute` after Strimzi has prepared the selected users. Read the credential procedure first. Rotation and application rollout are separate operations.
 

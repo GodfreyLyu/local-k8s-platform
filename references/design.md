@@ -77,6 +77,8 @@ The standalone Terraform validator uses a separate subprocess wrapper. Its envir
 
 The skill manages its dedicated namespaces, identities, policies, data services, optional storage, and monitoring objects. It can also create missing Strimzi and Prometheus prerequisites through a reviewed plan. Existing Minikube, CNI, Strimzi, Prometheus, Grafana, Alertmanager, and Argo CD keep their owners. The skill does not adopt or deploy application resources.
 
+A saved Terraform plan applies the diff it recorded without re-reading live objects. Stage reviews require the same UID and resource version on both sides of Terraform refresh before recording a configuration fingerprint. Before applying a saved plan, the runtime compares that fingerprint to detect out-of-band configuration changes under the same UID. Apply writes the stage report for the current plan before Terraform starts, so an interrupted run cannot leave an older `applied` result standing.
+
 Prerequisites use packaged official JSON manifests and atomic create calls. They stay outside Terraform state. Their review records bind configuration, source hashes, target identity, and reused resource contents. Execution consumes the plan before writes and records each result. A fresh plan can resume unchanged owned resources after a partial failure. There is no automatic upgrade, rollback, adoption, or cleanup. See [prerequisite operations](prerequisites.md).
 
 Storage retention and deletion protection reduce accidental deletion through Terraform. They cannot prevent an administrator from deleting data, or protect against disk or host failure. Multiple VMs on one computer do not provide independent availability zones.

@@ -39,7 +39,7 @@ REPORTS = {
 REPORTS.update(f"prerequisites-{name}" for name in ("all", "strimzi", "monitoring", "openssl"))
 PLAN_FILES = {
     "init-log.json", "plan-log.json", "apply-log.json", "review.json", "plan.tfplan",
-    "failed.json", "consumed.json",
+    "failed.json", "consumed.json", "invalidated.json",
 }
 PLAN_GROUPS = {"acceptance", "backup", "cluster", "cluster-delete", "prerequisites", "restore"}
 STAGE_ROOT = runtime.ROOT / "assets" / "infra" / "stacks"
@@ -256,7 +256,9 @@ def _artifact(parts, directory, stages):
     if root == "reports" and not directory and len(tail) == 1:
         name = Path(tail[0])
         return name.suffix == ".json" and (
-            name.stem in REPORTS or name.stem in {f"applied-{stage}" for stage in stages}
+            name.stem in REPORTS
+            or name.stem in {f"applied-{stage}" for stage in stages}
+            or any(re.fullmatch(rf"apply-{re.escape(stage)}-[a-f0-9]{{64}}", name.stem) for stage in stages)
         )
     if root == "state" and not directory and len(tail) == 1:
         return tail[0] == "recorded-objects.json" or any(

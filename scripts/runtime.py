@@ -8,9 +8,11 @@ import re
 import shutil
 import time
 import urllib.parse
+from collections.abc import Sequence
+from copy import deepcopy
 from pathlib import Path
 
-from capacity import assess
+from capacity import assess, pod_memory, quantity_mib
 from config import memory_mib
 from io_utils import private_dir, read_json, run, sha256, write_json
 
@@ -42,6 +44,18 @@ MANIFEST_KINDS = {
     "PodMonitor": "podmonitors.monitoring.coreos.com",
     "PrometheusRule": "prometheusrules.monitoring.coreos.com",
 }
+# Spec keys whose before/after values are safe to show in a plan review: resource requests,
+# storage, replicas, images and network rules. Environment variables are never walked.
+KEY_FIELDS = {
+    "resources", "storage", "storage_class_name", "storageClassName", "replicas", "partitions",
+    "image", "ingress", "egress", "policy_types", "policyTypes", "pod_selector", "podSelector",
+}
+RETENTION_PREFIXES = ("retention.", "log.retention.", "cleanup.policy")
+# Annotation prefixes that controllers or kubectl maintain; changes there are not configuration.
+CONTROLLER_ANNOTATIONS = (
+    "deployment.kubernetes.io/", "kubectl.kubernetes.io/", "pv.kubernetes.io/",
+    "volume.kubernetes.io/", "volume.beta.kubernetes.io/", "control-plane.alpha.kubernetes.io/",
+)
 # Alert names rendered by 40-monitoring for each enabled component.
 POSTGRES_ALERTS = {"LocalPlatformPostgresUnavailable", "LocalPlatformPostgresCollectorIncomplete"}
 KAFKA_ALERTS = {"LocalPlatformKafkaUnavailable"}
@@ -262,9 +276,61 @@ def _bind(
     return True
 
 
-# Inputs: resolved configuration, workspace and optional stage. Outputs: remaining Pod forecasts.
-# Purpose: omit unchanged applied workloads and reserve replacement headroom for increases. Dependencies: applied-stage records.
-def _remaining_workloads(config: dict, workspace: Path, stage: str | None = None) -> list[dict]:
+# Inputs: configuration, one forecast and running assigned Pods. Outputs: live memory and storage.
+# Purpose: identify the stage's existing footprint independently of a successful apply report.
+def _live_workload(config: dict, item: dict, pods: Sequence[dict]) -> tuple[int, int]:
+    derived, stage, name = config["derived"], item["stage"], item["name"]
+    env = config["environment_id"]
+    label, value = "app.kubernetes.io/name", name
+    if stage == "31-kafka":
+        namespace = config["kafka"]["namespace"]
+        label, value = (
+            ("strimzi.io/pool-name", f"{name}-combined")
+            if name == derived["kafka_name"] else ("strimzi.io/name", name)
+        )
+        owner_label, owner = "strimzi.io/cluster", derived["kafka_name"]
+    else:
+        owner_label, owner = ENVIRONMENT_LABEL, env
+        namespace = {
+            "05-storage": f"{env}-storage",
+            "20-gpu": derived["gpu_namespace"],
+            "30-postgres": derived["namespace"],
+        }[stage]
+        if stage == "20-gpu":
+            value = derived["gpu_plugin_name"]
+    for pod in pods:
+        metadata, spec = pod["metadata"], pod["spec"]
+        labels = metadata.get("labels", {})
+        if (
+            metadata["namespace"] != namespace
+            or labels.get(label) != value
+            or labels.get(owner_label) != owner
+            or (stage == "30-postgres" and metadata["name"] != f"{name}-0")
+            or ("nodes" in item and spec["nodeName"] not in item["nodes"])
+        ):
+            continue
+        storage = 0
+        if item["storage_mib"]:
+            claim_name = (
+                f"data-0-{metadata['name']}" if stage == "31-kafka" else f"{name}-data"
+            )
+            if any(
+                (volume.get("persistentVolumeClaim") or {}).get("claimName") == claim_name
+                for volume in spec.get("volumes", [])
+            ):
+                claim = _get(config, "persistentvolumeclaims", claim_name, namespace) or {}
+                status = claim.get("status", {})
+                if status.get("phase") == "Bound":
+                    storage = int(quantity_mib(status.get("capacity", {}).get("storage", "0")))
+        return pod_memory(pod), storage
+    return 0, 0
+
+
+# Inputs: configuration, workspace, optional stage and running assigned Pods. Outputs: forecasts.
+# Purpose: count live demand after an unsuccessful attempt and retain replacement headroom.
+def _remaining_workloads(
+    config: dict, workspace: Path, stage: str | None = None, *, pods: Sequence[dict] = ()
+) -> list[dict]:
     result = []
     for name in config["derived"]["stages"]:
         if stage is not None and name != stage:
@@ -274,6 +340,12 @@ def _remaining_workloads(config: dict, workspace: Path, stage: str | None = None
         storage = sum(item["storage_mib"] for item in items)
         path = workspace / "reports" / f"applied-{name}.json"
         previous = read_json(path) if path.exists() else {}
+        if previous.get("status") in {"attempting", "uncertain", "failed"}:
+            for item in items:
+                memory, allocated = _live_workload(config, item, pods)
+                if item["memory_mib"] > memory or item["storage_mib"] > allocated:
+                    result.append({**item, "storage_mib": max(0, item["storage_mib"] - allocated)})
+            continue
         prior_memory = (
             previous.get("memory_requests_mib", 0) if previous.get("status") == "applied" else 0
         )
@@ -595,9 +667,6 @@ def inspect(
             {"nodes": [item["metadata"]["name"] for item in nodes]},
         )
         _check(report, "image_platforms", *_image_platforms(config, nodes))
-        forecasts = (
-            _remaining_workloads(config, workspace, stage) if workloads is None else workloads
-        )
         measurements = []
         for node in nodes:
             name = node["metadata"]["name"]
@@ -616,6 +685,17 @@ def inspect(
                 }
             )
         pods = _get(config, "pods", all_namespaces=True)["items"]
+        node_names = {item["metadata"]["name"] for item in nodes}
+        running = [
+            pod for pod in pods
+            if pod.get("status", {}).get("phase") == "Running"
+            and pod.get("spec", {}).get("nodeName") in node_names
+            and not pod["metadata"].get("deletionTimestamp")
+        ]
+        forecasts = (
+            _remaining_workloads(config, workspace, stage, pods=running)
+            if workloads is None else workloads
+        )
         report["capacity"] = assess(
             nodes,
             pods,
@@ -884,14 +964,16 @@ def _state_value(value: object) -> object:
     return value
 
 
-# Inputs: private workspace. Outputs: recorded Kubernetes identities per stage state file.
+# Inputs: private workspace and optional stage. Outputs: recorded Kubernetes identities.
 # Purpose: Let cluster reconciliation compare live objects with Terraform state. Dependencies: local backend JSON.
-def _state_resources(workspace: Path) -> list[dict]:
+def _state_resources(workspace: Path, stage: str | None = None) -> list[dict]:
     result = []
     directory = workspace / "state"
     if not directory.exists():
         return result
     for path in sorted(directory.glob("*.tfstate")):
+        if stage is not None and path.stem != stage:
+            continue
         if path.is_symlink():
             raise RuntimeError("Terraform state must not be a symbolic link.")
         for item in read_json(path).get("resources", []):
@@ -997,7 +1079,7 @@ def _resource_identity(resource_type: str, values: dict) -> dict:
     return {
         "resource": resource,
         "name": metadata["name"],
-        "namespace": metadata.get("namespace"),
+        "namespace": metadata.get("namespace") or None,
         "labels": metadata.get("labels", {}),
         "uid": metadata.get("uid"),
     }
@@ -1015,7 +1097,7 @@ def _protect_data(resource_type: str, change: dict) -> None:
         if memory_mib(new) < memory_mib(old):
             raise RuntimeError("PVC shrinking requires a separate data migration.")
     if resource_type == "kubernetes_manifest":
-        old, new = before["manifest"], after["manifest"]
+        old, new = before.get("object") or before["manifest"], after["manifest"]
         if old["kind"] == "KafkaNodePool":
             previous = {item["id"]: item["size"] for item in old["spec"]["storage"]["volumes"]}
             current = {item["id"]: item["size"] for item in new["spec"]["storage"]["volumes"]}
@@ -1030,8 +1112,8 @@ def _protect_data(resource_type: str, change: dict) -> None:
             if new["spec"]["partitions"] < old["spec"]["partitions"]:
                 raise RuntimeError("Existing Kafka partitions cannot be reduced by this workflow.")
             for key in ("retention.ms", "retention.bytes"):
-                previous = old["spec"].get("config", {}).get(key)
-                current = new["spec"].get("config", {}).get(key)
+                previous = (old["spec"].get("config") or {}).get(key)
+                current = (new["spec"].get("config") or {}).get(key)
                 if (
                     previous is not None
                     and current is not None
@@ -1043,9 +1125,161 @@ def _protect_data(resource_type: str, change: dict) -> None:
                     )
 
 
-# Inputs: normalized configuration and decoded Terraform plan. Outputs: safe resource-action summary.
-# Purpose: Reject deletion, import, unsupported resources and collisions with resources outside this state. Dependencies: kubectl GET.
-def _review_changes(config: dict, document: dict) -> list[dict]:
+# Inputs: Terraform marker and path. Outputs: the mask for a selected subtree.
+# Purpose: preserve ancestor sensitivity and carry descendant markers into rendering.
+def _sensitivity_at(marker: object, path: tuple) -> object:
+    for key in path:
+        if marker is True:
+            return True
+        if isinstance(marker, dict):
+            marker = marker.get(key)
+        elif isinstance(marker, list) and isinstance(key, int) and key < len(marker):
+            marker = marker[key]
+        else:
+            return None
+    return marker
+
+
+# Inputs: selected review value and its mask. Outputs: safe value with the same composite shape.
+# Purpose: redact sensitive descendants of fields allowed in plan reviews.
+def _redact(value: object, marker: object) -> object:
+    if marker is True:
+        return "(sensitive)"
+    if isinstance(value, dict):
+        return {
+            key: _redact(item, _sensitivity_at(marker, (key,)))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact(item, _sensitivity_at(marker, (index,))) for index, item in enumerate(value)]
+    return value
+
+
+# Inputs: Terraform type, values, sensitivity mask and whether to use the refreshed API object.
+# Outputs: {path: value}.
+# Purpose: extract only reviewable key fields from the desired spec. Dependencies: KEY_FIELDS.
+def _key_fields(
+    resource_type: str, values: dict | None, marker: object = None, *, refreshed: bool = False
+) -> dict:
+    if not values:
+        return {}
+    if resource_type == "kubernetes_manifest":
+        # The manifest attribute retains prior configuration. Refresh updates object.
+        attribute = "object" if refreshed and values.get("object") else "manifest"
+        root, prefix = (values.get(attribute) or {}).get("spec"), (attribute, "spec")
+    else:
+        root, prefix = values.get("spec"), ("spec",)
+    fields = {}
+
+    # Inputs: spec subtree and path. Outputs: selected, redacted entries in fields.
+    # Purpose: traverse the provider's nested blocks and lists.
+    def walk(value, path):
+        items = value.items() if isinstance(value, dict) else (
+            enumerate(value) if isinstance(value, list) else ()
+        )
+        for key, item in items:
+            here = path + (key,)
+            if key == "env":
+                continue
+            if isinstance(key, str) and (
+                key in KEY_FIELDS or (path and path[-1] == "config" and key.startswith(RETENTION_PREFIXES))
+            ):
+                label = ".".join(str(part) for part in here[len(prefix) - 1:])
+                value = _redact(item, _sensitivity_at(marker, here))
+                if here[0] == "object":
+                    value = _redact(value, _sensitivity_at(marker, ("manifest", *here[1:])))
+                fields[label] = value
+            else:
+                walk(item, here)
+
+    walk(root, prefix)
+    return fields
+
+
+# Inputs: Terraform resource type and change. Outputs: {path: {before?, after}} for key fields.
+# Purpose: show reviewers what a create sets and what an update changes. Dependencies: _key_fields.
+def _field_changes(resource_type: str, change: dict) -> dict:
+    after = _key_fields(resource_type, change.get("after"), change.get("after_sensitive"))
+    if change["actions"] == ["create"]:
+        return {path: {"after": value} for path, value in sorted(after.items())}
+    before = _key_fields(
+        resource_type, change.get("before"), change.get("before_sensitive"), refreshed=True
+    )
+    return {
+        path: {"before": before.get(path), "after": after.get(path)}
+        for path in sorted(set(before) | set(after))
+        if before.get(path) != after.get(path)
+    }
+
+
+# Inputs: live Kubernetes object. Outputs: configuration without status or controller noise.
+# Purpose: compare what an update depends on, not what controllers report. Dependencies: none.
+def _live_config(item: dict) -> dict:
+    metadata = item.get("metadata", {})
+    config = {
+        key: deepcopy(value)
+        for key, value in item.items()
+        if key not in {"apiVersion", "kind", "metadata", "status"}
+    }
+    config["metadata"] = {
+        "labels": metadata.get("labels", {}),
+        "annotations": {
+            key: value
+            for key, value in metadata.get("annotations", {}).items()
+            if not key.startswith(CONTROLLER_ANNOTATIONS)
+        },
+    }
+    if item.get("kind") == "PersistentVolumeClaim":
+        # Binding fills volumeName once; the claim's requested configuration is unchanged.
+        config.get("spec", {}).pop("volumeName", None)
+    return config
+
+
+# Inputs: JSON value and path prefix. Outputs: (path, leaf) pairs.
+# Purpose: let fingerprints name changed paths without storing values. Dependencies: none.
+def _leaves(value: object, path: str = ""):
+    if isinstance(value, dict) and value:
+        for key in sorted(value):
+            yield from _leaves(value[key], f"{path}.{key}" if path else str(key))
+    elif isinstance(value, list) and value:
+        for index, item in enumerate(value):
+            yield from _leaves(item, f"{path}[{index}]")
+    else:
+        yield path, value
+
+
+# Inputs: live Kubernetes object. Outputs: {path: short digest}. Purpose: record the live
+# configuration an update was reviewed against without copying values. Dependencies: _live_config.
+def _live_fingerprint(item: dict) -> dict:
+    return {path: _digest(value)[:16] for path, value in _leaves(_live_config(item))}
+
+
+# Inputs: reviewed and current fingerprints. Outputs: sorted changed paths.
+# Purpose: explain why a plan became stale. Dependencies: none.
+def _changed_paths(reviewed: dict, current: dict) -> list[str]:
+    return sorted(path for path in set(reviewed) | set(current) if reviewed.get(path) != current.get(path))
+
+
+# Inputs: change summaries from a review. Outputs: summaries without fingerprints.
+# Purpose: keep CLI output readable while the review keeps the binding. Dependencies: none.
+def _public_changes(changes: list[dict]) -> list[dict]:
+    return [
+        {
+            **{key: value for key, value in item.items() if key != "live_fingerprint"},
+            **({"live_config_recorded": True} if "live_fingerprint" in item else {}),
+        }
+        for item in changes
+    ]
+
+
+class PlanInvalid(RuntimeError):
+    """A definitive mismatch with the reviewed plan; transient read failures never raise this."""
+
+
+# Inputs: configuration, Terraform plan and pre-plan versions. Outputs: safe resource-action summary.
+# Purpose: Reject deletion, import, unsupported resources and collisions with resources outside this state;
+# record key field values and, for updates, the live configuration fingerprint. Dependencies: kubectl GET.
+def _review_changes(config: dict, document: dict, versions: dict | None = None) -> list[dict]:
     changes = []
     for item in document.get("resource_changes", []):
         if item.get("mode", "managed") != "managed":
@@ -1084,21 +1318,53 @@ def _review_changes(config: dict, document: dict) -> list[dict]:
                 raise RuntimeError(
                     "Live resource ownership or UID no longer matches the planned state."
                 )
-        changes.append(
-            {
-                "address": item["address"],
-                "actions": actions,
-                **{key: identity[key] for key in ("resource", "name", "namespace")},
-                "uid": before["uid"] if actions != ["create"] else None,
-            }
-        )
+        summary = {
+            "address": item["address"],
+            "actions": actions,
+            **{key: identity[key] for key in ("resource", "name", "namespace")},
+            "uid": before["uid"] if actions != ["create"] else None,
+            "fields": _field_changes(item["type"], change),
+        }
+        if "update" in actions:
+            key = (identity["resource"], identity["name"], identity["namespace"])
+            version = metadata.get("uid"), metadata.get("resourceVersion")
+            if not all(version) or (versions or {}).get(key) != version:
+                raise RuntimeError(
+                    f"Live resource {identity['resource']}/{identity['name']} changed during planning "
+                    "or has no confirmed planning version. Generate a new plan."
+                )
+            # The same API version bracketed Terraform refresh. Apply can ignore later status noise.
+            summary["live_uid"] = metadata.get("uid")
+            summary["live_fingerprint"] = _live_fingerprint(live)
+        changes.append(summary)
     return changes
+
+
+# Inputs: configuration, workspace and stage. Outputs: resource versions before Terraform refresh.
+# Purpose: bracket planning with consistent GETs without comparing provider-shaped values to API JSON.
+def _planning_versions(config: dict, workspace: Path, stage: str) -> dict:
+    versions = {}
+    for ref in _state_resources(workspace, stage):
+        key = (ref["resource"], ref["name"], ref["namespace"])
+        if key not in versions:
+            item = _get(config, *key) or {}
+            metadata = item.get("metadata", {})
+            versions[key] = metadata.get("uid"), metadata.get("resourceVersion")
+    return versions
 
 
 # Inputs: command, stage directory and private log path. Outputs: completed Terraform process.
 # Purpose: Save diagnostics privately while keeping raw provider output out of the Agent response. Dependencies: Terraform, private JSON IO.
 def _terraform(command: list[str], stage_directory: Path, log: Path):
-    result = run(["terraform", f"-chdir={stage_directory}"] + command, timeout=600)
+    try:
+        result = run(["terraform", f"-chdir={stage_directory}"] + command, timeout=600)
+    except RuntimeError as error:
+        write_json(log, {"returncode": None, "error": str(error)})
+        raise
+    except KeyboardInterrupt:
+        # subprocess.run terminates the child; its output and exit status are not available.
+        write_json(log, {"returncode": None, "error": "Interrupted; Terraform was terminated."})
+        raise
     write_json(
         log, {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
     )
@@ -1145,11 +1411,14 @@ def plan(config: dict, workspace: Path, stage: str, plugin_dir: Path | None = No
             raise RuntimeError(
                 "Terraform initialization failed; diagnostics are in the private plan directory."
             )
+        prior_state = _state_hash(workspace, stage)
+        versions = _planning_versions(config, workspace, stage)
         result = _terraform(
             [
                 "plan",
                 "-input=false",
                 "-no-color",
+                "-refresh=true",
                 "-lock-timeout=20s",
                 "-detailed-exitcode",
                 f"-out={directory / 'plan.tfplan'}",
@@ -1170,7 +1439,9 @@ def plan(config: dict, workspace: Path, stage: str, plugin_dir: Path | None = No
         )
         if result.returncode:
             raise RuntimeError("Terraform could not decode the saved plan for review.")
-        changes = _review_changes(config, json.loads(result.stdout))
+        changes = _review_changes(config, json.loads(result.stdout), versions)
+        if _state_hash(workspace, stage) != prior_state:
+            raise RuntimeError("Terraform state changed during planning; generate a new plan.")
         review = {
             "stage": stage,
             "environment_id": config["environment_id"],
@@ -1178,7 +1449,7 @@ def plan(config: dict, workspace: Path, stage: str, plugin_dir: Path | None = No
             "config_sha256": _digest(config),
             "identity": inventory["identity"],
             "source_hashes": _source_hashes(stage_directory),
-            "prior_state_sha256": _state_hash(workspace, stage),
+            "prior_state_sha256": prior_state,
             "plan_sha256": sha256(saved),
             "changes": changes,
         }
@@ -1188,7 +1459,7 @@ def plan(config: dict, workspace: Path, stage: str, plugin_dir: Path | None = No
             "status": "planned",
             "stage": stage,
             "plan_id": review["plan_id"],
-            "changes": changes,
+            "changes": _public_changes(changes),
             "review": str(directory / "review.json"),
         }
     except (RuntimeError, ValueError, KeyError, TypeError, OSError):
@@ -1204,6 +1475,10 @@ def plan(config: dict, workspace: Path, stage: str, plugin_dir: Path | None = No
 def _matching_plan(config: dict, workspace: Path, stage: str, plan_id: str) -> dict:
     directory = workspace / "plans" / stage
     review_path, saved = directory / "review.json", directory / "plan.tfplan"
+    invalidated = directory / "invalidated.json"
+    if invalidated.is_file() and not invalidated.is_symlink() and not directory.is_symlink():
+        reason = read_json(invalidated).get("reason", "unknown")
+        raise RuntimeError(f"Plan was invalidated: {reason} Generate a new plan.")
     if (
         directory.is_symlink()
         or review_path.is_symlink()
@@ -1234,6 +1509,32 @@ def _matching_plan(config: dict, workspace: Path, stage: str, plan_id: str) -> d
     return review
 
 
+# Inputs: normalized configuration, reviewed changes. Outputs: none or PlanInvalid.
+# Purpose: re-read ownership, UID and live configuration immediately before dispatch;
+# reviewed metadata is not a live lock. Dependencies: kubectl GET.
+def _recheck_live(config: dict, changes: list[dict]) -> None:
+    for change in changes:
+        label = f"{change['resource']}/{change['name']}"
+        live = _get(config, change["resource"], change["name"], change["namespace"])
+        if change["actions"] == ["create"]:
+            if live is not None:
+                raise PlanInvalid(f"Planned creation {label} now exists; automatic adoption is disabled.")
+            continue
+        metadata = live.get("metadata", {}) if live else {}
+        expected_uid = change.get("live_uid") or change.get("uid")
+        if (
+            metadata.get("labels", {}).get(ENVIRONMENT_LABEL) != config["environment_id"]
+            or expected_uid
+            and metadata.get("uid") != expected_uid
+        ):
+            raise PlanInvalid(f"Live ownership or UID of {label} changed after plan review.")
+        if "live_fingerprint" in change:
+            paths = _changed_paths(change["live_fingerprint"], _live_fingerprint(live))
+            if paths:
+                shown = ", ".join(paths[:10]) + (f" and {len(paths) - 10} more" if len(paths) > 10 else "")
+                raise PlanInvalid(f"Live configuration of {label} changed after plan review: {shown}.")
+
+
 # Inputs: normalized configuration, workspace, stage, exact plan ID and explicit execution flag.
 # Outputs: read-only preview or application record. Purpose: Apply exactly one approved saved plan. Dependencies: Terraform, kubectl.
 def apply(config: dict, workspace: Path, stage: str, plan_id: str, execute: bool = False) -> dict:
@@ -1243,29 +1544,32 @@ def apply(config: dict, workspace: Path, stage: str, plan_id: str, execute: bool
             "status": "preview",
             "stage": stage,
             "plan_id": plan_id,
-            "changes": review["changes"],
+            "changes": _public_changes(review["changes"]),
             "requires_execute": True,
         }
-    inventory = inspect(config, workspace, stage=stage)
-    if inventory["status"] != "pass" or inventory["identity"] != review["identity"]:
-        raise RuntimeError("Target identity or prerequisites changed; execution is blocked.")
-    _prerequisites(config, workspace, stage)
-    # Re-read ownership immediately before dispatch; reviewed metadata is not a live lock.
-    for change in review["changes"]:
-        live = _get(config, change["resource"], change["name"], change["namespace"])
-        if change["actions"] == ["create"]:
-            if live is not None:
-                raise RuntimeError("A planned creation now exists; do not adopt it automatically.")
-        else:
-            metadata = live.get("metadata", {}) if live else {}
-            if (
-                metadata.get("labels", {}).get(ENVIRONMENT_LABEL) != config["environment_id"]
-                or change.get("uid")
-                and metadata.get("uid") != change["uid"]
-            ):
-                raise RuntimeError("Live resource ownership or UID changed after plan review.")
-    _matching_plan(config, workspace, stage, plan_id)
     directory = workspace / "plans" / stage
+    inventory = inspect(config, workspace, stage=stage)
+    try:
+        current = inventory.get("identity") or {}
+        if current and current.get("kube_system_uid") != review["identity"]["kube_system_uid"]:
+            raise PlanInvalid("Target cluster identity changed after plan review.")
+        # Other differences (for example a refreshed kubeconfig) block without invalidating.
+        if inventory["status"] != "pass" or current != review["identity"]:
+            raise RuntimeError("Target identity or prerequisites changed; execution is blocked.")
+        _prerequisites(config, workspace, stage)
+        _recheck_live(config, review["changes"])
+    except PlanInvalid as error:
+        # Keep the reason so a later preview or execute explains why a new plan is required.
+        write_json(directory / "invalidated.json", {
+            "plan_id": plan_id,
+            "invalidated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "reason": str(error),
+        })
+        raise RuntimeError(f"{error} Execution is blocked; generate a new plan.") from None
+    _matching_plan(config, workspace, stage, plan_id)
+    report = workspace / "reports" / f"applied-{stage}.json"
+    previous = read_json(report) if report.is_file() and not report.is_symlink() else None
+    log = workspace / "reports" / f"apply-{stage}-{plan_id}.json"
     record = {
         "stage": stage,
         "plan_id": plan_id,
@@ -1274,9 +1578,28 @@ def apply(config: dict, workspace: Path, stage: str, plan_id: str, execute: bool
         "applied_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "memory_requests_mib": config["derived"]["memory_requests_by_stage"][stage],
         "storage_mib": config["derived"]["storage_mib_by_stage"][stage],
+        "diagnostics": str(log),
+        "returncode": None,
     }
+    if previous:
+        record["previous"] = {
+            key: previous.get(key) for key in ("plan_id", "status", "applied_at")
+        }
+
+    # Inputs: outcome fields. Outputs: none. Purpose: keep the consumed marker and the stage
+    # report in step, so an older `applied` report never stands for this attempt.
+    def save(**fields):
+        record.update(fields)
+        write_json(directory / "consumed.json", {
+            "plan_id": plan_id,
+            **{key: record.get(key) for key in ("status", "returncode", "diagnostics", "interrupted", "error")
+               if key in record},
+        })
+        write_json(report, record)
+
     # Consume before dispatch: interruption or timeout must not leave a reusable mutation plan.
-    write_json(directory / "consumed.json", {"plan_id": plan_id, "status": "attempting"})
+    save()
+    result = None
     try:
         result = _terraform(
             [
@@ -1287,21 +1610,26 @@ def apply(config: dict, workspace: Path, stage: str, plan_id: str, execute: bool
                 str(directory / "plan.tfplan"),
             ],
             workspace / "stages" / stage,
-            directory / "apply-log.json",
+            log,
         )
-    except RuntimeError:
-        record["status"] = "uncertain"
-        write_json(directory / "consumed.json", {"plan_id": plan_id, "status": "uncertain"})
-        write_json(workspace / "reports" / f"applied-{stage}.json", record)
+        save(
+            status="applied" if result.returncode == 0 else "failed",
+            returncode=result.returncode,
+            state_sha256=_state_hash(workspace, stage),
+        )
+    except KeyboardInterrupt:
+        save(
+            status="uncertain",
+            interrupted=True,
+            returncode=result.returncode if result is not None else None,
+            error="Interrupted during Terraform apply; actual state is unknown.",
+        )
+        raise
+    except RuntimeError as error:
+        save(status="uncertain", error=str(error))
         raise RuntimeError(
             "Terraform invocation failed or timed out; inspect actual state before creating another plan."
         ) from None
-    record.update(
-        status="applied" if result.returncode == 0 else "failed",
-        state_sha256=_state_hash(workspace, stage),
-    )
-    write_json(directory / "consumed.json", {"plan_id": plan_id, "status": record["status"]})
-    write_json(workspace / "reports" / f"applied-{stage}.json", record)
     if result.returncode:
         raise RuntimeError(
             "Terraform apply failed; inspect private diagnostics and actual state before creating another plan."

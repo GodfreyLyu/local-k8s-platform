@@ -13,6 +13,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import runtime
 from config import load_config
+from delete_safety import _artifact
 from io_utils import private_dir, read_json, write_json
 
 
@@ -52,6 +53,58 @@ def creation(name="example-app", namespace=None):
                 },
             }
         ]
+    }
+
+
+# Inputs: CPU requests before and after. Outputs: Terraform Deployment update plan.
+# Purpose: exercise key-field review and live drift checks. Dependencies: Terraform JSON convention.
+def deployment_update(before_cpu="100m", after_cpu="200m"):
+    def values(cpu):
+        return {
+            "metadata": [{
+                "name": "example-api", "namespace": "example",
+                "labels": {runtime.ENVIRONMENT_LABEL: "example"}, "uid": "deploy-uid",
+            }],
+            "spec": [{
+                "replicas": "1",
+                "template": [{"spec": [{"container": [{
+                    "name": "api",
+                    "image": "example/api:1",
+                    "env": [{"name": "TOKEN", "value": "never-shown"}],
+                    "resources": [{"requests": {"cpu": cpu, "memory": "128Mi"}}],
+                }]}]}],
+            }],
+        }
+    return {
+        "resource_changes": [{
+            "address": "kubernetes_deployment_v1.api",
+            "type": "kubernetes_deployment_v1",
+            "mode": "managed",
+            "change": {"actions": ["update"], "before": values(before_cpu), "after": values(after_cpu)},
+        }]
+    }
+
+
+# Inputs: optional CPU request. Outputs: live Deployment as the API server returns it.
+# Purpose: provide the live object an update is reviewed against. Dependencies: none.
+def live_deployment(cpu="100m"):
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": "example-api", "namespace": "example", "uid": "deploy-uid",
+            "labels": {runtime.ENVIRONMENT_LABEL: "example"},
+            "annotations": {"deployment.kubernetes.io/revision": "1"},
+            "resourceVersion": "100", "generation": 1, "managedFields": [{"manager": "terraform"}],
+        },
+        "spec": {
+            "replicas": 1,
+            "template": {"spec": {"containers": [{
+                "name": "api", "image": "example/api:1",
+                "resources": {"requests": {"cpu": cpu, "memory": "128Mi"}},
+            }]}},
+        },
+        "status": {"observedGeneration": 1, "readyReplicas": 1},
     }
 
 
@@ -410,6 +463,244 @@ class RuntimeTests(unittest.TestCase):
                 self.config, self.workspace, "00-bootstrap", result["plan_id"], execute=True
             )
 
+    # Inputs: optional live object before planning and after refresh. Outputs: reviewed update plan.
+    # Purpose: share update-plan setup across drift tests. Dependencies: make_plan.
+    def make_update_plan(self, live=None, *, after_refresh=None):
+        self.document = deployment_update()
+        item = self.document["resource_changes"][0]
+        write_json(self.workspace / "state" / "00-bootstrap.tfstate", {
+            "resources": [{
+                "mode": "managed", "type": item["type"],
+                "instances": [{"attributes": item["change"]["before"]}],
+            }],
+        })
+        before = live or live_deployment()
+        with patch.object(runtime, "_get", side_effect=[before, after_refresh or before]):
+            with (
+                patch.object(runtime, "inspect", return_value={"status": "pass", "identity": self.identity}),
+                patch.object(runtime, "_terraform", side_effect=self.fake_terraform),
+                patch.object(runtime, "run", side_effect=self.fake_show),
+            ):
+                return runtime.plan(self.config, self.workspace, "00-bootstrap")
+
+    # Inputs: none. Outputs: assertions. Purpose: a concurrent edit between provider refresh
+    # and review invalidates the plan before it can be previewed. Dependencies: fake live GETs.
+    def test_review_rejects_drift_during_planning(self):
+        changed = live_deployment(cpu="300m")
+        changed["metadata"]["resourceVersion"] = "101"
+        with self.assertRaisesRegex(RuntimeError, "changed during planning"):
+            self.make_update_plan(after_refresh=changed)
+        directory = self.workspace / "plans" / "00-bootstrap"
+        self.assertTrue((directory / "failed.json").exists())
+        self.assertFalse((directory / "review.json").exists())
+
+    # Inputs: none. Outputs: assertions. Purpose: redact both values inside an allowed composite
+    # field in the saved review, printed plan and preview. Dependencies: fake update plan.
+    def test_nested_sensitive_fields_are_redacted_in_plan_and_preview(self):
+        document = deployment_update()
+        change = document["resource_changes"][0]["change"]
+        mask = {"spec": [{"template": [{"spec": [{"container": [{
+            "resources": [{"requests": {"memory": True}}],
+        }]}]}]}]}
+        change["after_sensitive"] = change["before_sensitive"] = mask
+        with patch.object(sys.modules[__name__], "deployment_update", return_value=document):
+            result = self.make_update_plan()
+        preview = runtime.apply(self.config, self.workspace, "00-bootstrap", result["plan_id"])
+        path = "spec.0.template.0.spec.0.container.0.resources"
+        self.assertEqual(preview["changes"][0]["fields"][path]["after"], [
+            {"requests": {"cpu": "200m", "memory": "(sensitive)"}},
+        ])
+        for output in (Path(result["review"]).read_text(), json.dumps(result), json.dumps(preview)):
+            self.assertNotIn("128Mi", output)
+
+    # Inputs: live object, Terraform stand-in. Outputs: apply result or raised error.
+    # Purpose: run a reviewed execute against fake live state. Dependencies: apply.
+    def execute(self, plan_id, live=None, terraform=None):
+        with (
+            patch.object(runtime, "inspect", return_value={"status": "pass", "identity": self.identity}),
+            patch.object(runtime, "_get", return_value=live),
+            patch.object(runtime, "_terraform", side_effect=terraform or self.fake_terraform),
+        ):
+            return runtime.apply(self.config, self.workspace, "00-bootstrap", plan_id, execute=True)
+
+    # Inputs: none. Outputs: assertions only.
+    # Purpose: prove reviews show key before/after values, never environment values, and record
+    # the live configuration without copying it. Dependencies: make_update_plan.
+    def test_update_review_shows_key_fields_without_secrets(self):
+        result = self.make_update_plan()
+        change = result["changes"][0]
+        path = "spec.0.template.0.spec.0.container.0.resources"
+        self.assertEqual(
+            change["fields"][path]["before"], [{"requests": {"cpu": "100m", "memory": "128Mi"}}]
+        )
+        self.assertEqual(
+            change["fields"][path]["after"], [{"requests": {"cpu": "200m", "memory": "128Mi"}}]
+        )
+        self.assertTrue(change["live_config_recorded"])
+        self.assertNotIn("live_fingerprint", change)
+        review_text = (self.workspace / "plans" / "00-bootstrap" / "review.json").read_text()
+        self.assertNotIn("never-shown", review_text + json.dumps(result))
+        self.assertNotIn('"100m"', json.dumps(read_json(Path(result["review"]))["changes"][0]["live_fingerprint"]))
+        created = runtime._field_changes(
+            "kubernetes_manifest",
+            {
+                "actions": ["create"],
+                "after": {"manifest": {"spec": {"partitions": 3, "config": {
+                    "retention.ms": "3600000", "min.insync.replicas": "1",
+                }}}},
+                "after_sensitive": {"manifest": {"spec": {"partitions": True}}},
+            },
+        )
+        self.assertEqual(
+            created,
+            {"spec.config.retention.ms": {"after": "3600000"}, "spec.partitions": {"after": "(sensitive)"}},
+        )
+        updated = runtime._field_changes("kubernetes_manifest", {
+            "actions": ["update"],
+            "before": {
+                "manifest": {"spec": {"partitions": 2}},
+                "object": {"spec": {"partitions": 3}},
+            },
+            "after": {"manifest": {"spec": {"partitions": 4}}},
+        })
+        self.assertEqual(updated, {"spec.partitions": {"before": 3, "after": 4}})
+
+    # Inputs: none. Outputs: assertions only.
+    # Purpose: prove a same-UID, same-owner configuration change invalidates the plan with a kept
+    # reason and never dispatches Terraform. Dependencies: execute.
+    def test_same_uid_live_config_change_invalidates_plan(self):
+        result = self.make_update_plan()
+        changed = live_deployment(cpu="150m")
+        with self.assertRaisesRegex(RuntimeError, "resources.requests.cpu"):
+            self.execute(result["plan_id"], changed, AssertionError("Apply must be blocked"))
+        directory = self.workspace / "plans" / "00-bootstrap"
+        self.assertIn("changed after plan review", read_json(directory / "invalidated.json")["reason"])
+        self.assertFalse((directory / "consumed.json").exists())
+        with self.assertRaisesRegex(RuntimeError, "invalidated: Live configuration"):
+            runtime.apply(self.config, self.workspace, "00-bootstrap", result["plan_id"])
+        # Restoring the live value does not revive an invalidated plan.
+        with self.assertRaisesRegex(RuntimeError, "invalidated"):
+            self.execute(result["plan_id"], live_deployment(), AssertionError("Apply must be blocked"))
+
+    # Inputs: none. Outputs: assertions only.
+    # Purpose: prove status, metadata bookkeeping and controller annotations do not invalidate.
+    # Dependencies: execute.
+    def test_status_only_change_allows_apply(self):
+        result = self.make_update_plan()
+        noisy = live_deployment()
+        noisy["status"] = {"observedGeneration": 2, "readyReplicas": 0, "conditions": [{"type": "Progressing"}]}
+        noisy["metadata"].update(
+            resourceVersion="250", generation=2, managedFields=[{"manager": "kube-controller-manager"}],
+        )
+        noisy["metadata"]["annotations"]["deployment.kubernetes.io/revision"] = "2"
+        record = self.execute(result["plan_id"], noisy)
+        self.assertEqual(record["status"], "applied")
+        self.assertEqual(record["returncode"], 0)
+
+    # Inputs: none. Outputs: assertions only.
+    # Purpose: prove a definitive cluster replacement invalidates while a refreshed kubeconfig only
+    # blocks. Dependencies: execute.
+    def test_identity_replacement_invalidates_but_refresh_only_blocks(self):
+        result = self.make_plan()
+        refreshed = {**self.identity, "kubeconfig_sha256": "refreshed"}
+        with (
+            patch.object(runtime, "inspect", return_value={"status": "pass", "identity": refreshed}),
+            patch.object(runtime, "_terraform", side_effect=AssertionError("blocked")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "identity or prerequisites"):
+                runtime.apply(self.config, self.workspace, "00-bootstrap", result["plan_id"], execute=True)
+        directory = self.workspace / "plans" / "00-bootstrap"
+        self.assertFalse((directory / "invalidated.json").exists())
+        replaced = {**self.identity, "kube_system_uid": "cluster-two"}
+        with (
+            patch.object(runtime, "inspect", return_value={"status": "pass", "identity": replaced}),
+            patch.object(runtime, "_terraform", side_effect=AssertionError("blocked")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                runtime.apply(self.config, self.workspace, "00-bootstrap", result["plan_id"], execute=True)
+        self.assertTrue((directory / "invalidated.json").exists())
+
+    # Inputs: none. Outputs: assertions only.
+    # Purpose: prove Ctrl-C during Terraform replaces an older `applied` report with this plan's
+    # `uncertain` record, keeps the diagnostics path, and leaves the plan consumed. Dependencies: apply.
+    def test_interrupt_supersedes_previous_applied_report(self):
+        report = self.workspace / "reports" / "applied-00-bootstrap.json"
+        write_json(report, {"stage": "00-bootstrap", "plan_id": "older", "status": "applied",
+                            "applied_at": "2026-11-20T00:00:00+00:00"})
+        result = self.make_plan()
+
+        def interrupted(command, **kwargs):
+            if "apply" in command:
+                raise KeyboardInterrupt
+            return self.fake_show(command, **kwargs)
+
+        with (
+            patch.object(runtime, "inspect", return_value={"status": "pass", "identity": self.identity}),
+            patch.object(runtime, "_get", return_value=None),
+            patch.object(runtime, "run", side_effect=interrupted),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            runtime.apply(self.config, self.workspace, "00-bootstrap", result["plan_id"], execute=True)
+        record = read_json(report)
+        self.assertEqual(record["plan_id"], result["plan_id"])
+        self.assertEqual(record["status"], "uncertain")
+        self.assertTrue(record["interrupted"])
+        self.assertIsNone(record["returncode"])
+        self.assertEqual(record["previous"]["plan_id"], "older")
+        log = read_json(Path(record["diagnostics"]))
+        self.assertIsNone(log["returncode"])
+        self.assertIn("Interrupted", log["error"])
+        consumed = read_json(self.workspace / "plans" / "00-bootstrap" / "consumed.json")
+        self.assertEqual(consumed["status"], "uncertain")
+        self.assertTrue(consumed["interrupted"])
+        # The old success no longer satisfies dependent stages, and the plan cannot run again.
+        with self.assertRaisesRegex(RuntimeError, "00-bootstrap must be applied"):
+            runtime._prerequisites(self.config, self.workspace, "30-postgres")
+        with self.assertRaisesRegex(RuntimeError, "consumed"):
+            self.execute(result["plan_id"], None, AssertionError("Consumed plan must not run"))
+        with self.assertRaisesRegex(RuntimeError, "consumed"):
+            runtime.apply(self.config, self.workspace, "00-bootstrap", result["plan_id"])
+
+    # Inputs: none. Outputs: assertions only.
+    # Purpose: prove timeouts and failed exits keep the exit code and diagnostics. Dependencies: apply.
+    def test_timeout_and_failure_record_exit_code_and_diagnostics(self):
+        result = self.make_plan()
+
+        def timed_out(command, **kwargs):
+            if "apply" in command:
+                raise RuntimeError("Command timed out; partial output was suppressed")
+            return self.fake_show(command, **kwargs)
+
+        with (
+            patch.object(runtime, "inspect", return_value={"status": "pass", "identity": self.identity}),
+            patch.object(runtime, "_get", return_value=None),
+            patch.object(runtime, "run", side_effect=timed_out),
+            self.assertRaisesRegex(RuntimeError, "actual state"),
+        ):
+            runtime.apply(self.config, self.workspace, "00-bootstrap", result["plan_id"], execute=True)
+        record = read_json(self.workspace / "reports" / "applied-00-bootstrap.json")
+        self.assertEqual((record["status"], record["returncode"]), ("uncertain", None))
+        self.assertIn("timed out", record["error"])
+        self.assertIn("timed out", read_json(Path(record["diagnostics"]))["error"])
+
+        result = self.make_plan()
+        old_log = Path(record["diagnostics"])
+        self.assertTrue(_artifact(old_log.relative_to(self.workspace).parts, False, ["00-bootstrap"]))
+        archived = next((self.workspace / "plans" / "archive").glob("00-bootstrap-*"))
+        archived_record = read_json(archived / "consumed.json")
+        self.assertEqual(Path(archived_record["diagnostics"]), old_log)
+        self.assertIn("timed out", read_json(old_log)["error"])
+
+        def failed(command, stage_directory, log):
+            return subprocess.CompletedProcess(command, 1, "", "")
+
+        with self.assertRaisesRegex(RuntimeError, "apply failed"):
+            self.execute(result["plan_id"], None, failed)
+        record = read_json(self.workspace / "reports" / "applied-00-bootstrap.json")
+        self.assertEqual((record["status"], record["returncode"]), ("failed", 1))
+        self.assertEqual(record["previous"]["status"], "uncertain")
+        self.assertNotEqual(Path(record["diagnostics"]), old_log)
+
     # Inputs: none. Outputs: assertions only.
     # Purpose: Reject updates if live metadata ownership or UID changed after Terraform refresh. Dependencies: live GET boundary.
     def test_live_update_uid_change_is_rejected(self):
@@ -502,6 +793,53 @@ class RuntimeTests(unittest.TestCase):
         ):
             report = runtime.inspect(self.config, self.workspace)
         self.assertEqual(report["status"], "pass", report["checks"])
+
+    # Inputs: none. Outputs: assertions. Purpose: a tight cluster can replan the same footprint
+    # after an interrupted apply while the original stage remains uncertain. Dependencies: inspect.
+    def test_inspect_credits_running_workload_after_interruption(self):
+        getter, runner = self.inventory_fakes(free_mib=128)
+        stage = "30-postgres"
+        item = next(item for item in self.config["derived"]["workloads"] if item["stage"] == stage)
+        name = self.config["derived"]["postgres_name"]
+        claim = f"{name}-data"
+        pod = {
+            "metadata": {
+                "name": f"{name}-0", "namespace": self.config["derived"]["namespace"],
+                "labels": {runtime.ENVIRONMENT_LABEL: "example", "app.kubernetes.io/name": name},
+            },
+            "status": {"phase": "Running"},
+            "spec": {
+                "nodeName": "minikube",
+                "containers": [{"resources": {"requests": {"memory": f"{item['memory_mib']}Mi"}}}],
+                "volumes": [{"persistentVolumeClaim": {"claimName": claim}}],
+            },
+        }
+
+        # Inputs: GET arguments. Outputs: existing Pod and bound PVC alongside base inventory.
+        def live(config, resource, *args, **kwargs):
+            if resource == "pods":
+                return {"items": [pod]}
+            if resource == "persistentvolumeclaims":
+                self.assertEqual(args[0], claim)
+                return {"status": {"phase": "Bound", "capacity": {"storage": f"{item['storage_mib']}Mi"}}}
+            return getter(config, resource, *args, **kwargs)
+
+        path = self.workspace / "reports" / f"applied-{stage}.json"
+        write_json(path, {"status": "uncertain"})
+        with (
+            patch.object(runtime, "_identity", return_value=self.identity),
+            patch.object(runtime, "_get", side_effect=live),
+            patch.object(runtime, "run", side_effect=runner),
+        ):
+            report = runtime.inspect(self.config, self.workspace, stage=stage, check_dependencies=False)
+            self.assertEqual(report["status"], "pass", report)
+            self.assertEqual(report["capacity"]["new_memory_requests_mib"], 0)
+            self.assertEqual(report["capacity"]["nodes"][0]["memory_requested_mib"], item["memory_mib"])
+            pod["status"]["phase"] = "Pending"
+            missing = runtime.inspect(self.config, self.workspace, stage=stage, check_dependencies=False)
+            self.assertEqual(missing["status"], "blocked")
+            self.assertEqual(missing["capacity"]["new_memory_requests_mib"], item["memory_mib"])
+        self.assertEqual(read_json(path)["status"], "uncertain")
 
     # Inputs: bootstrap with insufficient space for future services. Outputs: a valid bootstrap-only inspection.
     # Purpose: defer database volume requirements to data stages. Dependencies: stage-scoped forecasts.
