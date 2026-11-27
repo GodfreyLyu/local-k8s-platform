@@ -114,6 +114,15 @@ Use this only with `cluster.mode=create` and a workspace whose creation report r
 
 `archive/` is never removed. Purge blocks while the workspace holds any other entry or a symbolic link in place of a known entry. Move those away yourself first.
 
+### Driver support
+
+| Driver | `cluster` create | `delete` |
+|---|---|---|
+| `krunkit` | Supported; live runs on 2026-11-22 and 2026-11-23. Socket paths are checked. | Supported. Planning and execution check each machine's PID before and after the data-loss inventory. A PID change invalidates the review. Every checked process must exit after `minikube delete`. |
+| `docker`, `podman`, `vfkit`, `qemu2`, `kvm2` | Accepted by configuration; not run live. | Blocked at planning. No independent check of container or VM exit is implemented, so a deletion could not be confirmed. |
+
+Support for another driver needs a native exit check that does not rely on Minikube's own records, plus offline and live evidence.
+
 1. Run `delete --workspace-files MODE`. The plan reports one action:
 
    | Live evidence | Action | Execution |
@@ -124,11 +133,14 @@ Use this only with `cluster.mode=create` and a workspace whose creation report r
    | Identity differs from the creation report | blocked | The profile is not this workspace's cluster. Delete it yourself if that is intended. |
    | Profile present after a `keep` deletion | blocked | It was created elsewhere. |
    | Leftover machine or kubeconfig records without a profile | blocked | Inspect and remove them yourself. |
+   | Profile on a driver without independent exit evidence (any driver other than `krunkit`) | blocked | Profile identity and data loss remain unverified. Before any manual deletion, verify the named profile in the reported Minikube home against the configured kubeconfig and review the data loss. |
 
 2. Review `data_loss`. It records live UIDs from listable Kubernetes APIs, including PVCs, PVs, ConfigMaps, Secret metadata, and custom resources. A claim needs its own workspace record or a verified live controller reference. A PV needs a verified binding to a managed claim. The presence of an object in a managed or system namespace gives no ownership evidence. Unmanaged objects, including system objects without ownership evidence, require `--include-unmanaged`. Incomplete discovery or list access blocks the plan. A context that references a profile-named cluster or user also blocks deletion.
 3. After authorization of that plan, run `delete --workspace-files MODE [--include-unmanaged] --plan-id ID --execute` with the same options. Execution repeats the live inventory and detects replaced objects by UID. `archive` reserves its directory before deleting anything. `purge` reviews nested artifacts, blocks on unknown entries, and unlinks only the reviewed files.
 
-A failed or timed-out delete, or any profile, machine, or kubeconfig record left afterward, leaves the workspace files in place and the creation report `created`. Krunkit cleanup also requires independent confirmation that every recorded VM process is gone. Other drivers currently report `uncertain` and preserve the workspace files after a delete attempt. The consumed plan preserves this evidence, so absent Minikube records alone cannot authorize cleanup on a retry. If handling the workspace files fails after a confirmed deletion, the error reports both outcomes.
+A failure or interruption before workspace handling leaves existing workspace data and the creation report in place. A timeout or Ctrl-C while `minikube delete` is running records the deletion as `uncertain`. Ctrl-C during deletion or removal checks also sets `interrupted: true` and exits with status 130. Workspace handling requires every recorded krunkit process to exit and all profile, machine, and kubeconfig records to be cleared. A plan whose saved evidence has no process IDs is refused before `minikube delete` runs. For an earlier unconfirmed delete, the consumed plan preserves the VM evidence. A retry still requires independent confirmation of VM exit.
+
+After removal is confirmed, workspace handling can fail or be interrupted. Ctrl-C during `archive` or `purge` still exits with status 130. Some files may already have been moved or unlinked, and the consumed plan may already say `deleted`. Inspect the workspace, its `archive/` directory, and any remaining reports before retrying.
 
 ## Workspace and identity
 

@@ -1880,6 +1880,131 @@ class ClusterTests(unittest.TestCase):
         self.assertIn("unconfirmed VM removal", " ".join(refused["blockers"]))
         self.assertEqual(self.count("delete"), 1)
 
+    # Inputs: a krunkit VM restarts during the execution inventory without changing cluster objects.
+    # Outputs: stale plan refusal and preserved workspace. Dependencies: fake CLI and PID probes.
+    def test_delete_rejects_vm_restart_during_data_loss_inventory(self):
+        self.create()
+        self.record_delete_objects()
+        self.update_state(retain_vm=True)
+        status, planned = self.plan_delete("purge")
+        self.assertEqual(status, 0, planned)
+        evidence = {"driver": "krunkit", "pids": [12345]}
+        data_loss = delete_safety.data_loss
+
+        # Inputs: inventory arguments. Outputs: unchanged inventory after a simulated VM restart.
+        # Purpose: change native PID evidence while the Kubernetes inventory is read.
+        def inventory_after_restart(config, workspace):
+            inventory = data_loss(config, workspace)
+            evidence["pids"] = [12346]
+            return inventory
+
+        with (
+            patch.object(delete_safety, "machine_evidence", side_effect=lambda *_: evidence.copy()),
+            patch.object(delete_safety, "_process_exists", side_effect=lambda pid: pid == 12346),
+            patch.object(delete_safety, "data_loss", side_effect=inventory_after_restart),
+        ):
+            status, stale = self.execute_delete(planned, "purge")
+        self.assertEqual(status, 2, stale)
+        self.assertIn("changed since review", stale["error"])
+        self.assertEqual(self.count("delete"), 0)
+        self.assertTrue((self.workspace / "state" / "00-bootstrap.tfstate").exists())
+
+    # Inputs: profiles on drivers without independent exit evidence. Outputs: blocked plans for
+    # every workspace mode and no delete or identity request. Purpose: stop unconfirmable deletes at
+    # planning, before `minikube delete` runs. Dependencies: fake tools.
+    def test_unsupported_driver_delete_is_blocked_before_any_command(self):
+        self.create()
+        self.record_delete_objects()
+        before = len(self.calls())
+        for driver in ("vfkit", "docker", "qemu2"):
+            for files in ("keep", "archive", "purge"):
+                with (
+                    self.subTest(driver=driver, files=files),
+                    patch.object(
+                        delete_safety, "machine_evidence", return_value={"driver": driver, "pids": None}
+                    ),
+                ):
+                    status, blocked = self.plan_delete(files)
+                    self.assertEqual((status, blocked["status"]), (2, "blocked"), blocked)
+                    guidance = blocked["blockers"][0]
+                    self.assertIn(f"Driver {driver} has no independent check", guidance)
+                    self.assertIn("Profile identity and data loss remain unverified", guidance)
+                    self.assertIn(f"against kubeconfig {self.kubeconfig}", guidance)
+                    self.assertNotIn("minikube delete -p", guidance)
+                    self.assertIsNone(blocked["delete_command"])
+                    self.assertEqual(blocked["action"], "none")
+                    status, refused = self.execute_delete(blocked, files)
+                    self.assertEqual(status, 2, refused)
+                    self.assertIn("blocked", refused["error"])
+        self.assertEqual(self.count("delete"), 0)
+        # Identity and data inventory reads are skipped once the driver is known to be unsupported;
+        # only local kubeconfig views remain.
+        cluster_reads = [
+            call for call in self.calls()[before:]
+            if call["tool"] == "metadata"
+            or call["tool"] == "kubectl" and {"get", "api-resources"} & set(call["argv"])
+        ]
+        self.assertEqual(cluster_reads, [])
+        self.assertEqual(read_json(self.workspace / "reports" / "cluster.json")["status"], "created")
+        self.assertTrue((self.workspace / "state" / "00-bootstrap.tfstate").exists())
+        self.assertFalse((self.workspace / "archive").exists() and any((self.workspace / "archive").iterdir()))
+
+    # Inputs: a reviewed plan whose saved evidence lacks PIDs, as an older build could write.
+    # Outputs: refusal before `minikube delete`. Purpose: keep a defensive check at execution.
+    def test_execution_refuses_a_saved_delete_without_exit_evidence(self):
+        self.create()
+        self.record_delete_objects()
+        _, planned = self.plan_delete("keep")
+        review = read_json(Path(planned["review"]))
+        review["snapshot"]["machine_evidence"] = {"driver": "vfkit", "pids": None}
+        with self.assertRaisesRegex(RuntimeError, "was not run"):
+            cluster_module._execute_delete(load_config(self.source), self.workspace, review, None)
+        self.assertEqual(self.count("delete"), 0)
+        report = read_json(self.workspace / "reports" / "cluster-delete.json")
+        self.assertEqual((report["status"], report["deletion"]), ("failed", "not-needed"))
+        self.assertEqual(read_json(self.workspace / "reports" / "cluster.json")["status"], "created")
+
+    # Inputs: a delete that times out or is interrupted after `minikube delete` started.
+    # Outputs: uncertain reports, kept workspace files, consumed plans, and later plans that need
+    # independent VM evidence. Dependencies: fake tools and a wrapped runner.
+    def test_delete_timeout_or_interrupt_is_uncertain_and_keeps_files(self):
+        for failure, expected in ((RuntimeError("Command timed out"), 2), (KeyboardInterrupt(), 130)):
+            with self.subTest(failure=type(failure).__name__):
+                self.setUp()
+                self.create()
+                self.record_delete_objects()
+                self.update_state(retain_vm=True)
+                _, planned = self.plan_delete("archive")
+                real = cluster_module.run
+
+                def interrupted(argv, **kwargs):
+                    result = real(argv, **kwargs)
+                    if "delete" in argv:
+                        raise failure
+                    return result
+
+                with patch.object(cluster_module, "run", side_effect=interrupted):
+                    status, result = self.execute_delete(planned, "archive")
+                self.assertEqual(status, expected, result)
+                report = read_json(self.workspace / "reports" / "cluster-delete.json")
+                self.assertEqual((report["status"], report["deletion"]), ("uncertain", "uncertain"))
+                self.assertEqual(report.get("interrupted", False), expected == 130)
+                consumed = self.workspace / "plans" / "cluster-delete" / f"consumed-{planned['plan_id']}.json"
+                self.assertEqual(read_json(consumed)["status"], "uncertain")
+                self.assertEqual(list((self.workspace / "archive").iterdir()), [])
+                self.assertTrue((self.workspace / "state" / "00-bootstrap.tfstate").exists())
+                status, again = self.execute_delete(planned, "archive")
+                self.assertEqual(status, 2, again)
+                self.assertIn("consumed", again["error"])
+                # The profile records are gone, but a surviving VM process still blocks cleanup.
+                status, blocked = self.plan_delete("archive")
+                self.assertEqual(status, 2, blocked)
+                self.assertIn("unconfirmed VM removal", " ".join(blocked["blockers"]))
+                self.update_state(vm_present=False)
+                status, cleared = self.plan_delete("archive")
+                self.assertEqual((status, cleared["action"]), (0, "already-absent"), cleared)
+                self.assertEqual(self.count("delete"), 1)
+
     # Inputs: another context that uses the target's cluster or user. Outputs: blocked delete.
     # Purpose: preserve shared kubeconfig references. Dependencies: fake kubeconfig.
     def test_delete_refuses_shared_kubeconfig_entries(self):

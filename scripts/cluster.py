@@ -1023,10 +1023,24 @@ def _delete_snapshot(config, workspace, files, include_unmanaged, *, plan_id=Non
         )
         return snapshot
     kubeconfig = Path(snapshot["kubeconfig"])
+    home = Path(snapshot["minikube_home"])
     try:
         config_hash = sha256(kubeconfig)
         if shared := _shared_kubeconfig_contexts(kubeconfig, name):
             blockers.append("Other kubeconfig contexts use profile entries: " + ", ".join(shared))
+            return snapshot
+        # Check the driver first: without independent exit evidence, a delete can never be confirmed.
+        initial_machine_evidence = delete_safety.machine_evidence(home, name)
+        if not initial_machine_evidence.get("pids"):
+            snapshot["machine_evidence"] = initial_machine_evidence
+            blockers.append(
+                f"Driver {initial_machine_evidence.get('driver')} has no independent check that its machines "
+                "exited after `minikube delete`, so this skill cannot confirm a deletion. Supported "
+                f"drivers: {', '.join(sorted(delete_safety.CONFIRMED_DELETE_DRIVERS))}. "
+                "Profile identity and data loss remain unverified. Before any manual deletion, "
+                f"verify profile {name} in Minikube home {home} against kubeconfig {kubeconfig}, "
+                "and review the data loss."
+            )
             return snapshot
         observed = _verified_identity(config, snapshot)
         if not _same_identity(creation["identity"], observed):
@@ -1042,7 +1056,13 @@ def _delete_snapshot(config, workspace, files, include_unmanaged, *, plan_id=Non
             )
             return snapshot
         data_loss = delete_safety.data_loss(config, workspace)
-        machine_evidence = delete_safety.machine_evidence(Path(snapshot["minikube_home"]), name)
+        # Inventory can outlast a VM restart; bind the review to the live PIDs at its end.
+        machine_evidence = delete_safety.machine_evidence(home, name)
+        if machine_evidence != initial_machine_evidence:
+            blockers.append(
+                "Minikube machine evidence changed during inventory. Prepare a fresh delete plan."
+            )
+            return snapshot
         if config_hash != sha256(kubeconfig):
             raise RuntimeError("The selected kubeconfig changed during inspection.")
     except (RuntimeError, ValueError, KeyError, TypeError, OSError) as error:
@@ -1118,6 +1138,11 @@ def _execute_delete(config, workspace, review, materialize):
         if snapshot["action"] == "delete":
             if sha256(Path(snapshot["kubeconfig"])) != snapshot["kubeconfig_sha256"]:
                 raise RuntimeError("The selected kubeconfig changed since review.")
+            if not (snapshot["machine_evidence"] or {}).get("pids"):
+                # Plans from older builds could reach here; never run a delete that cannot be confirmed.
+                raise RuntimeError(
+                    "This driver's machine exit cannot be confirmed; minikube delete was not run."
+                )
             record["deletion"] = "uncertain"
             write_json(consumed, record)
             try:
@@ -1150,6 +1175,17 @@ def _execute_delete(config, workspace, review, materialize):
     except (RuntimeError, ValueError, OSError):
         if record["status"] == "attempting":
             record["status"] = "failed"
+        if archive is not None:
+            with suppress(OSError):
+                archive.rmdir()
+        write_json(consumed, record)
+        write_json(report_path, record)
+        raise
+    except KeyboardInterrupt:
+        # A started delete may have removed some machines; the outcome is unknown either way.
+        if record["status"] == "attempting":
+            record["status"] = "uncertain" if record["deletion"] == "uncertain" else "failed"
+        record["interrupted"] = True
         if archive is not None:
             with suppress(OSError):
                 archive.rmdir()
@@ -1258,8 +1294,6 @@ def delete(
             "environment does not manage. Shared Minikube caches, other profiles, and host mounts "
             "are untouched. " + effects
         )
-        if snapshot["machine_evidence"]["pids"] is None:
-            effects += " Native VM removal cannot be verified for this driver. Workspace files will be kept."
     return {
         "status": "blocked" if snapshot["blockers"] else "planned" if plan_id is None else "preview",
         "plan_id": review["plan_id"],

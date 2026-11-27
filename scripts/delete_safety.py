@@ -43,6 +43,10 @@ PLAN_FILES = {
 }
 PLAN_GROUPS = {"acceptance", "backup", "cluster", "cluster-delete", "prerequisites", "restore"}
 STAGE_ROOT = runtime.ROOT / "assets" / "infra" / "stacks"
+# Drivers whose VM removal after `minikube delete` can be confirmed independently of Minikube's
+# own records. krunkit writes one PID per machine and the process can be checked natively. Other
+# drivers can be created, but a delete plan for them is blocked before any command runs.
+CONFIRMED_DELETE_DRIVERS = {"krunkit"}
 
 
 # Inputs: cluster config and resource scope. Outputs: sorted listable resource names.
@@ -217,7 +221,7 @@ def _krunkit_process(pid):
 def machine_evidence(home, name):
     profile = read_json(home / "profiles" / name / "config.json")
     driver = profile["Driver"]
-    if driver != "krunkit":
+    if driver not in CONFIRMED_DELETE_DRIVERS:
         return {"driver": driver, "pids": None}
     nodes = [node["Name"] for node in profile["Nodes"]]
     if not nodes or any(not re.fullmatch(r"[a-z0-9-]*", node) for node in nodes):
