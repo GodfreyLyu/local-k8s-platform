@@ -10,6 +10,7 @@ from pathlib import Path
 
 from config import DEFAULTS, load_config, memory_mib
 from io_utils import private_dir, read_json, workspace_lock, write_json
+from summary import render, summarize
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -359,7 +360,17 @@ def main(argv=None):
                     )
                 else:
                     report = getattr(runtime, args.action)(config, workspace)
+        # The summary is derived from the report alone; it never reads the cluster again.
+        # A summary defect must not turn a finished action into an error, so it is isolated.
+        try:
+            report["summary"] = summarize(args, report)
+            view = render(report["summary"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            report.pop("summary", None)
+            view = "Summary unavailable for this report; read the JSON output."
         print(json.dumps(report, indent=2, sort_keys=True))
+        # stdout stays one JSON document for tools; the readable view goes to stderr.
+        print(view, file=sys.stderr)
         return 2 if report.get("status") in {"blocked", "failed", "fail"} else 0
     except (ValueError, RuntimeError, OSError, KeyError, json.JSONDecodeError) as error:
         print(json.dumps({"status": "blocked", "error": str(error)}), file=sys.stderr)

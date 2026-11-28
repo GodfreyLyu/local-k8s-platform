@@ -111,6 +111,14 @@ It removes all inherited `TF_*` and `PLUGIN_*` variables. It then sets automatio
 
 The validator avoids Kubernetes requests. Provider installation can still contact the registry. It does not provide network isolation.
 
+## Step summaries
+
+[summary.py](../scripts/summary.py) turns each action's report into one structure: `title`, `status`, `phase` (`plan`, `result`, or `read-only`), `target`, `current`, `add`, `change`, `delete`, `unchanged`, `blockers`, `notes`, and `next`. `platform.py` adds it to the report as `summary` and prints the rendered text on stderr. Stdout stays a single JSON document.
+
+The summarizer reads only report fields. It does not contact Kubernetes or read workspace files. Credential entries name Secrets and local directories, never values. Stage field values come from the already redacted plan review. Long values are shortened to 80 characters.
+
+If the summarizer fails on an unexpected report shape, the report is printed without `summary` and stderr says the summary is unavailable. The exit status is unchanged. Error reports are not summarized.
+
 ## Failure reporting
 
 `platform.py` and `validate.py` report caught exceptions as JSON with `str(error)`. They do not print exception chains. A chained temporary-file cleanup failure may therefore be absent from the CLI error text.
