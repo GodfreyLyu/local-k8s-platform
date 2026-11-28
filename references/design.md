@@ -19,6 +19,8 @@ This skill configures a local development platform on an existing or newly creat
 | Runtime checks | Check cluster identity, ownership, prerequisites, and readiness. | Inventory, plan review, and acceptance status. |
 | Capacity helper | Estimate joint Pod memory and volume placement from current evidence. | Suggested allocations and remaining node capacity. |
 | GPU smoke helper | Create one restricted test Pod that requests the GPU resource, read its result, and delete it. | Smoke report bound to the cluster and plugin rollout. |
+| Acceptance helper | Plan, then run one restricted client Pod against labeled PostgreSQL or Kafka fixtures, and delete only the fixtures its run created. | Plan ID, acceptance report bound to the cluster and the tested versions. |
+| Recovery helper | Plan and take a logical PostgreSQL dump through `kubectl exec`, then compare an isolated restore in local Docker. | Private backup directory with a checksummed manifest; backup and restore reports. |
 
 The agent invokes the packaged CLI through its execution tool. Python starts child commands without a shell wrapper. This skill needs no custom server, MCP connection, background daemon, or scheduler.
 
@@ -75,6 +77,8 @@ The standalone Terraform validator uses a separate subprocess wrapper. Its envir
 
 The skill manages its dedicated namespaces, identities, policies, data services, optional storage, and monitoring objects. It can also create missing Strimzi and Prometheus prerequisites through a reviewed plan. Existing Minikube, CNI, Strimzi, Prometheus, Grafana, Alertmanager, and Argo CD keep their owners. The skill does not adopt or deploy application resources.
 
+A saved Terraform plan applies the diff it recorded without re-reading live objects. Stage reviews require the same UID and resource version on both sides of Terraform refresh before recording a configuration fingerprint. Before applying a saved plan, the runtime compares that fingerprint to detect out-of-band configuration changes under the same UID. Apply writes the stage report for the current plan before Terraform starts, so an interrupted run cannot leave an older `applied` result standing.
+
 Prerequisites use packaged official JSON manifests and atomic create calls. They stay outside Terraform state. Their review records bind configuration, source hashes, target identity, and reused resource contents. Execution consumes the plan before writes and records each result. A fresh plan can resume unchanged owned resources after a partial failure. There is no automatic upgrade, rollback, adoption, or cleanup. See [prerequisite operations](prerequisites.md).
 
 Storage retention and deletion protection reduce accidental deletion through Terraform. They cannot prevent an administrator from deleting data, or protect against disk or host failure. Multiple VMs on one computer do not provide independent availability zones.
@@ -99,9 +103,9 @@ The command fixes Calico, CSI addons for CSI storage, the Kubernetes version ran
 
 Deletion requires a verified difference. The configured context and the API queried inside the running profile must return the same cluster UID. The creation and review records pin the resolved Minikube home. Resource evidence includes the observed UID and ownership label. Stage plans handle spec drift.
 
-Execution reserves a private archive on the workspace filesystem before deletion. After a confirmed delete and a clean host check, it moves the workspace files, prepares the new workspace, and starts the replacement. Shared kubeconfig and Minikube home paths must sit outside the archive. The archive, deletion, and replacement outcomes remain available independently.
+Execution reserves a private archive on the workspace filesystem before deletion. After a confirmed delete, confirmed exit of every recorded krunkit process, and a clean host check, it moves the workspace files, prepares the new workspace, and starts the replacement. Shared kubeconfig and Minikube home paths must sit outside the archive. The archive, deletion, and replacement outcomes remain available independently.
 
-`delete` requires a verified match between the running profile, the configured context, and the creation report. The review binds `--workspace-files` and `--include-unmanaged`, live object identities, and the workspace inventory. Namespace membership provides no evidence of an object's ownership. Purge adds a nested artifact inventory. The workflow preserves the workspace when the driver cannot confirm VM removal. Delete and overwrite retain separate plan directories.
+`delete` requires a verified match between the running profile, the configured context, and the creation report. The review binds `--workspace-files` and `--include-unmanaged`, live object identities, and the workspace inventory. Namespace membership provides no evidence of an object's ownership. Purge adds a nested artifact inventory. Deletion requires independent evidence that every machine exited, which only krunkit provides through its PID files. Other drivers block at planning instead of after `minikube delete` has run. The workflow preserves the workspace when VM removal is unconfirmed. Delete and overwrite retain separate plan directories.
 
 Workspace files change only after a confirmed delete and a clean host check. `keep` marks the creation report `deleted` instead of removing the binding. That status closes every cluster-contacting action. A later overwrite treats the profile as missing and archives the kept files first. A profile that appears under the same name after a kept deletion was created elsewhere, so it is never deleted or overwritten. `purge` removes only the entries `configure` and the helpers write. It is the one path that removes workspace history, and it still leaves `archive/` alone.
 
@@ -119,9 +123,13 @@ After a failure, stop writes and report what completed. Inspect the current stat
 
 Offline tests cover configuration, workspace creation, state isolation, plan integrity, command effects, credentials, and checks for the selected components. They use fake external tools where needed. Terraform formatting and provider validation check the packaged assets.
 
-The native validation run passed 63 stage instances across 18 profiles, including existing-CSI storage. This checks static Terraform and provider schemas, not deployed services. See [build validation](validation.md) for the evidence and remaining limits.
+The latest native validation run (2026-11-23) passed 71 stage instances across 20 profiles, including existing-CSI storage and both GPU profiles. This checks static Terraform and provider schemas, not deployed services. See [build validation](validation.md) for the evidence and remaining limits.
 
-`verify` reads baseline readiness and storage status. Functional acceptance needs separate checks for authentication, permissions, allowed and denied traffic, metrics, alert delivery, and restore results. This release has no automated SQL, Kafka, network, or backup acceptance runner.
+`verify` reads baseline readiness per object and stays read-only. It also reads actual Prometheus targets, samples, and rules when the API server pod proxy allows it. Functional results stay separate from baseline results.
+
+Backups use the in-Pod Unix socket with peer authentication, so no password leaves the cluster or appears in arguments. A plain-format dump is verifiable without PostgreSQL tools on the host: the completion trailer proves pg_dump finished, and `COPY` sections give exact row counts. Restore compares those counts instead of counts taken from the live source, which may change during the dump. Restore replays the verified private snapshot inside a network-isolated local Docker container. Cleanup uses the container ID returned at creation. Verification ties evidence to the source PVC and PV UIDs and requires a matching fixture. Credential renewal stays manual because each step changes live authentication; the expiry check gives the inputs and the documented order gives the recovery points.
+
+The acceptance helper is a separate, reviewed write path, like the GPU smoke test. Fixtures carry a random run label and live in the validation namespace, plus a fixture topic and user for Kafka. Cleanup trusts only that label together with the UID recorded at creation, so it never deletes an object it did not create. Application credentials are copied into a fixture Secret for the run instead of placing test Pods in the application namespace. Results count only for the same cluster and tested versions. NetworkPolicy traffic and alert delivery have no runner. The acceptance Pods exercise only allowed paths, so the NetworkPolicy items stay separate.
 
 ## Extension points
 

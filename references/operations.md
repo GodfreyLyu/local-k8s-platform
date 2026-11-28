@@ -16,6 +16,10 @@ Every `platform.py` action loads the configuration and locks the workspace. It r
 | `cluster` | Check profile, machine, and kubeconfig names. Save a review and plan ID. | None. |
 | `cluster --plan-id ID` | Preview a saved cluster plan. | None. |
 | `cluster --plan-id ID --execute` | Save the verified cluster binding, creation result, and suggested API addresses. | Run the reviewed `minikube start` once for the new profile. |
+| `cluster --overwrite` | Compare the created profile with the workspace records; save a review and plan ID. | Read-only Minikube and API checks. |
+| `cluster --overwrite --plan-id ID --execute` | Archive the previous workspace files and record the replacement. | `minikube delete` (only for the reviewed `overwrite` action), then `minikube start`. |
+| `delete --workspace-files MODE` | Save a review with the data-loss inventory and plan ID. | Read-only Minikube and API inventory. |
+| `delete ... --plan-id ID --execute` | Keep, archive, or purge the workspace files as reviewed. | `minikube delete` for the reviewed profile. |
 | `prerequisites` | Save a review and plan ID for selected dependencies. | Read inventory and create permissions. No writes. |
 | `prerequisites --plan-id ID` | Preview a saved dependency plan. | None. |
 | `prerequisites --plan-id ID --execute` | Install reviewed local packages and record partial results. | Create missing reviewed namespaces, CRDs, RBAC, and workloads. |
@@ -28,11 +32,19 @@ Every `platform.py` action loads the configuration and locks the workspace. It r
 | `credentials --execute` | Use the prepared bundle; record results. | Write fixed source Secrets and the application client Secret. |
 | `credentials --component kafka` | Show Kafka credential mappings. | None. |
 | `credentials --component kafka --execute` | Record handoff results. | Read selected Strimzi client fields and write application client Secrets. |
-| `verify` | Save baseline results and pending acceptance items. | Read-only checks for enabled components. |
+| `credentials --expiry` | Record `reports/credentials-expiry.json`. | Read-only: public certificate fields and application Pods. |
+| `backup --backup-dir DIR [--with-fixture]` | Save a backup plan and plan ID. | Read-only checks and the database size. |
+| `backup ... --plan-id ID --execute` | Write `dump.sql` and `manifest.json` under `DIR`; record `reports/backup.json`. | `pg_dump` through `kubectl exec`; with `--with-fixture`, insert and then remove one fixture row. |
+| `restore --backup PATH [--target-database NAME] [--keep-target]` | Verify the backup offline; save a restore plan and plan ID. | Read-only backup, PostgreSQL identity, and local Docker engine checks. |
+| `restore ... --plan-id ID --execute` | Record `reports/restore.json`. | Create a local isolated Docker container, load and compare the dump, then remove the container unless `--keep-target`. |
+| `verify` | Save baseline results, functional acceptance results, and pending items. | Read-only checks for enabled components, including Prometheus queries through the API server pod proxy. |
+| `acceptance --component C` | Save an acceptance plan with its target, fixtures, effects, cleanup scope, and plan ID. | Read-only checks of identity, readiness, source Secrets, and leftover fixtures. |
+| `acceptance --component C --plan-id ID` | Show the saved plan. | None. |
+| `acceptance --component C --plan-id ID --execute` | Record `reports/acceptance-C.json`. | Create the reviewed fixtures, run one client Pod, then delete the fixtures this run created. |
 | `gpu-smoke` | Show the smoke-test Pod and its effects. | None. |
 | `gpu-smoke --execute` | Record `reports/gpu-smoke.json`. | Create one test Pod in the validation namespace, read its log, and delete it. |
 
-The CLI has no destroy, import, cluster deletion, restart, or cleanup command. `cluster` only creates a profile that does not exist yet. Configuration and preview commands do not authorize later writes. Building this project does not install the skill globally.
+The CLI has no destroy, import, restart, or general cleanup command. Without `--overwrite`, `cluster` only creates a profile that does not exist yet. `cluster --overwrite` and `delete` act only on a profile this workspace created, each through its own reviewed plan; see [Create a Minikube cluster](#create-a-minikube-cluster) and [Delete a created cluster](#delete-a-created-cluster). Acceptance and the GPU smoke test remove only the test objects they created. Configuration and preview commands do not authorize later writes. Building this project does not install the skill globally.
 
 To build a portable archive, choose an output path outside the maintained source directories:
 
@@ -80,15 +92,23 @@ Results map to plan actions:
 | Live evidence | Action | Execution |
 |---|---|---|
 | No profile with this name | `recreate-missing` | Archive the workspace, then start once. |
-| Readable profile, all checks match | `unchanged` | Nothing to execute. |
-| Readable profile, identity or any object differs | `overwrite` | `minikube delete --profile=NAME`, then archive and start once. |
+| Readable profile, all checks match | `unchanged` | Nothing to execute. PID files are optional for this comparison. |
+| Readable profile, identity or any object differs | `overwrite` | `minikube delete --profile=NAME`, confirm every krunkit process exited, then archive and start once. |
 | Profile cannot be read (stopped, invalid, API down) | blocked | Start it outside this workflow and plan again. |
+| Readable profile that differs, on a driver without independent exit evidence (any driver other than `krunkit`) | blocked | No delete is planned. Verify the profile, Minikube home, and kubeconfig yourself before any manual recreation. |
+| An earlier delete or overwrite left a recorded VM running outside the PIDs covered by this deletion | blocked | Confirm that VM has exited before replanning. |
 
 Machine records or kubeconfig entries left without a profile still block `recreate-missing`, and the plan does not clean them up. Comparisons cover existence, UID, and ownership only. They ignore spec drift, which stage plans handle without deleting anything.
 
-Execution requires `--overwrite --plan-id ID --execute`, with authorization for the stated data loss. It repeats the comparison and refuses stale evidence. Keep the kubeconfig and Minikube home outside the workspace, and the workspace outside Minikube home. Execution reserves a writable private archive on the workspace filesystem before consuming the plan and deleting anything. A failed delete, timeout, or residual profile, machine, or kubeconfig record leaves the workspace files in place.
+Execution requires `--overwrite --plan-id ID --execute`, with authorization for the stated data loss. It repeats the comparison and refuses stale evidence. Keep the kubeconfig and Minikube home outside the workspace, and the workspace outside Minikube home. Execution reserves a writable private archive on the workspace filesystem before consuming the plan and deleting anything. A plan that would delete the profile requires matching krunkit PIDs before and after the state comparison. Execution checks those PIDs again immediately before `minikube delete`. Before archiving or starting a replacement, it also checks unresolved PID records from earlier delete and overwrite attempts. A failed delete, timeout, Ctrl-C, a recorded process that is still running, or a residual profile, machine, or kubeconfig record leaves the workspace files in place and starts no replacement. A timeout, Ctrl-C, or surviving process records the deletion as `uncertain` in `plans/cluster/consumed-<id>.json`; Ctrl-C also sets `interrupted: true` and exits with status 130. A later `recreate-missing` plan stays blocked until every recorded process has exited. For older attempts without PIDs, use the recovery procedure below.
 
 Archiving moves workspace entries other than `.operation.lock` and `archive/` into `archive/<UTC time>-<plan prefix>/`, mode `0700`. The new workspace records the archive and deletion outcome in `reports/cluster-recreated.json`. The replacement start and its binding are reported separately in `reports/cluster.json`, including an uncertain start after a completed deletion. Earlier state, credentials, and plans remain in the archive. Prerequisites, stage plans, and credentials start again from new reviewed plans.
+
+### Recover an older overwrite without PID evidence
+
+For an older failed or interrupted overwrite that recorded no PIDs, use the host driver's own VM or container inventory to verify that every machine from the earlier attempt has exited. For krunkit, inspect the host's krunkit processes and identify them by the recorded profile and Minikube home. Missing Minikube records alone do not confirm VM exit.
+
+Once the profile, machine records, and kubeconfig entries are absent, prepare a fresh `cluster --overwrite --confirm-legacy-vm-removal` plan to recreate the profile or `delete --workspace-files archive --confirm-legacy-vm-removal` to archive the files. Review the listed legacy attempts and use the same option when executing with the approved plan ID. This confirmation applies only to older overwrite records without PID evidence. A surviving recorded PID still blocks execution.
 
 ## Delete a created cluster
 
@@ -102,6 +122,15 @@ Use this only with `cluster.mode=create` and a workspace whose creation report r
 
 `archive/` is never removed. Purge blocks while the workspace holds any other entry or a symbolic link in place of a known entry. Move those away yourself first.
 
+### Driver support
+
+| Driver | `cluster` create | `delete` and `cluster --overwrite` of a drifted profile |
+|---|---|---|
+| `krunkit` | Supported; live runs on 2026-11-22 and 2026-11-23. Socket paths are checked. | Supported. Planning and execution check each machine's PID before and after the data-loss inventory or state comparison. Execution checks again immediately before deletion. A PID change invalidates the review. Every checked process must exit after `minikube delete`. |
+| `docker`, `podman`, `vfkit`, `qemu2`, `kvm2` | Accepted by configuration; not run live. | Blocked at planning. No independent check of container or VM exit is implemented, so a deletion could not be confirmed. Overwrite of a missing profile (`recreate-missing`) runs no delete and stays available. |
+
+Support for another driver needs a native exit check that does not rely on Minikube's own records, plus offline and live evidence.
+
 1. Run `delete --workspace-files MODE`. The plan reports one action:
 
    | Live evidence | Action | Execution |
@@ -112,11 +141,14 @@ Use this only with `cluster.mode=create` and a workspace whose creation report r
    | Identity differs from the creation report | blocked | The profile is not this workspace's cluster. Delete it yourself if that is intended. |
    | Profile present after a `keep` deletion | blocked | It was created elsewhere. |
    | Leftover machine or kubeconfig records without a profile | blocked | Inspect and remove them yourself. |
+   | Profile on a driver without independent exit evidence (any driver other than `krunkit`) | blocked | Profile identity and data loss remain unverified. Before any manual deletion, verify the named profile in the reported Minikube home against the configured kubeconfig and review the data loss. |
 
 2. Review `data_loss`. It records live UIDs from listable Kubernetes APIs, including PVCs, PVs, ConfigMaps, Secret metadata, and custom resources. A claim needs its own workspace record or a verified live controller reference. A PV needs a verified binding to a managed claim. The presence of an object in a managed or system namespace gives no ownership evidence. Unmanaged objects, including system objects without ownership evidence, require `--include-unmanaged`. Incomplete discovery or list access blocks the plan. A context that references a profile-named cluster or user also blocks deletion.
 3. After authorization of that plan, run `delete --workspace-files MODE [--include-unmanaged] --plan-id ID --execute` with the same options. Execution repeats the live inventory and detects replaced objects by UID. `archive` reserves its directory before deleting anything. `purge` reviews nested artifacts, blocks on unknown entries, and unlinks only the reviewed files.
 
-A failed or timed-out delete, or any profile, machine, or kubeconfig record left afterward, leaves the workspace files in place and the creation report `created`. Krunkit cleanup also requires independent confirmation that every recorded VM process is gone. Other drivers currently report `uncertain` and preserve the workspace files after a delete attempt. The consumed plan preserves this evidence, so absent Minikube records alone cannot authorize cleanup on a retry. If handling the workspace files fails after a confirmed deletion, the error reports both outcomes.
+A failure or interruption before workspace handling leaves existing workspace data and the creation report in place. A timeout or Ctrl-C while `minikube delete` is running records the deletion as `uncertain`. Ctrl-C during deletion or removal checks also sets `interrupted: true` and exits with status 130. Workspace handling requires every recorded krunkit process to exit and all profile, machine, and kubeconfig records to be cleared. A plan whose saved evidence has no process IDs is refused before `minikube delete` runs. For an earlier unconfirmed delete, the consumed plan preserves the VM evidence. A retry still requires independent confirmation of VM exit.
+
+After removal is confirmed, workspace handling can fail or be interrupted. Ctrl-C during `archive` or `purge` still exits with status 130. Some files may already have been moved or unlinked, and the consumed plan may already say `deleted`. Inspect the workspace, its `archive/` directory, and any remaining reports before retrying.
 
 ## Workspace and identity
 
@@ -140,7 +172,7 @@ Failed JSON writes attempt to remove their temporary file. Cleanup can fail and 
 
 Commands have per-call timeouts. The shared runner uses 60 seconds by default. Runtime Terraform init, plan, and apply use 600 seconds. The runner captures output in memory and does not redact it. Keep raw command logs private. A timeout does not prove that an external operation had no effect.
 
-Before invoking Terraform apply, the runtime consumes the reviewed plan. A runner timeout or startup error records the result as `uncertain`. Inspect actual state and create a new plan before another attempt. See the [subprocess reference](io.md#subprocess-execution) for exact environment and error handling.
+Before invoking Terraform apply, the runtime consumes the reviewed plan and rewrites `reports/applied-<stage>.json` for this plan with status `attempting`. An earlier `applied` report therefore never stands for the current attempt; its plan ID, status, and time move to `previous`. A runner timeout, a startup error, or Ctrl-C records `uncertain` in both the stage report and `consumed.json`. Ctrl-C also sets `interrupted: true`, and the CLI exits with status 130. The report keeps `returncode` (the Terraform exit code, or `null` when Terraform was terminated or never started) and `diagnostics`, the private `reports/apply-<stage>-<plan-id>.json` path. This path remains valid when the plan directory is archived. For older attempts, look for `apply-log.json` next to the archived `consumed.json`. A nonzero exit records `failed`. A later plan moves the directory under `plans/archive/`. An `uncertain` or `failed` stage blocks dependent stages until a new plan for it is applied. Inspect actual state, and clear a stale Terraform state lock only with authorization, before creating a new plan. See the [subprocess reference](io.md#subprocess-execution) for exact environment and error handling.
 
 ## Preparation and inventory
 
@@ -162,11 +194,15 @@ Check free disk space on selected storage nodes and verify binding and retention
 
 Generate a plan for the next stage whose prerequisites are ready. Each plan and apply checks that stage's new Pods and volumes. Bootstrap creates dedicated namespaces and identities. `20-gpu` needs bootstrap, the render device on every selected node, and no other plugin for `devic.es/dri` ([GPU device plugin](gpu.md)). `05-storage-csi` creates a class using the existing CSI driver; `05-storage` installs a separate Local Path controller. PostgreSQL needs its namespace, storage class, and source Secrets. Kafka needs ready Strimzi CRDs and an Operator in its configured namespace. The monitoring stage needs a ready monitoring installation, matching selectors, and ready data services.
 
-Unchanged applied stages are excluded from new capacity demand. A resource increase retains full replacement-Pod headroom. Data-stage state blocks automatic volume shrinking or storage-node/class changes. Plan review also rejects shrinking Kafka volumes, reducing existing Topic partitions, or shortening existing message retention.
+Unchanged applied stages are excluded from new capacity demand. To replan an interrupted or failed stage, capacity credits matching running Pods and their existing bound storage. The stage report still blocks dependent stages until an apply succeeds. A resource increase retains full replacement-Pod headroom. Data-stage state blocks automatic volume shrinking or storage-node/class changes. Plan review also rejects shrinking Kafka volumes, reducing existing Topic partitions, or shortening existing message retention.
 
 Deploy in stages. After applying a prerequisite, check its result and create a fresh plan for the next stage.
 
 The saved review records the target, resolved configuration, and source hashes. It also records provider lockfiles, prior state, and the saved plan's digest and ID. Review actual additions and updates. This workflow rejects deletion, replacement, unknown ownership, and target mismatches. Failed and superseded plans cannot be applied.
+
+Each change lists `fields`: the after values a creation sets, and the before and after values an update changes. Only key spec fields appear: resource requests and limits, storage sizes and classes, replicas, partitions, images, Kafka retention and cleanup settings, and NetworkPolicy selectors and rules. Environment variables are never shown, and values Terraform marks sensitive appear as `(sensitive)`, including inside displayed maps and lists. Secret data is never managed by Terraform.
+
+The runtime reads the live UID and resource version of managed objects before Terraform refreshes them. For an update, both must still match when the review is built. Any intervening write, including a status update during planning, requires a fresh plan. The review then records the live UID and a short configuration digest per field path. The configuration fingerprint excludes status, `resourceVersion`, `generation`, `managedFields`, finalizers, controller-maintained annotations such as `deployment.kubernetes.io/revision`, and a PVC's bound `volumeName`. A saved Terraform plan does not re-read live objects, so execution compares the fingerprint again. A changed field under the same UID and ownership label, a changed UID or owner, a planned creation that now exists, or a different cluster UID invalidates the plan. The reason and changed field paths are kept in `plans/<stage>/invalidated.json`, and later previews and executions report it. Restoring the old value does not revive the plan. A failed read or a refreshed kubeconfig blocks execution without invalidating the plan.
 
 Present the plan and any related operations outside Terraform, such as Secret writes. Before execution, the tool checks the saved plan against its inputs and target. Changes to configuration, source, state, identity, or plan require a new plan and review.
 
@@ -219,7 +255,7 @@ python3 -B scripts/platform.py --config environment.json --workspace /private/pa
 
 Preparation reuses a valid existing bundle. Stop if ownership is unknown, files are incomplete, certificates have expired, or identities have changed. Inspect the affected files and objects. The helper does not silently reset passwords. Some Secret writes may succeed before another fails. They are not a transaction across namespaces. Check the recorded result before retrying.
 
-Changing a Kubernetes Secret alone does not change a database role password. Certificate renewal, password rotation, client reloads, and rollout are separate changes. This helper does not automate rotation.
+Changing a Kubernetes Secret alone does not change a database role password. Certificate renewal, password rotation, client reloads, and rollout are separate changes. The helper does not automate rotation, and `credentials --execute` keeps refusing to overwrite a Secret whose contents differ. See [Credential expiry and renewal](#credential-expiry-and-renewal) for the manual order.
 
 ## Kafka client handoff
 
@@ -239,23 +275,168 @@ python3 -B scripts/platform.py --config environment.json --workspace /private/pa
 
 Kafka has no `--prepare` operation. Strimzi issues its source credentials. Never copy cluster CA private keys or broker identities to applications. Reject destinations with unknown ownership. The handoff may succeed only in part. Copies do not rotate automatically, and clients need to reload credentials after future changes.
 
+## PostgreSQL backup and restore
+
+Backups are logical `pg_dump` files of the application database. They run inside the PostgreSQL Pod as the `postgres` OS user over the Unix socket, so peer authentication needs no password. The output streams through `kubectl exec` into a private host directory.
+
+`--backup-dir` must lie outside the Minikube home (`MINIKUBE_HOME`, `~/.minikube`, and the home recorded at cluster creation), the workspace, and the installed skill. A `delete` or `cluster --overwrite` therefore never removes a backup, and `purge` never sees one. Each backup gets a new directory `<environment>-<UTC time>-<run>/`, mode `0700`:
+
+| File | Contents |
+|---|---|
+| `dump.sql` | Plain SQL dump with `--no-owner --no-privileges`, mode `0600`. |
+| `manifest.json` | Source cluster UID, API server, namespace, database, Pod, StatefulSet, PVC and PV UIDs, server version, byte size, SHA-256, exact rows per table from the dump's `COPY` sections, the fixture row, and a digest of the manifest itself. |
+
+```sh
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev backup --backup-dir /private/path/backups --with-fixture
+```
+
+Present the plan's source, output directory, reads, and writes. After authorization, repeat the command with `--plan-id REVIEWED_PLAN_ID --execute`. `--with-fixture` creates a run-specific schema and table in one transaction and inserts one random row in the application database. Cleanup locks the table, checks the schema and table OIDs and the sole fixture row, and drops both objects in one transaction with `RESTRICT`. Without the flag, the backup writes nothing to the database.
+
+A restorable dump requires pg_dump to exit 0, the completion trailer to be present, and any requested fixture row to appear in the dump. Incomplete dumps are kept as `dump.sql.partial` without a manifest. If fixture cleanup fails after a verified dump, the backup report records the failure and the verified backup remains available.
+
+```sh
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev restore --backup /private/path/backups/atlas-20261126T101500Z-1a2b3c
+```
+
+Restore requires a running local Docker engine reachable through a Unix socket and enough disk space for the snapshot and the isolated container. Planning verifies the manifest, dump size, SHA-256, trailer and table row counts, then records the source, engine, image digest and new container name. The target database defaults to `<database>_restore_<run>`. Use `--target-database NAME` to choose another name inside the isolated server. After authorization, execute with the reviewed plan ID. Execution makes a private snapshot and verifies it against that plan before creating the container.
+
+The container runs PostgreSQL and psql as a non-root OS user. It has no external network, host data mounts, cluster credentials, or published ports. PostgreSQL accepts only container-local Unix socket connections. Restore loads the snapshot and checks row counts and the fixture token. Cleanup removes the container by its recorded full ID. With `--keep-target`, the report gives the ID of the retained container. Failed cleanup makes the drill exit nonzero even if the data checks passed.
+
+`verify` requires a matching fixture and completed cleanup or reviewed retention. The backup and the drill must both match the current cluster and PostgreSQL PVC and PV UIDs. A fixture-free restore can succeed and leaves the recovery check pending.
+
+Limits:
+
+- An isolated restore drill proves the dump loads into the pinned image and that its recorded row counts and fixture match. Losing the volume or the cluster requires restoring into a new environment: create and deploy it, then load the dump manually after review. That path has not been automated.
+- Logical dumps are point-in-time copies. There is no WAL archiving or PITR. Roles and passwords are not part of the dump; they come from the credential bundle.
+- Backups are not encrypted at rest. Protect the backup directory as you protect the credentials, and copy it off the host for real durability.
+
+## Credential expiry and renewal
+
+```sh
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev credentials --expiry
+```
+
+This read-only check covers every enabled component. It reads only public certificate fields through jsonpath, never private keys or passwords. For each certificate it reports the subject, `not_after`, remaining days, and a status: `ok`, `warning` (under 30 days), `critical` (under 7 days), or `expired`. Certificates checked:
+
+| Group | Source and copies |
+|---|---|
+| `postgres-ca` | Local `ca.crt`, `<postgres_name>-tls:ca.crt`, `<app namespace>/<postgres_name>-client:ca.crt`. |
+| `postgres-server` | Local `server.crt` and `<postgres_name>-tls:tls.crt` (365-day validity from `credentials --prepare`). |
+| `kafka-cluster-ca`, `kafka-clients-ca` | Strimzi CA Secrets and the `ca.crt` in each application client Secret. |
+| `kafka-producer`, `kafka-consumer` | Strimzi user Secret and its application copy. |
+
+Copies in one group must have the same fingerprint. A difference is listed under `mismatched_copies` and fails the check. It usually means Strimzi renewed a certificate but the application copy was never updated. For application-namespace Secrets, `client_pods` lists Pods that mount the Secret or reference it from an environment variable. Unreadable or missing fields are listed under `unavailable` and make the status at least `warning`.
+
+The renewal steps below are manual and need their own authorization. Each says where to resume after a failure.
+
+**PostgreSQL password rotation.** PostgreSQL holds one password per role, so clients fail authentication between steps 3 and 5.
+
+1. Take a backup. This is the recovery point for data.
+2. Generate the new value privately and update `bundle.json`. Keep the previous file until step 6.
+3. Change the role password in the database with `ALTER ROLE` from stdin through `kubectl exec`, never as a command argument.
+4. Replace `<postgres_name>-app` (or `-admin`, `-metrics`) and, for the application role, `<postgres_name>-client`. `credentials --execute` refuses to overwrite them, so replace them by a reviewed delete and recreate.
+5. Restart the clients listed by `credentials --expiry`.
+6. Restart PostgreSQL once to confirm startup. Its startup checks log in with every mounted password and refuse to start on a mismatch.
+
+Recovery point: if step 4 fails, the database has the new password and the Secrets have the old one. PostgreSQL then refuses to restart. Either finish step 4, or set the old password back with `ALTER ROLE` from the previous bundle.
+
+**PostgreSQL server certificate renewal (same CA).** Clients trust the CA, not the server certificate, so they need no change.
+
+1. Issue a new server certificate from the local CA with the same `server.ext`, and keep the previous pair.
+2. Replace `tls.crt` and `tls.key` in `<postgres_name>-tls`.
+3. Restart the PostgreSQL Pod. TLS files are copied at startup, and the startup check connects with `verify-full`.
+
+Recovery point: a bad certificate keeps the new Pod unready, and the previous Pod's data is unaffected. Restore the previous pair into the Secret and restart.
+
+**PostgreSQL CA renewal.**
+
+1. Add the new CA next to the old one in every client trust file: the `ca.crt` in `<postgres_name>-tls` and in `<postgres_name>-client`.
+2. Restart the clients.
+3. Issue a server certificate from the new CA, then renew it as above.
+4. Remove the old CA after all clients have reloaded.
+
+Recovery point: until step 3, the old certificate still works for every client.
+
+**Kafka client Secret update.** Strimzi renews user certificates and CAs before they expire and updates its own Secrets. The application copies do not follow.
+
+1. When `credentials --expiry` reports a `kafka-*` mismatch, replace `<kafka_name>-producer-client` and `-consumer-client` by a reviewed delete and `credentials --component kafka --execute`. The publisher refuses to overwrite different contents.
+2. Restart the clients listed in `client_pods`.
+
+Recovery point: the Strimzi Secret is the source of truth, so a broken copy is fixed by copying again. During a CA renewal Strimzi trusts both CAs for a while. Finish both steps within that window.
+
+**Client reload.** Secret volumes update in running Pods after a kubelet sync, but most clients read certificates and passwords only at startup. Environment variables never update. Plan a rollout restart for every listed Pod.
+
+## Kafka data recovery boundary
+
+Kafka runs as one broker on one local volume, with no replication, MirrorMaker, or backup. Topics, users, ACLs, and NetworkPolicies are declarative: `31-kafka` recreates them. Messages, consumer offsets, and the Strimzi CAs live only in the cluster.
+
+| Data | Recovery |
+|---|---|
+| Events that an upstream system still holds, such as rows in PostgreSQL or files at their source | Replay from upstream after recreating Kafka. Consumers must be idempotent. |
+| Messages whose only copy is in Kafka, such as dead letters or results not stored elsewhere | Not recoverable. Persist them outside Kafka, for example in PostgreSQL, if they matter. |
+| Consumer group offsets | Lost with the volume. Consumers restart from their configured reset policy, so plan for replays or gaps. |
+| Strimzi cluster and clients CAs | Regenerated when Kafka is recreated. Hand off new client Secrets and restart clients. |
+
+The default retention (`kafka.retention_hours=6`, `kafka.retention_mib=64`) also bounds what a running broker keeps. Treat Kafka as transport, not as a system of record. This release backs up PostgreSQL only.
+
 ## Verification and acceptance
 
-`verify` selects checks from enabled components. PostgreSQL-only operation does not require Kafka CRDs. Plain PostgreSQL does not require CNPG, cert-manager, or Gateway API.
+`verify` selects checks from enabled components. PostgreSQL-only operation does not require Kafka CRDs. Plain PostgreSQL does not require CNPG, cert-manager, or Gateway API. It is read-only and reports three separate results:
 
-This release checks baseline readiness only. The table below also lists evidence needed for functional acceptance. Those functional tests are not automated in this release.
+- `baseline_result` and `checks`: controller status, ownership, Pod readiness, and PVC binding.
+- `acceptance_result` and `acceptance_checks`: functional evidence, each item `pass`, `fail`, or `pending` with its reason.
+- `pending_acceptance`: descriptions of the items still pending.
 
-| Result | Evidence |
+A failed functional check sets `status` to `fail`. Pending items alone keep the baseline status.
+
+### Baseline checks
+
+| Component | Checked objects |
 |---|---|
-| Baseline readiness | Controller status, Pod readiness, PVC binding, and selected monitoring object existence. Actual scrape health remains a separate check. |
-| PostgreSQL acceptance | Dedicated client connection with `verify-full`, expected permissions, wrong-CA/account rejection. |
-| Kafka acceptance | TLS authentication, reachable advertised addresses, isolated produce/consume, forbidden ACL rejection. |
-| Network-policy acceptance | Allowed traffic succeeds and denied traffic fails from scoped clients. |
-| Monitoring acceptance | Actual samples and an isolated alert delivered through the intended route. |
-| Recovery acceptance | Create a protected backup, restore it to isolated resources, and verify the test data. |
-| GPU acceptance | `gpu-smoke --execute` passes against the current plugin. Vulkan, inference, and utilization need separate workload tests. |
+| Stages | Each enabled stage's controller at its current generation, with the environment ownership label. |
+| PostgreSQL | The data PVC is `Bound`. |
+| Kafka | Every configured KafkaTopic (`Ready`, matching `topicName`), both KafkaUsers, the node pool, and each node's data PVC. |
+| Monitoring | One PodMonitor per enabled data service and the `PrometheusRule` with the exact alert set, each owned and carrying the `release` label. |
 
-Functional probes may create Pods, write data, or send alerts. Read-only verification does not authorize those actions. Use isolated fixtures and dedicated identities. Set time limits and review cleanup. Do not change business topics, credentials, replicas, or application data to demonstrate a test.
+Each object reports its own state: `ready`, `missing`, `not-ready`, `not-bound`, `not-owned`, `not-selected`, `mismatch`, `access-denied`, or `read-failed`. One failed read no longer hides the other results. With PostgreSQL and Kafka both enabled, each needs its own PodMonitor.
+
+### Functional acceptance
+
+| Item | Evidence | Source |
+|---|---|---|
+| `postgres_tls` | `verify-full` session; a never-trusted CA and plaintext are rejected. | `acceptance --component postgres` |
+| `postgres_permissions` | Application role has no administrative or monitoring role. A table write in a rolled-back transaction succeeds and leaves nothing behind. `CREATE ROLE`, `pg_read_file`, and `SET ROLE postgres` are denied. The admin role over the network and the application role on `postgres` are rejected. | `acceptance --component postgres` |
+| `kafka_mtls` | The fixture user reads metadata over mTLS; a client without a certificate is rejected. | `acceptance --component kafka` |
+| `kafka_produce_consume` | One message round-trips on a fixture topic with a fixture user and group. | `acceptance --component kafka` |
+| `kafka_acl_rejection` | The fixture user cannot read an application topic, the application producer cannot write to the fixture topic, and the application consumer cannot join another group. | `acceptance --component kafka` |
+| `prometheus_targets`, `prometheus_samples`, `prometheus_rules` | Active targets for each PodMonitor are up, `pg_up` is 1, Kafka under-replicated partitions are 0, and the platform rules are loaded and not firing. | `verify`, through the API server pod proxy |
+| `gpu_smoke` | `gpu-smoke --execute` passed against the current plugin. | `gpu-smoke` |
+| `alert_delivery` | An isolated alert reaches its intended receiver. | Pending; no runner. |
+| `network_policy_allowed`, `network_policy_denied` | Allowed traffic succeeds, and unlabeled or wrong-namespace clients are refused, including DNS. Acceptance Pods use the allowed path only, so they do not close these items. | Pending; no runner. |
+| `postgres_backup_restore` | An isolated restore matched row counts and the fixture for a backup from the current cluster and data volume. | `backup` and `restore` |
+| `gpu_workload` | Vulkan and inference workloads. | Pending; no runner. |
+
+When a Prometheus read fails, for example because `pods/proxy` access is denied or a NetworkPolicy blocks the API server, the affected items stay `pending` with that reason. For a sharded instance, all three items stay `pending` until evidence can be collected across every shard.
+
+`verify` accepts an acceptance report only for the same cluster (`kube-system` UID) and the same tested versions: the PostgreSQL StatefulSet and client Secret, or the Kafka cluster, application KafkaUsers, client Secrets, and cluster CA. A rollout or credential change puts the items back on the pending list.
+
+### Run functional acceptance
+
+```sh
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev acceptance --component postgres
+```
+
+The plan checks the workspace binding, the applied and ready stages, the application client Secrets from `credentials --execute`, and leftover fixtures in this environment. It records a random run ID, the target identity, the tested versions, and the digest-pinned `client_image`. Present the image with the `fixtures`, `reads`, `writes`, `cleanup`, `untouched`, and `time_limits`. Obtain authorization for that plan, then run `acceptance --component postgres --plan-id REVIEWED_PLAN_ID --execute`. Kafka works the same way with `--component kafka`.
+
+Execution rechecks the identity, target versions, and client image before consuming the plan and writing fixtures. It checks each source Secret's UID and resource version again when reading its data. Fixtures live in the validation namespace and, for Kafka, a fixture KafkaTopic and KafkaUser in the Kafka namespace. Each carries the environment labels and `local-k8s-platform/acceptance-run=<run ID>`. The client Pod is non-root and restricted, carries the access label the NetworkPolicies expect, and mounts only the fixture Secret. Its log contains fixed result tokens, never command output or messages.
+
+Cleanup runs after success, failure, or interruption. It deletes fixtures newest first after checking the run and environment labels. Each DELETE carries the UID recorded at creation as a server-side precondition. Deleting the KafkaUser removes the Strimzi-issued Secret, and the run waits for that. Deleting the KafkaTopic removes the fixture topic and its message. The Kafka client Pod also confirms the fixture consumer group is absent after attempting deletion. Remaining fixtures or unconfirmed consumer-group cleanup make `cleanup` `incomplete`. Leftover Kubernetes fixtures block new plans in the owning environment and appear as unmanaged objects in a `delete` plan.
+
+The run copies application client credentials into the fixture Secret for its duration. It never prints them or writes them to reports. The wrong CA's private key exists only in a private local temporary directory during preparation.
+
+### Remaining limits
+
+Functional probes create Pods and Secrets, write fixture data, or would send alerts. Read-only verification does not authorize those actions. Do not change business topics, credentials, replicas, or application data to demonstrate a test.
 
 Build checks and offline tests cover the implementation. They do not establish deployment or runtime acceptance. Mark unexecuted checks as pending, including backups and restores. Single instances and local volumes remain single points of failure after tests pass.
 
@@ -263,4 +444,4 @@ Build checks and offline tests cover the implementation. They do not establish d
 
 Return the configuration, target identity, applied plan IDs, and endpoints. Include required Pod labels, identity names, application-local Secret references, and the acceptance report. Generated interface records keep the status `planned-not-connectivity-verified`. Record live readiness in a separate verification report. Applications still own their schemas, migrations, and releases.
 
-Preserve PVCs, data, state, and credentials after failures. This version has no automatic teardown. Review ownership and backups before volume moves, major upgrades, adoption, or destructive cleanup.
+Preserve PVCs, data, state, and credentials after failures. Platform stages have no teardown command; only a reviewed `delete` removes a created profile with everything in it. Review ownership and backups before volume moves, major upgrades, adoption, or destructive cleanup.

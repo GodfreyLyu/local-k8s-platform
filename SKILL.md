@@ -65,7 +65,7 @@ The plan compares the profile with the workspace's records and reports one actio
 - `overwrite`: the profile is readable, but its identity or a recorded object differs. The plan includes `minikube delete`.
 - `unchanged`: everything matches. There is nothing to execute.
 
-A stopped or unreachable profile blocks. For a running profile, the API queried from its control plane and the chosen context must return the same cluster UID. Present the reviewed Minikube home, action, differences, delete command, and effects. A deleted profile loses its data, and prerequisites, stages, and credentials need new plans. Obtain authorization for that plan, then run `cluster --overwrite --plan-id REVIEWED_PLAN_ID --execute`. Execution rechecks the evidence, reserves the archive, and confirms deletion and clean host records before moving the previous workspace files and starting the replacement.
+A stopped or unreachable profile blocks. For a running profile, the API queried from its control plane and the chosen context must return the same cluster UID. Present the reviewed Minikube home, action, differences, delete command, and effects. A deleted profile loses its data, and prerequisites, stages, and credentials need new plans. Obtain authorization for that plan, then run `cluster --overwrite --plan-id REVIEWED_PLAN_ID --execute`. Execution reserves the archive and checks PIDs again immediately before deletion. It confirms that recorded VM processes from this and earlier attempts have exited and host records are clear before archiving and starting the replacement. An unchanged profile can be reported without PID evidence. For older attempts without PID records, follow the [legacy recovery procedure](references/operations.md#recover-an-older-overwrite-without-pid-evidence). Overwriting a drifted profile on any other driver blocks at planning.
 
 ### Delete a created cluster
 
@@ -79,7 +79,7 @@ Use this only when the user asks to delete the cluster. It applies only to a pro
 python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev delete --workspace-files archive
 ```
 
-The plan reports `delete` for a running profile whose identity matches the creation report, or `already-absent` when the profile no longer exists and cleanup evidence allows it. A stopped, unreadable, or mismatched profile blocks, along with leftover machine or kubeconfig records and shared kubeconfig references. Unmanaged live objects require `--include-unmanaged`. Review the data-loss inventory, including PVCs, PVs and object UIDs. Purge also requires a verified nested inventory. Present the action, delete command, `data_loss`, and effects. Obtain authorization for that plan, then repeat the same options with `--plan-id REVIEWED_PLAN_ID --execute`. Preserve the workspace when native VM removal is uncertain.
+The plan reports `delete` for a running profile whose identity matches the creation report, or `already-absent` when the profile no longer exists and cleanup evidence allows it. A stopped, unreadable, or mismatched profile blocks, along with leftover machine or kubeconfig records and shared kubeconfig references. Only krunkit profiles can be deleted: other drivers have no independent exit check, so their plans block before any delete command. Unmanaged live objects require `--include-unmanaged`. Review the data-loss inventory, including PVCs, PVs and object UIDs. Purge also requires a verified nested inventory. Present the action, delete command, `data_loss`, and effects. Obtain authorization for that plan, then repeat the same options with `--plan-id REVIEWED_PLAN_ID --execute`. Preserve the workspace when native VM removal is uncertain.
 
 ## Prepare prerequisites
 
@@ -119,9 +119,20 @@ Follow the session's authorization and the plan review procedure in `operations.
 python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev apply --stage 00-bootstrap --plan-id REVIEWED_PLAN_ID
 ```
 
-This shows a preview. Add `--execute` only when that exact change is authorized. Stop on stale-plan, ownership, capacity, or target failures. If a write fails, report partial results and inspect them before retrying.
+This shows a preview. Present each change's `fields`, the key before and after values. Add `--execute` only when that exact change is authorized. Stop on stale-plan, ownership, capacity, or target failures. An update whose live configuration changed after review invalidates the plan; report the kept reason and create a new plan. If a write fails, or Terraform times out or is interrupted, `reports/applied-<stage>.json` names this plan with `uncertain` or `failed`, its exit code, and the diagnostics path. Report partial results and inspect actual state before a new plan.
 
 `credentials` previews PostgreSQL Secret references. `credentials --prepare` creates local material. `credentials --execute` writes source and application Secrets. Use `credentials --component kafka --execute` after Strimzi has prepared the selected users. Read the credential procedure first. Rotation and application rollout are separate operations.
+
+`credentials --expiry` is read-only. It reports each certificate's expiry and remaining days, copies that no longer match their source, and the application Pods that use each Secret. Renewal and rotation are manual. Follow the order and recovery points in [Credential expiry and renewal](references/operations.md#credential-expiry-and-renewal), and get separate authorization for each Secret or database change.
+
+## Back up and restore PostgreSQL
+
+```sh
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev backup --backup-dir /private/path/backups --with-fixture
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev restore --backup /private/path/backups/BACKUP_DIRECTORY
+```
+
+Both commands plan first; add `--plan-id REVIEWED_PLAN_ID --execute` after authorization. The backup directory must be outside the Minikube home, the workspace, and the skill. A backup has a checksummed manifest; failed or incomplete dumps get none and cannot be restored. Restore requires a local Docker engine on a Unix socket. It replays a verified private snapshot into a network-isolated container, checks row counts and the fixture, then removes the container by ID unless `--keep-target` is given. Present source, target, and writes from the plan. Kafka messages and offsets have no backup; explain the [Kafka data recovery boundary](references/operations.md#kafka-data-recovery-boundary) when recovery comes up.
 
 ## Verify and hand off
 
@@ -129,6 +140,14 @@ This shows a preview. Add `--execute` only when that exact change is authorized.
 python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev verify
 ```
 
-`verify` runs read-only readiness checks. With GPU enabled, `gpu-smoke --execute` creates and then deletes one test Pod to check device injection; it needs its own authorization. This release has no other automated functional acceptance runner. Ready Pods and bound PVCs do not prove TLS, permissions, ACLs, network isolation, alerts, or recovery. Leave those results pending until authorized tests provide evidence.
+`verify` is read-only. It reports baseline readiness per object: each Kafka Topic, User, and PVC, and each enabled component's PodMonitor and alert rules. Functional results are reported separately. When Prometheus is readable through the API server pod proxy, it also checks actual targets, samples, and rules; otherwise those items stay pending with the reason. A failed functional check fails the command.
+
+Functional acceptance for PostgreSQL and Kafka runs through a reviewed plan:
+
+```sh
+python3 -B scripts/platform.py --config environment.json --workspace /private/path/foo-dev acceptance --component postgres
+```
+
+Present the plan's target, `client_image`, `fixtures`, `reads`, `writes`, `cleanup`, `untouched`, and `time_limits`. Obtain authorization for that plan, then run `acceptance --component postgres --plan-id REVIEWED_PLAN_ID --execute`. It creates labeled fixtures and one restricted client Pod. PostgreSQL checks cover `verify-full`, wrong-CA and login rejection, and application role limits. Kafka checks cover mTLS, fixture produce/consume, and ACL rejection. Cleanup uses the recorded UID as a deletion precondition and confirms the Kafka fixture consumer group is absent. Leftover Kubernetes fixtures block new runs in the owning environment. With GPU enabled, `gpu-smoke --execute` creates and then deletes one test Pod and needs its own authorization. NetworkPolicy allowed/denied traffic, alert delivery, and GPU workloads have no runner; backup and restore counts after an isolated drill confirms a fixture from the current data volume. Leave them pending until authorized tests provide evidence. See [Verification and acceptance](references/operations.md#verification-and-acceptance).
 
 Return the resolved configuration, created cluster profile if any, executed stages, plan IDs, and endpoints. Include required application labels, application-local Secret references, and remaining acceptance work. Keep credential values out of responses, logs, Terraform inputs, and state. Mark unexecuted checks as pending. Report full usability only after the relevant acceptance checks pass.

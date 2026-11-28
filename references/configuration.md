@@ -16,7 +16,7 @@ The configuration path is expanded and resolved before reading. Relative kubecon
 | `cluster.name` | New Minikube profile name; required with `create` and rejected with `reuse`. Lowercase DNS label, up to 40 characters. |
 | `cluster.context` | Kubeconfig context used by every Kubernetes request and Terraform provider. With `create`, omit it or set it to `cluster.name`. |
 | `cluster.kubeconfig` | Kubeconfig path. Relative paths resolve from the configuration file's directory. A new cluster writes its context here. |
-| `cluster.create.driver` | Required with `create`: `docker`, `podman`, `krunkit`, `vfkit`, `qemu2`, or `kvm2`. |
+| `cluster.create.driver` | Required with `create`: `docker`, `podman`, `krunkit`, `vfkit`, `qemu2`, or `kvm2`. All six can be created; only `krunkit` supports a confirmed `delete` or overwrite of a drifted profile ([driver support](operations.md#driver-support)). |
 | `cluster.create.nodes` / `cpus` / `memory_mib` / `disk_mib` | Node count (1–5, default 3) and per-node CPUs (default 2), memory (default and minimum 4096 MiB; VM drivers keep the node root filesystem in RAM), and disk (default 20000 MiB). |
 | `cluster.create.kubernetes_version` | `v1.35.x` through `v1.37.x`; default `v1.37.0`, matching the preflight profile. |
 | `cluster.create.container_runtime` | `containerd` (default), `cri-o`, or `docker`. |
@@ -87,7 +87,7 @@ Enable PostgreSQL, Kafka, the GPU device plugin, or any combination. Monitoring 
 | Existing CSI | A new class using the current Minikube CSI Hostpath driver. No extra storage controller is installed. |
 | GPU | A privileged plugin DaemonSet in its own namespace on the selected nodes. New clusters require the `krunkit` driver. |
 
-This version does not start, recreate, resize, or delete clusters. It does not support HTTPS ingress, CNPG, replication, failover, object storage, WAL/PITR, operator upgrades, or application releases. Adding a field to the JSON cannot enable them.
+This version does not start, restart, or resize clusters. It recreates or deletes only a profile this workspace created, through a separately reviewed `cluster --overwrite` or `delete` plan. It does not support HTTPS ingress, CNPG, replication, failover, object storage, WAL/PITR, operator upgrades, or application releases. Adding a field to the JSON cannot enable them.
 
 ## Derived resources and stages
 

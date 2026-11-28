@@ -32,16 +32,21 @@ CONTROLLERS = {
 CLAIM_CONTROLLERS = {"StatefulSet", "Pod", "Kafka", "KafkaNodePool", "StrimziPodSet"}
 REPORTS = {
     "cluster", "cluster-delete", "cluster-deleted", "cluster-reconcile", "cluster-recreated",
+    "acceptance-postgres", "acceptance-kafka", "backup", "restore", "credentials-expiry",
     "credentials-postgres", "credentials-kafka", "gpu-smoke", "interfaces", "inventory",
     "verification",
 }
 REPORTS.update(f"prerequisites-{name}" for name in ("all", "strimzi", "monitoring", "openssl"))
 PLAN_FILES = {
     "init-log.json", "plan-log.json", "apply-log.json", "review.json", "plan.tfplan",
-    "failed.json", "consumed.json",
+    "failed.json", "consumed.json", "invalidated.json",
 }
-PLAN_GROUPS = {"cluster", "cluster-delete", "prerequisites"}
+PLAN_GROUPS = {"acceptance", "backup", "cluster", "cluster-delete", "prerequisites", "restore"}
 STAGE_ROOT = runtime.ROOT / "assets" / "infra" / "stacks"
+# Drivers whose VM removal after `minikube delete` can be confirmed independently of Minikube's
+# own records. krunkit writes one PID per machine and the process can be checked natively. Other
+# drivers can be created, but a delete plan for them is blocked before any command runs.
+CONFIRMED_DELETE_DRIVERS = {"krunkit"}
 
 
 # Inputs: cluster config and resource scope. Outputs: sorted listable resource names.
@@ -216,7 +221,7 @@ def _krunkit_process(pid):
 def machine_evidence(home, name):
     profile = read_json(home / "profiles" / name / "config.json")
     driver = profile["Driver"]
-    if driver != "krunkit":
+    if driver not in CONFIRMED_DELETE_DRIVERS:
         return {"driver": driver, "pids": None}
     nodes = [node["Name"] for node in profile["Nodes"]]
     if not nodes or any(not re.fullmatch(r"[a-z0-9-]*", node) for node in nodes):
@@ -255,7 +260,9 @@ def _artifact(parts, directory, stages):
     if root == "reports" and not directory and len(tail) == 1:
         name = Path(tail[0])
         return name.suffix == ".json" and (
-            name.stem in REPORTS or name.stem in {f"applied-{stage}" for stage in stages}
+            name.stem in REPORTS
+            or name.stem in {f"applied-{stage}" for stage in stages}
+            or any(re.fullmatch(rf"apply-{re.escape(stage)}-[a-f0-9]{{64}}", name.stem) for stage in stages)
         )
     if root == "state" and not directory and len(tail) == 1:
         return tail[0] == "recorded-objects.json" or any(

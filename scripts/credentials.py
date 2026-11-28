@@ -1,6 +1,7 @@
 """Purpose: prepare PostgreSQL credentials and explicitly hand approved credentials to applications."""
 
 import base64
+import datetime as dt
 import json
 import os
 import re
@@ -393,4 +394,199 @@ def credentials(config, workspace, component="postgres", *, prepare=False, execu
             write_json(report_path, report)
             raise
     write_json(report_path, report)
+    return report
+
+
+WARNING_DAYS = 30
+CRITICAL_DAYS = 7
+
+
+# Inputs: configuration, namespace, Secret name and data key. Outputs: (state, PEM text or None).
+# Purpose: read one public certificate field without fetching private keys or passwords.
+# Dependencies: kubectl jsonpath, runtime read-failure classification.
+def _certificate_field(config, namespace, name, key):
+    escaped = key.replace(".", "\\.")
+    result = runtime.run(
+        runtime._kube(config)
+        + ["get", "secret", name, "--namespace", namespace, "--ignore-not-found=true"]
+        + ["-o", f"jsonpath={{.data.{escaped}}}"],
+        timeout=20,
+    )
+    if result.returncode:
+        return runtime._read_failure(result), None
+    if not result.stdout.strip():
+        return "missing", None
+    try:
+        return "present", base64.b64decode(result.stdout.strip(), validate=True).decode()
+    except (ValueError, UnicodeDecodeError):
+        return "unreadable", None
+
+
+# Inputs: PEM text, OpenSSL path and current time. Outputs: expiry facts.
+# Purpose: read notAfter and a fingerprint without writing the certificate anywhere.
+# Dependencies: openssl x509.
+def _certificate_facts(pem, executable, now):
+    result = run(
+        [executable, "x509", "-noout", "-enddate", "-subject", "-fingerprint", "-sha256"],
+        input_text=pem,
+        timeout=20,
+    )
+    if result.returncode:
+        return {"state": "unreadable"}
+    fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    not_after = dt.datetime.strptime(
+        " ".join(fields["notAfter"].split()), "%b %d %H:%M:%S %Y %Z"
+    ).replace(tzinfo=dt.timezone.utc)
+    remaining = (not_after - now).total_seconds() / 86400
+    status = (
+        "expired" if remaining < 0
+        else "critical" if remaining < CRITICAL_DAYS
+        else "warning" if remaining < WARNING_DAYS
+        else "ok"
+    )
+    fingerprint = next(value for key, value in fields.items() if "Fingerprint" in key)
+    return {
+        "state": "present",
+        "status": status,
+        "subject": fields.get("subject", "").strip(),
+        "not_after": not_after.isoformat(),
+        "remaining_days": round(remaining, 1),
+        "fingerprint_sha256": fingerprint.strip(),
+    }
+
+
+# Inputs: PEM bundle, OpenSSL path and time. Outputs: earliest expiry and all certificate identities.
+# Purpose: compare trust stores independently of PEM ordering. Dependencies: _certificate_facts.
+def _bundle_facts(pem, executable, now):
+    begin, end = "-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----"
+    blocks = re.findall(r"-----BEGIN CERTIFICATE-----\s+[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----", pem)
+    if not blocks or len(blocks) != pem.count(begin) or len(blocks) != pem.count(end):
+        return {"state": "unreadable"}
+    facts = [_certificate_facts(block, executable, now) for block in blocks]
+    if any(item["state"] != "present" for item in facts):
+        return {"state": "unreadable"}
+    return {
+        **min(facts, key=lambda item: item["not_after"]),
+        "fingerprints_sha256": sorted({item["fingerprint_sha256"] for item in facts}),
+    }
+
+
+# Inputs: configuration. Outputs: {secret name: [Pod names]} in the application namespace.
+# Purpose: list clients that must reload after a credential change. Dependencies: kubectl GET pods.
+def _secret_consumers(config):
+    pods = runtime._get(config, "pods", namespace=config["application"]["namespace"]) or {}
+    consumers = {}
+    for pod in pods.get("items", []):
+        spec = pod.get("spec", {})
+        names = set()
+        for volume in spec.get("volumes", []):
+            names.add((volume.get("secret") or {}).get("secretName"))
+            for source in (volume.get("projected") or {}).get("sources", []):
+                names.add((source.get("secret") or {}).get("name"))
+        for container in spec.get("containers", []) + spec.get("initContainers", []):
+            for variable in container.get("env", []):
+                names.add(((variable.get("valueFrom") or {}).get("secretKeyRef") or {}).get("name"))
+            for source in container.get("envFrom", []):
+                names.add((source.get("secretRef") or {}).get("name"))
+        for name in names - {None}:
+            consumers.setdefault(name, []).append(pod["metadata"]["name"])
+    return {name: sorted(items) for name, items in consumers.items()}
+
+
+# Inputs: configuration. Outputs: certificate sources as (group, reference, namespace, Secret, key).
+# Purpose: list each certificate and the copy it must match. Dependencies: credential naming.
+def _certificate_sources(config):
+    derived, application = config["derived"], config["application"]["namespace"]
+    sources = []
+    if config["postgres"]["enabled"]:
+        name, namespace = derived["postgres_name"], derived["namespace"]
+        sources += [
+            ("postgres-ca", namespace, f"{name}-tls", "ca.crt"),
+            ("postgres-server", namespace, f"{name}-tls", "tls.crt"),
+            ("postgres-ca", application, f"{name}-client", "ca.crt"),
+        ]
+    if config["kafka"]["enabled"]:
+        name, namespace = derived["kafka_name"], config["kafka"]["namespace"]
+        sources += [
+            ("kafka-cluster-ca", namespace, f"{name}-cluster-ca-cert", "ca.crt"),
+            ("kafka-clients-ca", namespace, f"{name}-clients-ca-cert", "ca.crt"),
+        ]
+        for role in ("producer", "consumer"):
+            sources += [
+                (f"kafka-{role}", namespace, f"{name}-{role}", "user.crt"),
+                (f"kafka-{role}", application, f"{name}-{role}-client", "user.crt"),
+                ("kafka-cluster-ca", application, f"{name}-{role}-client", "ca.crt"),
+            ]
+    return sources
+
+
+# Inputs: configuration and workspace. Outputs: read-only expiry report.
+# Purpose: report certificate lifetimes, copies that no longer match their source, and the client
+# Pods affected. Dependencies: OpenSSL, kubectl GET; no writes.
+def expiry(config, workspace):
+    tool = find_openssl()
+    if tool is None:
+        raise RuntimeError("A supported OpenSSL is required; run prerequisites --component openssl first")
+    identity = runtime._identity(config)
+    if not runtime._bind(config, workspace, identity):
+        raise RuntimeError("The target must match the workspace binding.")
+    now = dt.datetime.now(dt.timezone.utc)
+    certificates = []
+    local = workspace / "credentials" / "postgres"
+    if config["postgres"]["enabled"]:
+        for filename, group in (("ca.crt", "postgres-ca"), ("server.crt", "postgres-server")):
+            path = local / filename
+            entry = {"group": group, "reference": f"workspace:credentials/postgres/{filename}"}
+            entry.update(
+                _bundle_facts(path.read_text(encoding="utf-8"), tool["path"], now)
+                if path.is_file() and not path.is_symlink()
+                else {"state": "missing"}
+            )
+            certificates.append(entry)
+    for group, namespace, name, key in _certificate_sources(config):
+        state, pem = _certificate_field(config, namespace, name, key)
+        entry = {"group": group, "reference": f"{namespace}/{name}:{key}"}
+        entry.update(_bundle_facts(pem, tool["path"], now) if pem else {"state": state})
+        certificates.append(entry)
+    try:
+        consumers, consumer_error = _secret_consumers(config), None
+    except runtime.ReadError as error:
+        consumers, consumer_error = {}, error.reason
+    application = config["application"]["namespace"]
+    for entry in certificates:
+        namespace, _, rest = entry["reference"].partition("/")
+        if namespace == application:
+            entry["client_pods"] = consumers.get(rest.split(":")[0], [])
+    # Copies must carry the same certificate as their source; a difference means a renewal was
+    # not handed off, or a handoff happened without a server change.
+    stale = []
+    groups = {}
+    for entry in certificates:
+        if entry.get("fingerprints_sha256"):
+            groups.setdefault(entry["group"], set()).add(tuple(entry["fingerprints_sha256"]))
+    for group, prints in sorted(groups.items()):
+        if len(prints) > 1:
+            stale.append({
+                "group": group,
+                "references": [item["reference"] for item in certificates if item["group"] == group],
+            })
+    statuses = {entry.get("status") for entry in certificates}
+    unreadable = [entry["reference"] for entry in certificates if entry["state"] != "present"]
+    status = (
+        "fail" if statuses & {"expired"} or stale
+        else "warning" if statuses & {"critical", "warning"} or unreadable
+        else "pass"
+    )
+    report = {
+        "captured_at": now.isoformat(),
+        "status": status,
+        "thresholds_days": {"warning": WARNING_DAYS, "critical": CRITICAL_DAYS},
+        "certificates": certificates,
+        "mismatched_copies": stale,
+        "unavailable": unreadable,
+        "client_pods_unavailable": consumer_error,
+        "cluster_writes": False,
+        "next_steps": "See the credential renewal order in references/operations.md.",
+    }
+    write_json(workspace / "reports" / "credentials-expiry.json", report)
     return report
