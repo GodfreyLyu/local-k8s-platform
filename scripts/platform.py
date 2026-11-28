@@ -152,9 +152,12 @@ def arguments(argv=None):
     cluster.add_argument("--plan-id")
     cluster.add_argument("--execute", action="store_true")
     cluster.add_argument("--overwrite", action="store_true")
+    legacy_removal_help = "Confirm independent host verification for earlier overwrite attempts without PID records."
+    cluster.add_argument("--confirm-legacy-vm-removal", action="store_true", help=legacy_removal_help)
     delete = actions.add_parser("delete")
     delete.add_argument("--workspace-files", required=True, choices=("keep", "archive", "purge"))
     delete.add_argument("--include-unmanaged", action="store_true")
+    delete.add_argument("--confirm-legacy-vm-removal", action="store_true", help=legacy_removal_help)
     delete.add_argument("--plan-id")
     delete.add_argument("--execute", action="store_true")
     plan = actions.add_parser("plan")
@@ -194,6 +197,10 @@ def arguments(argv=None):
     restore.add_argument("--plan-id")
     restore.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
+    if args.action == "cluster" and args.confirm_legacy_vm_removal and not args.overwrite:
+        parser.error("--confirm-legacy-vm-removal requires cluster --overwrite")
+    if args.action == "delete" and args.confirm_legacy_vm_removal and args.workspace_files != "archive":
+        parser.error("--confirm-legacy-vm-removal requires delete --workspace-files archive")
     if args.action == "credentials":
         if args.expiry and args.component:
             parser.error("credentials --expiry checks every enabled component; omit --component")
@@ -287,6 +294,7 @@ def main(argv=None):
                     args.plan_id,
                     args.execute,
                     overwrite=args.overwrite,
+                    confirm_legacy_vm_removal=args.confirm_legacy_vm_removal,
                     materialize=configure,
                 )
             elif args.action == "delete":
@@ -299,6 +307,7 @@ def main(argv=None):
                     args.plan_id,
                     args.execute,
                     include_unmanaged=args.include_unmanaged,
+                    confirm_legacy_vm_removal=args.confirm_legacy_vm_removal,
                     materialize=configure,
                 )
             elif args.action == "credentials" and args.expiry:

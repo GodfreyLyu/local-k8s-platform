@@ -92,15 +92,23 @@ Results map to plan actions:
 | Live evidence | Action | Execution |
 |---|---|---|
 | No profile with this name | `recreate-missing` | Archive the workspace, then start once. |
-| Readable profile, all checks match | `unchanged` | Nothing to execute. |
-| Readable profile, identity or any object differs | `overwrite` | `minikube delete --profile=NAME`, then archive and start once. |
+| Readable profile, all checks match | `unchanged` | Nothing to execute. PID files are optional for this comparison. |
+| Readable profile, identity or any object differs | `overwrite` | `minikube delete --profile=NAME`, confirm every krunkit process exited, then archive and start once. |
 | Profile cannot be read (stopped, invalid, API down) | blocked | Start it outside this workflow and plan again. |
+| Readable profile that differs, on a driver without independent exit evidence (any driver other than `krunkit`) | blocked | No delete is planned. Verify the profile, Minikube home, and kubeconfig yourself before any manual recreation. |
+| An earlier delete or overwrite left a recorded VM running outside the PIDs covered by this deletion | blocked | Confirm that VM has exited before replanning. |
 
 Machine records or kubeconfig entries left without a profile still block `recreate-missing`, and the plan does not clean them up. Comparisons cover existence, UID, and ownership only. They ignore spec drift, which stage plans handle without deleting anything.
 
-Execution requires `--overwrite --plan-id ID --execute`, with authorization for the stated data loss. It repeats the comparison and refuses stale evidence. Keep the kubeconfig and Minikube home outside the workspace, and the workspace outside Minikube home. Execution reserves a writable private archive on the workspace filesystem before consuming the plan and deleting anything. A failed delete, timeout, or residual profile, machine, or kubeconfig record leaves the workspace files in place.
+Execution requires `--overwrite --plan-id ID --execute`, with authorization for the stated data loss. It repeats the comparison and refuses stale evidence. Keep the kubeconfig and Minikube home outside the workspace, and the workspace outside Minikube home. Execution reserves a writable private archive on the workspace filesystem before consuming the plan and deleting anything. A plan that would delete the profile requires matching krunkit PIDs before and after the state comparison. Execution checks those PIDs again immediately before `minikube delete`. Before archiving or starting a replacement, it also checks unresolved PID records from earlier delete and overwrite attempts. A failed delete, timeout, Ctrl-C, a recorded process that is still running, or a residual profile, machine, or kubeconfig record leaves the workspace files in place and starts no replacement. A timeout, Ctrl-C, or surviving process records the deletion as `uncertain` in `plans/cluster/consumed-<id>.json`; Ctrl-C also sets `interrupted: true` and exits with status 130. A later `recreate-missing` plan stays blocked until every recorded process has exited. For older attempts without PIDs, use the recovery procedure below.
 
 Archiving moves workspace entries other than `.operation.lock` and `archive/` into `archive/<UTC time>-<plan prefix>/`, mode `0700`. The new workspace records the archive and deletion outcome in `reports/cluster-recreated.json`. The replacement start and its binding are reported separately in `reports/cluster.json`, including an uncertain start after a completed deletion. Earlier state, credentials, and plans remain in the archive. Prerequisites, stage plans, and credentials start again from new reviewed plans.
+
+### Recover an older overwrite without PID evidence
+
+For an older failed or interrupted overwrite that recorded no PIDs, use the host driver's own VM or container inventory to verify that every machine from the earlier attempt has exited. For krunkit, inspect the host's krunkit processes and identify them by the recorded profile and Minikube home. Missing Minikube records alone do not confirm VM exit.
+
+Once the profile, machine records, and kubeconfig entries are absent, prepare a fresh `cluster --overwrite --confirm-legacy-vm-removal` plan to recreate the profile or `delete --workspace-files archive --confirm-legacy-vm-removal` to archive the files. Review the listed legacy attempts and use the same option when executing with the approved plan ID. This confirmation applies only to older overwrite records without PID evidence. A surviving recorded PID still blocks execution.
 
 ## Delete a created cluster
 
@@ -116,10 +124,10 @@ Use this only with `cluster.mode=create` and a workspace whose creation report r
 
 ### Driver support
 
-| Driver | `cluster` create | `delete` |
+| Driver | `cluster` create | `delete` and `cluster --overwrite` of a drifted profile |
 |---|---|---|
-| `krunkit` | Supported; live runs on 2026-11-22 and 2026-11-23. Socket paths are checked. | Supported. Planning and execution check each machine's PID before and after the data-loss inventory. A PID change invalidates the review. Every checked process must exit after `minikube delete`. |
-| `docker`, `podman`, `vfkit`, `qemu2`, `kvm2` | Accepted by configuration; not run live. | Blocked at planning. No independent check of container or VM exit is implemented, so a deletion could not be confirmed. |
+| `krunkit` | Supported; live runs on 2026-11-22 and 2026-11-23. Socket paths are checked. | Supported. Planning and execution check each machine's PID before and after the data-loss inventory or state comparison. Execution checks again immediately before deletion. A PID change invalidates the review. Every checked process must exit after `minikube delete`. |
+| `docker`, `podman`, `vfkit`, `qemu2`, `kvm2` | Accepted by configuration; not run live. | Blocked at planning. No independent check of container or VM exit is implemented, so a deletion could not be confirmed. Overwrite of a missing profile (`recreate-missing`) runs no delete and stays available. |
 
 Support for another driver needs a native exit check that does not rely on Minikube's own records, plus offline and live evidence.
 

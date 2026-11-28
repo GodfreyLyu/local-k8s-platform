@@ -500,18 +500,19 @@ def _reconcile(config, workspace, snapshot, creation):
 # Inputs: resolved configuration and a workspace that created the profile. Outputs: overwrite evidence.
 # Purpose: choose no change, recreation of a missing profile, or overwrite of a drifted one.
 # Dependencies: _snapshot, _reconcile.
-def _overwrite_snapshot(config, workspace):
+def _overwrite_snapshot(config, workspace, *, confirm_legacy_vm_removal=False):
     snapshot = _snapshot(config)
     name = config["cluster"]["name"]
     creation, deleted = _workspace_creation(config, workspace)
-    snapshot.update(reconcile=None, delete_command=None)
+    snapshot.update(reconcile=None, delete_command=None, machine_evidence=None)
     if blocker := _home_blocker(workspace, snapshot, creation):
         snapshot.update(action="none", blockers=[blocker])
         return snapshot
     if not snapshot["profile_exists"]:
         # Leftover machine or kubeconfig records stay blockers; they are not ours to clean.
-        if _unconfirmed_delete(workspace):
-            snapshot.update(action="none", blockers=["The prior delete has unconfirmed VM removal."])
+        snapshot["blockers"] += _review_vm_history(workspace, snapshot, confirm_legacy_vm_removal)
+        if snapshot["blockers"]:
+            snapshot["action"] = "none"
             return snapshot
         snapshot["action"] = "recreate-missing"
         return _check_startup(config, snapshot)
@@ -525,6 +526,12 @@ def _overwrite_snapshot(config, workspace):
             ],
         )
         return snapshot
+    home = Path(snapshot["minikube_home"])
+    try:
+        initial_machine_evidence = delete_safety.machine_evidence(home, name)
+        machine_error = None
+    except (RuntimeError, ValueError, KeyError, TypeError, OSError) as error:
+        initial_machine_evidence, machine_error = None, str(error)
     try:
         reconcile = _reconcile(config, workspace, snapshot, creation)
     except (RuntimeError, ValueError, KeyError, TypeError, OSError) as error:
@@ -543,6 +550,34 @@ def _overwrite_snapshot(config, workspace):
         snapshot.update(action="none", blockers=[])
         return snapshot
     snapshot.update(action="none", blockers=[])
+    try:
+        if machine_error is not None:
+            raise RuntimeError(machine_error)
+        # The comparison can outlast a VM restart; bind the review to the PIDs after it.
+        machine_evidence = delete_safety.machine_evidence(home, name)
+    except (RuntimeError, ValueError, KeyError, TypeError, OSError) as error:
+        snapshot["blockers"] = [f"Cannot verify Minikube machine evidence for overwrite: {error}"]
+        return snapshot
+    snapshot["machine_evidence"] = machine_evidence
+    if not machine_evidence.get("pids"):
+        # Same rule as delete: without independent exit evidence the replacement could start
+        # beside machines that never stopped.
+        snapshot["blockers"] = [
+            f"Driver {machine_evidence.get('driver')} has no independent check that its machines "
+            "exited after `minikube delete`, so this skill cannot overwrite the profile. Supported "
+            f"drivers: {', '.join(sorted(delete_safety.CONFIRMED_DELETE_DRIVERS))}. Before any manual "
+            f"recreation, verify profile {name} in Minikube home {home} against kubeconfig "
+            f"{snapshot['kubeconfig']} and review the data loss."
+        ]
+        return snapshot
+    if machine_evidence != initial_machine_evidence:
+        snapshot["blockers"] = [
+            "Minikube machine evidence changed during the comparison. Prepare a fresh overwrite plan."
+        ]
+        return snapshot
+    snapshot["blockers"] = _review_vm_history(workspace, snapshot, confirm_legacy_vm_removal)
+    if snapshot["blockers"]:
+        return snapshot
     _check_startup(config, snapshot)
     if snapshot["blockers"]:
         return snapshot
@@ -591,6 +626,25 @@ def _reviewed_home(snapshot):
     return home
 
 
+# Inputs: reviewed snapshot, pinned home, consumed path and record. Outputs: none or refusal.
+# Purpose: bind deletion dispatch to the same live PIDs after persisting the attempt marker.
+def _record_delete_dispatch(snapshot, home, consumed, record):
+    evidence = snapshot.get("machine_evidence")
+    if not (evidence or {}).get("pids"):
+        raise RuntimeError("This driver's machine exit cannot be confirmed; minikube delete was not run.")
+    record["deletion"] = "uncertain"
+    write_json(consumed, record)
+    try:
+        current = delete_safety.machine_evidence(home, snapshot["profile"])
+        if current != evidence:
+            raise RuntimeError("Minikube machine evidence changed immediately before deletion.")
+    except (RuntimeError, ValueError, KeyError, TypeError, OSError) as error:
+        record["deletion"] = "not-needed"
+        raise RuntimeError(
+            f"{error} Minikube delete was not run. Prepare a fresh plan."
+        ) from None
+
+
 # Inputs: resolved configuration, workspace, reviewed overwrite record, and a materialize callback.
 # Outputs: creation report. Purpose: delete (overwrite only), archive, re-materialize, then start once.
 # Dependencies: minikube, kubectl; materialize is the CLI's configure, passed in to avoid an import cycle.
@@ -604,15 +658,17 @@ def _execute_overwrite(config, workspace, review, materialize):
         "action": snapshot["action"],
         "deletion": "not-needed",
         "archive": str(archive),
+        "machine_evidence": snapshot.get("machine_evidence"),
     }
+    if "legacy_vm_removal" in snapshot:
+        record["legacy_vm_removal"] = snapshot["legacy_vm_removal"]
     try:
         home = _reviewed_home(snapshot)
         write_json(consumed, record)
         if snapshot["action"] == "overwrite":
             if sha256(Path(snapshot["kubeconfig"])) != snapshot["reconcile"]["kubeconfig_sha256"]:
                 raise RuntimeError("The selected kubeconfig changed since review.")
-            record["deletion"] = "uncertain"
-            write_json(consumed, record)
+            _record_delete_dispatch(snapshot, home, consumed, record)
             try:
                 result = run(snapshot["delete_command"], timeout=DELETE_TIMEOUT_SECONDS)
             except RuntimeError:
@@ -627,6 +683,12 @@ def _execute_overwrite(config, workspace, review, materialize):
                     "minikube delete failed. The workspace was not archived. "
                     "Inspect the profile before a new plan."
                 )
+            if not delete_safety.machines_removed(snapshot["machine_evidence"]):
+                record["status"] = "uncertain"
+                raise RuntimeError(
+                    "VM removal could not be confirmed. The workspace was not archived and no "
+                    "replacement was started."
+                )
             record["deletion"] = "completed"
             write_json(consumed, record)
         # Inspect the reviewed home even if the ambient environment has changed.
@@ -638,9 +700,19 @@ def _execute_overwrite(config, workspace, review, materialize):
                 "Profile, machine, or kubeconfig records remain. The workspace was not archived. "
                 + " ".join(residual)
             )
+        _require_vm_history(workspace, snapshot, record)
     except (RuntimeError, ValueError, OSError):
         if record["status"] == "attempting":
             record["status"] = "failed"
+        with suppress(OSError):
+            archive.rmdir()
+        write_json(consumed, record)
+        raise
+    except KeyboardInterrupt:
+        # A started delete may have removed some machines; the outcome is unknown either way.
+        if record["status"] == "attempting":
+            record["status"] = "uncertain" if record["deletion"] == "uncertain" else "failed"
+        record["interrupted"] = True
         with suppress(OSError):
             archive.rmdir()
         write_json(consumed, record)
@@ -825,9 +897,12 @@ def _overwrite_summary(workspace, snapshot):
     summary = {
         "action": snapshot["action"],
         "delete_command": snapshot["delete_command"],
+        "machine_evidence": snapshot.get("machine_evidence"),
         "archive_directory": str(workspace / "archive"),
         "reconcile": None,
     }
+    if "legacy_vm_removal" in snapshot:
+        summary["legacy_vm_removal"] = snapshot["legacy_vm_removal"]
     if reconcile is not None:
         summary["reconcile"] = {
             "identity": reconcile["identity"],
@@ -847,7 +922,10 @@ def _overwrite_summary(workspace, snapshot):
 # Inputs: resolved create-mode configuration, workspace, optional reviewed ID, execution and overwrite
 # flags, and the CLI's configure function. Outputs: plan, preview, or creation report.
 # Purpose: one reviewed create workflow plus an explicit overwrite path. Dependencies: private plans.
-def cluster(config, workspace, plan_id=None, execute=False, overwrite=False, materialize=None):
+def cluster(
+    config, workspace, plan_id=None, execute=False, overwrite=False, materialize=None, *,
+    confirm_legacy_vm_removal=False,
+):
     directory = workspace / "plans" / "cluster"
     creation, deleted = _workspace_creation(config, workspace)
     is_created = creation is not None and not deleted
@@ -873,7 +951,9 @@ def cluster(config, workspace, plan_id=None, execute=False, overwrite=False, mat
     # Inputs: none. Outputs: current evidence for the selected plan kind. Dependencies: the snapshots above.
     def current():
         if overwrite:
-            return _overwrite_snapshot(config, workspace)
+            return _overwrite_snapshot(
+                config, workspace, confirm_legacy_vm_removal=confirm_legacy_vm_removal
+            )
         return _check_startup(config, _snapshot(config))
 
     if plan_id is None:
@@ -886,6 +966,8 @@ def cluster(config, workspace, plan_id=None, execute=False, overwrite=False, mat
         # Only overwrite reviews carry the flag, so earlier create plan IDs keep their contents.
         if overwrite:
             review["overwrite"] = True
+            if confirm_legacy_vm_removal:
+                review["confirm_legacy_vm_removal"] = True
         review["plan_id"] = runtime._digest(review)
         write_json(directory / f"{review['plan_id']}.json", review)
     else:
@@ -898,6 +980,8 @@ def cluster(config, workspace, plan_id=None, execute=False, overwrite=False, mat
             raise RuntimeError(
                 "This cluster plan was prepared with a different --overwrite setting; repeat it exactly."
             )
+        if review.get("confirm_legacy_vm_removal", False) != confirm_legacy_vm_removal:
+            raise RuntimeError("Repeat the reviewed --confirm-legacy-vm-removal setting exactly.")
         if (directory / f"consumed-{plan_id}.json").exists():
             raise RuntimeError(
                 "Cluster plan was consumed; inspect the profile and its report before any new plan."
@@ -954,22 +1038,72 @@ def _workspace_entries(workspace):
     return sorted(item.name for item in workspace.iterdir() if item.name not in ARCHIVE_KEEP)
 
 
-# Inputs: workspace. Outputs: whether a prior delete still lacks independent VM confirmation.
-# Purpose: prevent absent Minikube records from bypassing a failed or interrupted removal check.
-def _unconfirmed_delete(workspace):
-    for path in (workspace / "plans" / "cluster-delete").glob("consumed-*.json"):
-        record = read_json(path)
-        if record.get("deletion") in {"uncertain", "failed"} and not delete_safety.machines_removed(
-            record.get("machine_evidence")
+# Inputs: workspace and PIDs covered by a proposed delete. Outputs: legacy records and a blocker flag.
+# Purpose: check unresolved VMs independently of whether Minikube currently lists the profile.
+def _vm_removal_history(workspace, covered=()):
+    legacy, unconfirmed = {}, False
+    for group in ("cluster", "cluster-delete"):
+        for path in sorted((workspace / "plans" / group).glob("consumed-*.json")):
+            record = read_json(path)
+            if record.get("deletion") not in {"uncertain", "failed"}:
+                continue
+            evidence = record.get("machine_evidence")
+            if group == "cluster" and evidence is None:
+                legacy[path.name] = runtime._digest(record)
+                continue
+            pids = (evidence or {}).get("pids")
+            if isinstance(pids, list) and pids:
+                remaining = [pid for pid in pids if pid not in covered]
+                if not remaining or delete_safety.machines_removed({"pids": remaining}):
+                    continue
+            unconfirmed = True
+    return legacy, unconfirmed
+
+
+# Inputs: workspace, proposed action snapshot and legacy acknowledgment. Outputs: safe blockers.
+# Purpose: bind independently checked legacy attempts to an absent-profile recovery plan.
+def _review_vm_history(workspace, snapshot, confirm_legacy_vm_removal):
+    covered = (snapshot.get("machine_evidence") or {}).get("pids") or ()
+    legacy, unconfirmed = _vm_removal_history(workspace, covered)
+    blockers = []
+    if unconfirmed:
+        blockers.append("A prior attempt has unconfirmed VM removal. Workspace files are preserved.")
+    if legacy:
+        if (
+            confirm_legacy_vm_removal and not snapshot["profile_exists"]
+            and not snapshot["machine_conflicts"] and not snapshot["kubeconfig_conflicts"]
         ):
-            return True
-    return False
+            snapshot["legacy_vm_removal"] = legacy
+        else:
+            blockers.append(
+                "Earlier overwrite records lack VM evidence. Independently verify VM removal "
+                "with the host driver. Once the profile, machine, and kubeconfig records are "
+                "absent, prepare an overwrite or archive plan with --confirm-legacy-vm-removal."
+            )
+    return blockers
+
+
+# Inputs: workspace, reviewed snapshot and attempt record. Outputs: none or refusal.
+# Purpose: verify VM exit for current and prior attempts before handling workspace files.
+def _require_vm_history(workspace, snapshot, record):
+    if record["deletion"] == "completed" and not delete_safety.machines_removed(
+        snapshot["machine_evidence"]
+    ):
+        record.update(status="uncertain", deletion="uncertain")
+        raise RuntimeError("VM removal could not be confirmed. Workspace files are unchanged.")
+    legacy, unconfirmed = _vm_removal_history(workspace)
+    if unconfirmed or legacy != snapshot.get("legacy_vm_removal", {}):
+        raise RuntimeError(
+            "Prior VM removal could not be confirmed. Workspace files are unchanged. Prepare a fresh plan."
+        )
 
 
 # Inputs: configuration, workspace, file mode, unmanaged-data acceptance, and optional reviewed ID.
 # Outputs: delete evidence with action delete, already-absent, or none.
 # Purpose: delete only a verified profile this workspace created. Dependencies: _snapshot, _verified_identity.
-def _delete_snapshot(config, workspace, files, include_unmanaged, *, plan_id=None):
+def _delete_snapshot(
+    config, workspace, files, include_unmanaged, *, plan_id=None, confirm_legacy_vm_removal=False
+):
     snapshot = _snapshot(config)
     name = config["cluster"]["name"]
     creation, deleted = _workspace_creation(config, workspace)
@@ -1000,8 +1134,7 @@ def _delete_snapshot(config, workspace, files, include_unmanaged, *, plan_id=Non
                 + ", ".join(inventory["unknown"])
             )
     if not snapshot["profile_exists"]:
-        if _unconfirmed_delete(workspace):
-            blockers.append("The prior delete has unconfirmed VM removal. Workspace files are preserved.")
+        blockers.extend(_review_vm_history(workspace, snapshot, confirm_legacy_vm_removal))
         leftovers = [
             *(f"machine {node}" for node in snapshot["machine_conflicts"]),
             *(f"kubeconfig {kind} {name}" for kind in snapshot["kubeconfig_conflicts"]),
@@ -1088,6 +1221,7 @@ def _delete_snapshot(config, workspace, files, include_unmanaged, *, plan_id=Non
             + ["delete", f"--profile={name}"]
         ),
     )
+    blockers.extend(_review_vm_history(workspace, snapshot, confirm_legacy_vm_removal))
     return snapshot
 
 
@@ -1132,19 +1266,15 @@ def _execute_delete(config, workspace, review, materialize):
         "archive": str(archive) if archive else None,
         "machine_evidence": snapshot["machine_evidence"],
     }
+    if "legacy_vm_removal" in snapshot:
+        record["legacy_vm_removal"] = snapshot["legacy_vm_removal"]
     try:
         home = _reviewed_home(snapshot)
         write_json(consumed, record)
         if snapshot["action"] == "delete":
             if sha256(Path(snapshot["kubeconfig"])) != snapshot["kubeconfig_sha256"]:
                 raise RuntimeError("The selected kubeconfig changed since review.")
-            if not (snapshot["machine_evidence"] or {}).get("pids"):
-                # Plans from older builds could reach here; never run a delete that cannot be confirmed.
-                raise RuntimeError(
-                    "This driver's machine exit cannot be confirmed; minikube delete was not run."
-                )
-            record["deletion"] = "uncertain"
-            write_json(consumed, record)
+            _record_delete_dispatch(snapshot, home, consumed, record)
             try:
                 result = run(snapshot["delete_command"], timeout=DELETE_TIMEOUT_SECONDS)
             except RuntimeError:
@@ -1172,6 +1302,7 @@ def _execute_delete(config, workspace, review, materialize):
                 "Profile, machine, or kubeconfig records remain. The workspace files are unchanged. "
                 + " ".join(residual)
             )
+        _require_vm_history(workspace, snapshot, record)
     except (RuntimeError, ValueError, OSError):
         if record["status"] == "attempting":
             record["status"] = "failed"
@@ -1227,7 +1358,8 @@ def _execute_delete(config, workspace, review, materialize):
 # and unmanaged-data flags, and the CLI's configure function. Outputs: plan, preview, or deletion report.
 # Purpose: reviewed deletion of a profile this workspace created. Dependencies: private plans.
 def delete(
-    config, workspace, files, plan_id=None, execute=False, include_unmanaged=False, materialize=None
+    config, workspace, files, plan_id=None, execute=False, include_unmanaged=False, materialize=None, *,
+    confirm_legacy_vm_removal=False,
 ):
     directory = workspace / "plans" / "cluster-delete"
     if _workspace_creation(config, workspace)[0] is None:
@@ -1236,6 +1368,8 @@ def delete(
             "complete creation report."
         )
     options = {"workspace_files": files, "include_unmanaged": include_unmanaged}
+    if confirm_legacy_vm_removal:
+        options["confirm_legacy_vm_removal"] = True
     if plan_id is None:
         private_dir(directory)
         review = {
@@ -1243,7 +1377,10 @@ def delete(
             "config_sha256": runtime._digest(config),
             "source_hashes": _sources(),
             "delete": options,
-            "snapshot": _delete_snapshot(config, workspace, files, include_unmanaged),
+            "snapshot": _delete_snapshot(
+                config, workspace, files, include_unmanaged,
+                confirm_legacy_vm_removal=confirm_legacy_vm_removal,
+            ),
         }
         review["plan_id"] = runtime._digest(review)
         write_json(directory / f"{review['plan_id']}.json", review)
@@ -1259,7 +1396,7 @@ def delete(
         if review["delete"] != options:
             raise RuntimeError(
                 "This delete plan was prepared with different --workspace-files or "
-                "--include-unmanaged options; repeat them exactly."
+                "--include-unmanaged or --confirm-legacy-vm-removal options; repeat them exactly."
             )
         if (directory / f"consumed-{plan_id}.json").exists():
             raise RuntimeError(
@@ -1273,7 +1410,11 @@ def delete(
         if review["snapshot"]["blockers"]:
             raise RuntimeError("The reviewed delete plan is blocked; resolve it and prepare a new plan.")
         if execute:
-            if _delete_snapshot(config, workspace, files, include_unmanaged, plan_id=plan_id) != review["snapshot"]:
+            current = _delete_snapshot(
+                config, workspace, files, include_unmanaged, plan_id=plan_id,
+                confirm_legacy_vm_removal=confirm_legacy_vm_removal,
+            )
+            if current != review["snapshot"]:
                 raise RuntimeError(
                     "Host, Minikube, profile, identity, cluster data, or workspace evidence changed "
                     "since review; prepare a fresh plan."
@@ -1308,6 +1449,7 @@ def delete(
         "include_unmanaged": include_unmanaged,
         "data_loss": snapshot["data_loss"],
         "machine_evidence": snapshot["machine_evidence"],
+        **({"legacy_vm_removal": snapshot["legacy_vm_removal"]} if "legacy_vm_removal" in snapshot else {}),
         "identity": snapshot.get("identity"),
         "effects": effects,
         "blockers": snapshot["blockers"],
