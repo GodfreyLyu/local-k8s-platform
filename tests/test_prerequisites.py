@@ -293,6 +293,10 @@ class PrerequisiteTests(unittest.TestCase):
                     *flags,
                 ]
             )
+        if output.getvalue():
+            # Every successful report carries the summary and prints its readable view on stderr.
+            self.assertIn("summary", json.loads(output.getvalue()))
+            self.assertIn("== prerequisites", error.getvalue())
         return status, json.loads(output.getvalue() or error.getvalue())
 
     # Inputs: component and external ownership choice. Outputs: none.

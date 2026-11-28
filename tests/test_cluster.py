@@ -425,6 +425,10 @@ class ClusterTests(unittest.TestCase):
             status = CLI.main(
                 ["--config", str(self.source), "--workspace", str(self.workspace), *arguments]
             )
+        if stdout.getvalue():
+            # Every successful report carries the summary and prints its readable view on stderr.
+            self.assertIn("summary", json.loads(stdout.getvalue()))
+            self.assertIn(f"== {arguments[0]}", stderr.getvalue())
         text = stdout.getvalue() or stderr.getvalue()
         return status, json.loads(text)
 

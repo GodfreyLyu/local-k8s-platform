@@ -1459,6 +1459,7 @@ def plan(config: dict, workspace: Path, stage: str, plugin_dir: Path | None = No
             "status": "planned",
             "stage": stage,
             "plan_id": review["plan_id"],
+            "identity": review["identity"],
             "changes": _public_changes(changes),
             "review": str(directory / "review.json"),
         }
@@ -1544,6 +1545,7 @@ def apply(config: dict, workspace: Path, stage: str, plan_id: str, execute: bool
             "status": "preview",
             "stage": stage,
             "plan_id": plan_id,
+            "identity": review["identity"],
             "changes": _public_changes(review["changes"]),
             "requires_execute": True,
         }

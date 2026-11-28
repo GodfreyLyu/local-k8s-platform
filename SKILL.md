@@ -24,6 +24,17 @@ Use English for maintained documentation and code comments. Respond in the user'
 
 Support a single PostgreSQL StatefulSet, a single Strimzi KRaft node, and an optional GPU device plugin that advertises the krunkit render node as `devic.es/dri`. Enable any combination of these; a GPU-only environment disables monitoring and storage. Local storage and monitoring integration are optional. Cluster creation never starts an existing profile. It recreates a profile only through an explicitly requested, separately authorized `cluster --overwrite` plan, and deletes one only through such a `cluster --overwrite` or `delete` plan, in both cases for a profile this workspace created. Operator replacement, HTTPS ingress, CNPG, PITR, and application releases are outside this version's scope. Explain unsupported requests rather than trying to enable them through configuration.
 
+## Present each step
+
+Every successful action prints its JSON report on stdout and a readable summary block on stderr. The same data is in the report's `summary` field. Show the block to the user after each step, before asking for any authorization. It has the same sections every time:
+
+- `Target`: the context, API server, and kube-system UID the step reads or changes.
+- `Current state`: what the step observed, such as profile state, drift, reused installations, or check results.
+- `Will add` / `Will change` / `Will delete`: planned creations, field-level `before -> after` updates, and deletions, including data loss and workspace file handling. After execution these become `Added` / `Changed` / `Deleted`. An empty delete section states why the step cannot delete.
+- `Unchanged`, `Blockers`, `Note`, and `Next`: the exact follow-up command, marked when it needs authorization.
+
+The summary is built from the report only and never contacts the cluster. Offline steps say `Kubernetes not contacted`. Errors keep the single JSON error on stderr.
+
 ## Form an explicit configuration
 
 1. Identify the cluster mode, context or new cluster name, environment ID, data services, storage, application namespace, and resource budget. Use the request and available evidence. Never invent a cluster name; ask for one when a new cluster is wanted.
